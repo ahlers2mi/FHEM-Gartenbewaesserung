@@ -43,7 +43,6 @@ use POSIX;
 sub Gartenbewaesserung_Initialize {
     my ($hash) = @_;
 
-    $hash->{VERSION}    = '1.0.12';
     $hash->{DefFn}      = "Gartenbewaesserung_Define";
     $hash->{UndefFn}    = "Gartenbewaesserung_Undef";
     $hash->{SetFn}      = "Gartenbewaesserung_Set";
@@ -97,6 +96,8 @@ sub Gartenbewaesserung_Define {
     my @a = split("[ \t][ \t]*", $def);
     
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
+
+    $hash->{VERSION}    = '1.0.12';
     
     my $name = $a[0];
     
