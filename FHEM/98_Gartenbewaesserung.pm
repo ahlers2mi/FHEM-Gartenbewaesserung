@@ -5,6 +5,7 @@
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
+#     Automatische Füll-Pausen während Bewässerung
 #
 ##############################################################################
 
@@ -45,6 +46,8 @@ sub Gartenbewaesserung_Initialize {
         "barrelFillThreshold:slider,0,5,100 " .
         "ibcToBarrelDuration:slider,1,1,60 " .
         "moistureThreshold:slider,0,5,100 " .
+        "wateringPauseInterval:slider,0,1,60 " .
+        "wateringPauseDuration:slider,0,1,60 " .
         "startTime1 startTime2 startTime3 " .
         "rainDurationForIBC:slider,5,5,180 " .
         "rainCheckInterval:slider,1,1,30 " .
@@ -79,6 +82,9 @@ sub Gartenbewaesserung_Define {
     readingsBulkUpdate($hash, "ibcFilling", "no");
     readingsBulkUpdate($hash, "ibcToBarrelActive", "no");
     readingsBulkUpdate($hash, "rainDetectedSince", "never");
+    readingsBulkUpdate($hash, "remainingTime", "-");
+    readingsBulkUpdate($hash, "pauseActive", "no");
+    readingsBulkUpdate($hash, "pauseTimeRemaining", "-");
     readingsEndUpdate($hash, 1);
     
     # Set default attributes
@@ -98,6 +104,8 @@ sub Gartenbewaesserung_Define {
     $attr{$name}{rainDurationForIBC} = 30 if(!defined($attr{$name}{rainDurationForIBC}));
     $attr{$name}{rainCheckInterval} = 5 if(!defined($attr{$name}{rainCheckInterval}));
     $attr{$name}{pumpStartDelay} = 3 if(!defined($attr{$name}{pumpStartDelay}));
+    $attr{$name}{wateringPauseInterval} = 8 if(!defined($attr{$name}{wateringPauseInterval}));
+    $attr{$name}{wateringPauseDuration} = 20 if(!defined($attr{$name}{wateringPauseDuration}));
     
     # Default values for switches and sensors
     $attr{$name}{switchOnValue} = "ON" if(!defined($attr{$name}{switchOnValue}));
@@ -259,6 +267,126 @@ sub Gartenbewaesserung_Notify {
 }
 
 ##############################################################################
+# Update remaining time display
+##############################################################################
+sub Gartenbewaesserung_UpdateRemainingTime {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+    
+    RemoveInternalTimer($hash, "Gartenbewaesserung_UpdateRemainingTime");
+    
+    if(!defined($hash->{HELPER}{endTime}) || $hash->{HELPER}{endTime} <= 0) {
+        readingsSingleUpdate($hash, "remainingTime", "-", 1);
+        return;
+    }
+    
+    my $remaining = $hash->{HELPER}{endTime} - time();
+    
+    if($remaining <= 0) {
+        readingsSingleUpdate($hash, "remainingTime", "finishing...", 1);
+        return;
+    }
+    
+    # Format time
+    my $timeStr;
+    if($remaining >= 60) {
+        my $minutes = int($remaining / 60);
+        my $seconds = $remaining % 60;
+        $timeStr = sprintf("%d min %d sec", $minutes, $seconds);
+    }
+    else {
+        $timeStr = sprintf("%d sec", $remaining);
+    }
+    
+    readingsSingleUpdate($hash, "remainingTime", $timeStr, 1);
+    
+    # Schedule next update in 10 seconds
+    InternalTimer(gettimeofday() + 10, "Gartenbewaesserung_UpdateRemainingTime", $hash);
+}
+
+##############################################################################
+# Update pause time remaining
+##############################################################################
+sub Gartenbewaesserung_UpdatePauseTime {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+    
+    RemoveInternalTimer($hash, "Gartenbewaesserung_UpdatePauseTime");
+    
+    if(!defined($hash->{HELPER}{pauseEndTime}) || $hash->{HELPER}{pauseEndTime} <= 0) {
+        readingsSingleUpdate($hash, "pauseTimeRemaining", "-", 1);
+        return;
+    }
+    
+    my $remaining = $hash->{HELPER}{pauseEndTime} - time();
+    
+    if($remaining <= 0) {
+        readingsSingleUpdate($hash, "pauseTimeRemaining", "finishing...", 1);
+        return;
+    }
+    
+    # Format time
+    my $timeStr;
+    if($remaining >= 60) {
+        my $minutes = int($remaining / 60);
+        my $seconds = $remaining % 60;
+        $timeStr = sprintf("%d min %d sec", $minutes, $seconds);
+    }
+    else {
+        $timeStr = sprintf("%d sec", $remaining);
+    }
+    
+    readingsSingleUpdate($hash, "pauseTimeRemaining", $timeStr, 1);
+    
+    # Schedule next update in 10 seconds
+    InternalTimer(gettimeofday() + 10, "Gartenbewaesserung_UpdatePauseTime", $hash);
+}
+
+##############################################################################
+# Set end time and start countdown timer
+##############################################################################
+sub Gartenbewaesserung_SetEndTime {
+    my ($hash, $durationMinutes) = @_;
+    
+    $hash->{HELPER}{endTime} = time() + ($durationMinutes * 60);
+    Gartenbewaesserung_UpdateRemainingTime($hash);
+}
+
+##############################################################################
+# Clear end time and stop countdown
+##############################################################################
+sub Gartenbewaesserung_ClearEndTime {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+    
+    delete $hash->{HELPER}{endTime};
+    RemoveInternalTimer($hash, "Gartenbewaesserung_UpdateRemainingTime");
+    readingsSingleUpdate($hash, "remainingTime", "-", 1);
+}
+
+##############################################################################
+# Set pause end time and start countdown
+##############################################################################
+sub Gartenbewaesserung_SetPauseEndTime {
+    my ($hash, $durationMinutes) = @_;
+    
+    $hash->{HELPER}{pauseEndTime} = time() + ($durationMinutes * 60);
+    Gartenbewaesserung_UpdatePauseTime($hash);
+}
+
+##############################################################################
+# Clear pause time
+##############################################################################
+sub Gartenbewaesserung_ClearPauseTime {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+    
+    delete $hash->{HELPER}{pauseEndTime};
+    RemoveInternalTimer($hash, "Gartenbewaesserung_UpdatePauseTime");
+    readingsSingleUpdate($hash, "pauseTimeRemaining", "-", 1);
+}
+
+##############################################################################
 # Update sensor readings (initial read and refresh)
 ##############################################################################
 sub Gartenbewaesserung_UpdateSensorReadings {
@@ -373,6 +501,16 @@ sub Gartenbewaesserung_ValidateConfig {
                 }
             }
         }
+    }
+    
+    # Check pause settings
+    my $pauseInterval = AttrVal($name, "wateringPauseInterval", 8);
+    my $pauseDuration = AttrVal($name, "wateringPauseDuration", 20);
+    if($pauseInterval > 0) {
+        push @info, "Automatic pause: Every $pauseInterval min for $pauseDuration min barrel refill";
+    }
+    else {
+        push @info, "Automatic pause: DISABLED (continuous watering)";
     }
     
     # Check pump
@@ -614,6 +752,18 @@ sub Gartenbewaesserung_GetConfig {
     
     my $ibcToBarrelPump = AttrVal($name, "ibcToBarrelPumpDevice", "not configured");
     $config .= "  IBC to barrel pump: $ibcToBarrelPump\n";
+    
+    # Pause settings
+    $config .= "\nAUTOMATISCHE PAUSEN:\n";
+    my $pauseInterval = AttrVal($name, "wateringPauseInterval", 8);
+    my $pauseDuration = AttrVal($name, "wateringPauseDuration", 20);
+    if($pauseInterval > 0) {
+        $config .= "  Pause interval: Every $pauseInterval min\n";
+        $config .= "  Pause duration: $pauseDuration min (barrel refill)\n";
+    }
+    else {
+        $config .= "  Automatic pause: DISABLED (continuous watering)\n";
+    }
     
     # Barrel
     $config .= "\nFASS:\n";
@@ -899,6 +1049,9 @@ sub Gartenbewaesserung_FillBarrelForCircuit {
     
     my $duration = AttrVal($name, "barrelFillDuration", 10);
     
+    # Set end time
+    Gartenbewaesserung_SetEndTime($hash, $duration);
+    
     Log3 $name, 3, "$name: Filling barrel for $duration minutes before circuit $circuitNum";
     
     # Schedule fill stop
@@ -921,6 +1074,8 @@ sub Gartenbewaesserung_StopBarrelFillForCircuit {
     
     $hash->{HELPER}{barrelFilling} = 0;
     readingsSingleUpdate($hash, "barrelLevel", 100, 1);
+    
+    Gartenbewaesserung_ClearEndTime($hash);
     
     Log3 $name, 4, "$name: Barrel filling stopped, continuing with circuit $circuitNum";
     
@@ -955,6 +1110,9 @@ sub Gartenbewaesserung_RunCircuit {
             # Open valve
             Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
             
+            # Set end time
+            Gartenbewaesserung_SetEndTime($hash, $duration);
+            
             readingsBeginUpdate($hash);
             readingsBulkUpdate($hash, "phase", "watering circuit $circuitNum");
             readingsBulkUpdate($hash, "currentValve", $circuitNum);
@@ -971,6 +1129,9 @@ sub Gartenbewaesserung_RunCircuit {
     else {
         # No pump, just open valve
         Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
+        
+        # Set end time
+        Gartenbewaesserung_SetEndTime($hash, $duration);
         
         readingsBeginUpdate($hash);
         readingsBulkUpdate($hash, "phase", "watering circuit $circuitNum");
@@ -1005,6 +1166,8 @@ sub Gartenbewaesserung_FinishCircuit {
     
     $hash->{HELPER}{circuitMode} = 0;
     delete $hash->{HELPER}{circuitNumber};
+    
+    Gartenbewaesserung_ClearEndTime($hash);
     
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "state", "idle");
@@ -1060,11 +1223,13 @@ sub Gartenbewaesserung_StartWatering {
     $hash->{HELPER}{wateringIndex} = 0;
     $hash->{HELPER}{totalValves} = scalar(@activeValves);
     $hash->{HELPER}{watering} = 1;
+    $hash->{HELPER}{wateringStartTime} = time();  # Track start time for pauses
     
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "state", "watering");
     readingsBulkUpdate($hash, "phase", "starting");
     readingsBulkUpdate($hash, "cycleProgress", "0/" . scalar(@activeValves));
+    readingsBulkUpdate($hash, "pauseActive", "no");
     readingsEndUpdate($hash, 1);
     
     Log3 $name, 3, "$name: Starting watering cycle with " . scalar(@activeValves) . " valves: " . join(", ", @activeValves);
@@ -1076,6 +1241,122 @@ sub Gartenbewaesserung_StartWatering {
 }
 
 ##############################################################################
+# Check if pause is needed
+##############################################################################
+sub Gartenbewaesserung_CheckPauseNeeded {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+    
+    my $pauseInterval = AttrVal($name, "wateringPauseInterval", 8);
+    
+    # If pause interval is 0, no pauses
+    return 0 if($pauseInterval == 0);
+    
+    # Calculate time since watering started (or last pause ended)
+    my $lastPauseEnd = $hash->{HELPER}{lastPauseEnd} || $hash->{HELPER}{wateringStartTime} || time();
+    my $elapsedMinutes = (time() - $lastPauseEnd) / 60;
+    
+    # Check if we need a pause
+    if($elapsedMinutes >= $pauseInterval) {
+        Log3 $name, 3, "$name: Pause needed after $elapsedMinutes minutes of watering";
+        return 1;
+    }
+    
+    return 0;
+}
+
+##############################################################################
+# Start watering pause for barrel refill
+##############################################################################
+sub Gartenbewaesserung_StartWateringPause {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+    
+    my $pauseDuration = AttrVal($name, "wateringPauseDuration", 20);
+    
+    Log3 $name, 3, "$name: Starting watering pause for $pauseDuration minutes (barrel refill)";
+    
+    # Stop current valve and pump
+    my $currentValve = ReadingsVal($name, "currentValve", "none");
+    if($currentValve ne "none" && $currentValve =~ /^\d+$/) {
+        my $valveDevice = AttrVal($name, "valve${currentValve}Device", "");
+        if($valveDevice ne "") {
+            Gartenbewaesserung_SwitchDevice($name, $valveDevice, "off");
+            Log3 $name, 4, "$name: Closed valve $currentValve for pause";
+        }
+    }
+    
+    # Stop pump
+    my $pumpDevice = AttrVal($name, "pumpDevice", "");
+    if($pumpDevice ne "") {
+        Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "off");
+        Log3 $name, 4, "$name: Stopped pump for pause";
+    }
+    
+    # Mark as paused
+    $hash->{HELPER}{pauseActive} = 1;
+    
+    # Clear valve end time, set pause end time
+    Gartenbewaesserung_ClearEndTime($hash);
+    Gartenbewaesserung_SetPauseEndTime($hash, $pauseDuration);
+    
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, "state", "paused");
+    readingsBulkUpdate($hash, "phase", "pause - barrel refilling");
+    readingsBulkUpdate($hash, "pauseActive", "yes");
+    readingsEndUpdate($hash, 1);
+    
+    # Start barrel filling
+    my $fillValve = AttrVal($name, "barrelFillValveDevice", "");
+    if($fillValve ne "") {
+        Gartenbewaesserung_SwitchDevice($name, $fillValve, "on");
+        Log3 $name, 4, "$name: Opened barrel fill valve";
+    }
+    
+    # Schedule pause end
+    InternalTimer(gettimeofday() + ($pauseDuration * 60), sub {
+        Gartenbewaesserung_EndWateringPause($hash);
+    }, $hash);
+}
+
+##############################################################################
+# End watering pause and resume
+##############################################################################
+sub Gartenbewaesserung_EndWateringPause {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+    
+    Log3 $name, 3, "$name: Ending watering pause, resuming cycle";
+    
+    # Close barrel fill valve
+    my $fillValve = AttrVal($name, "barrelFillValveDevice", "");
+    if($fillValve ne "") {
+        Gartenbewaesserung_SwitchDevice($name, $fillValve, "off");
+        Log3 $name, 4, "$name: Closed barrel fill valve";
+    }
+    
+    # Mark pause as ended
+    $hash->{HELPER}{pauseActive} = 0;
+    $hash->{HELPER}{lastPauseEnd} = time();
+    
+    # Reset barrel level
+    readingsSingleUpdate($hash, "barrelLevel", 100, 1);
+    
+    Gartenbewaesserung_ClearPauseTime($hash);
+    
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, "state", "watering");
+    readingsBulkUpdate($hash, "phase", "resuming");
+    readingsBulkUpdate($hash, "pauseActive", "no");
+    readingsEndUpdate($hash, 1);
+    
+    # Small delay, then continue with next valve
+    InternalTimer(gettimeofday() + 2, sub {
+        Gartenbewaesserung_NextValve($hash);
+    }, $hash);
+}
+
+##############################################################################
 # Process next valve in queue
 ##############################################################################
 sub Gartenbewaesserung_NextValve {
@@ -1083,6 +1364,12 @@ sub Gartenbewaesserung_NextValve {
     my $name = $hash->{NAME};
     
     return if(!$hash->{HELPER}{watering});
+    
+    # Check if pause is needed BEFORE processing next valve
+    if(!$hash->{HELPER}{pauseActive} && Gartenbewaesserung_CheckPauseNeeded($hash)) {
+        Gartenbewaesserung_StartWateringPause($hash);
+        return;
+    }
     
     my $queue = $hash->{HELPER}{wateringQueue};
     my $index = $hash->{HELPER}{wateringIndex};
@@ -1103,7 +1390,7 @@ sub Gartenbewaesserung_NextValve {
         return;
     }
     
-    # Check if barrel needs filling
+    # Check if barrel needs filling (initial check, not pause-based)
     my $barrelLevel = ReadingsVal($name, "barrelLevel", 100);
     my $threshold = AttrVal($name, "barrelFillThreshold", 30);
     
@@ -1150,6 +1437,9 @@ sub Gartenbewaesserung_OpenValve {
     
     Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
     
+    # Set end time
+    Gartenbewaesserung_SetEndTime($hash, $duration);
+    
     my $index = $hash->{HELPER}{wateringIndex} + 1;
     my $total = $hash->{HELPER}{totalValves};
     
@@ -1179,6 +1469,8 @@ sub Gartenbewaesserung_CloseValve {
     
     Log3 $name, 4, "$name: Valve $valveNum closed";
     
+    Gartenbewaesserung_ClearEndTime($hash);
+    
     readingsSingleUpdate($hash, "currentValve", "none", 1);
     
     # Turn off pump briefly
@@ -1186,6 +1478,12 @@ sub Gartenbewaesserung_CloseValve {
     if($pumpDevice ne "") {
         Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "off");
     }
+    
+    # Decrease barrel level (simulated)
+    my $currentLevel = ReadingsVal($name, "barrelLevel", 100);
+    my $newLevel = $currentLevel - 12;  # Each valve uses about 12%
+    $newLevel = 0 if($newLevel < 0);
+    readingsSingleUpdate($hash, "barrelLevel", $newLevel, 1);
     
     # Move to next valve
     $hash->{HELPER}{wateringIndex}++;
@@ -1213,6 +1511,9 @@ sub Gartenbewaesserung_FillBarrel {
     
     my $duration = AttrVal($name, "barrelFillDuration", 10);
     
+    # Set end time
+    Gartenbewaesserung_SetEndTime($hash, $duration);
+    
     Log3 $name, 3, "$name: Filling barrel for $duration minutes";
     
     # Schedule fill stop
@@ -1235,6 +1536,8 @@ sub Gartenbewaesserung_StopBarrelFill {
     
     $hash->{HELPER}{barrelFilling} = 0;
     readingsSingleUpdate($hash, "barrelLevel", 100, 1);
+    
+    Gartenbewaesserung_ClearEndTime($hash);
     
     Log3 $name, 4, "$name: Barrel filling stopped";
     
@@ -1275,11 +1578,17 @@ sub Gartenbewaesserung_FinishWatering {
     $hash->{HELPER}{watering} = 0;
     delete $hash->{HELPER}{wateringQueue};
     delete $hash->{HELPER}{wateringIndex};
+    delete $hash->{HELPER}{wateringStartTime};
+    delete $hash->{HELPER}{lastPauseEnd};
+    
+    Gartenbewaesserung_ClearEndTime($hash);
+    Gartenbewaesserung_ClearPauseTime($hash);
     
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "state", "idle");
     readingsBulkUpdate($hash, "phase", "idle");
     readingsBulkUpdate($hash, "currentValve", "none");
+    readingsBulkUpdate($hash, "pauseActive", "no");
     readingsBulkUpdate($hash, "lastWatering", TimeNow());
     readingsEndUpdate($hash, 1);
     
@@ -1327,14 +1636,21 @@ sub Gartenbewaesserung_StopAll {
     $hash->{HELPER}{watering} = 0;
     $hash->{HELPER}{barrelFilling} = 0;
     $hash->{HELPER}{circuitMode} = 0;
+    $hash->{HELPER}{pauseActive} = 0;
     delete $hash->{HELPER}{wateringQueue};
     delete $hash->{HELPER}{wateringIndex};
     delete $hash->{HELPER}{circuitNumber};
+    delete $hash->{HELPER}{wateringStartTime};
+    delete $hash->{HELPER}{lastPauseEnd};
+    
+    Gartenbewaesserung_ClearEndTime($hash);
+    Gartenbewaesserung_ClearPauseTime($hash);
     
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "state", "stopped");
     readingsBulkUpdate($hash, "phase", "idle");
     readingsBulkUpdate($hash, "currentValve", "none");
+    readingsBulkUpdate($hash, "pauseActive", "no");
     readingsEndUpdate($hash, 1);
     
     Log3 $name, 3, "$name: All operations stopped";
@@ -1401,6 +1717,8 @@ sub Gartenbewaesserung_StopCurrentValve {
     if($pumpDevice ne "") {
         Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "off");
     }
+    
+    Gartenbewaesserung_ClearEndTime($hash);
     
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "state", "idle");
@@ -1540,6 +1858,7 @@ sub Gartenbewaesserung_StartIBCtoBarrel {
     
     # Check if we need a pump for IBC to barrel
     my $ibcToBarrelPump = AttrVal($name, "ibcToBarrelPumpDevice", "");
+    my $duration = AttrVal($name, "ibcToBarrelDuration", 15);
     
     if($ibcToBarrelPump ne "") {
         # Use pump for IBC to barrel transfer
@@ -1552,13 +1871,15 @@ sub Gartenbewaesserung_StartIBCtoBarrel {
             Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on");
             $hash->{HELPER}{ibcToBarrelActive} = 1;
             
+            # Set end time
+            Gartenbewaesserung_SetEndTime($hash, $duration);
+            
             readingsBeginUpdate($hash);
             readingsBulkUpdate($hash, "ibcToBarrelActive", "yes");
             readingsBulkUpdate($hash, "state", "ibc to barrel");
             readingsBulkUpdate($hash, "phase", "transferring water from IBC (pump)");
             readingsEndUpdate($hash, 1);
             
-            my $duration = AttrVal($name, "ibcToBarrelDuration", 15);
             Log3 $name, 3, "$name: IBC to barrel transfer started with pump for $duration minutes";
             
             # Schedule auto-stop
@@ -1572,13 +1893,15 @@ sub Gartenbewaesserung_StartIBCtoBarrel {
         Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on");
         $hash->{HELPER}{ibcToBarrelActive} = 1;
         
+        # Set end time
+        Gartenbewaesserung_SetEndTime($hash, $duration);
+        
         readingsBeginUpdate($hash);
         readingsBulkUpdate($hash, "ibcToBarrelActive", "yes");
         readingsBulkUpdate($hash, "state", "ibc to barrel");
         readingsBulkUpdate($hash, "phase", "transferring water from IBC (gravity)");
         readingsEndUpdate($hash, 1);
         
-        my $duration = AttrVal($name, "ibcToBarrelDuration", 15);
         Log3 $name, 3, "$name: IBC to barrel transfer started (gravity) for $duration minutes";
         
         # Schedule auto-stop
@@ -1612,6 +1935,8 @@ sub Gartenbewaesserung_StopIBCtoBarrel {
     }
     
     $hash->{HELPER}{ibcToBarrelActive} = 0;
+    
+    Gartenbewaesserung_ClearEndTime($hash);
     
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "ibcToBarrelActive", "no");
@@ -1721,7 +2046,10 @@ sub Gartenbewaesserung_GetStatus {
     $status .= "State: " . ReadingsVal($name, "state", "unknown") . "\n";
     $status .= "Phase: " . ReadingsVal($name, "phase", "unknown") . "\n";
     $status .= "Current Valve: " . ReadingsVal($name, "currentValve", "none") . "\n";
+    $status .= "Remaining Time: " . ReadingsVal($name, "remainingTime", "-") . "\n";
     $status .= "Cycle Progress: " . ReadingsVal($name, "cycleProgress", "0/0") . "\n";
+    $status .= "Pause Active: " . ReadingsVal($name, "pauseActive", "no") . "\n";
+    $status .= "Pause Time Remaining: " . ReadingsVal($name, "pauseTimeRemaining", "-") . "\n";
     $status .= "IBC Filling: " . ReadingsVal($name, "ibcFilling", "no") . "\n";
     $status .= "IBC to Barrel: " . ReadingsVal($name, "ibcToBarrelActive", "no") . "\n";
     $status .= "Barrel Full: " . ReadingsVal($name, "barrelFull", "not configured") . "\n";
@@ -1747,6 +2075,7 @@ sub Gartenbewaesserung_GetStatus {
 <ul>
     <p>Modul für intelligente Gartenbewässerung mit mehreren Ventilen, Regenwasserfass und IBC-Container.</p>
     <p><b>Unterstützt MQTT2 Relay Boards (z.B. Tasmota) und dynamische Werte-Erkennung</b></p>
+    <p><b>Automatische Pausen zum Fass-Nachfüllen während Bewässerung</b></p>
     
     <b>Define</b>
     <ul>
@@ -1776,16 +2105,21 @@ sub Gartenbewaesserung_GetStatus {
     
     <b>Attributes</b>
     <ul>
+        <li><code>wateringPauseInterval</code> - Pause alle X Minuten (0 = keine Pausen, Standard: 8)</li>
+        <li><code>wateringPauseDuration</code> - Pause-Dauer zum Nachfüllen (Standard: 20 min)</li>
         <li><code>pumpDevice</code> - Hauptpumpe (für Bewässerung & IBC-Befüllung)</li>
         <li><code>ibcToBarrelPumpDevice</code> - Optional: Separate Pumpe für IBC → Fass</li>
         <li><code>ibcToBarrelValveDevice</code> - Ventil für IBC → Fass</li>
         <li><code>ibcToBarrelDuration</code> - Dauer des Transfers (Standard: 15 min)</li>
     </ul>
     
-    <b>Wasser-Fluss:</b>
+    <b>Readings</b>
     <ul>
-        <li><b>Fass → IBC:</b> Pumpe + ibcFillValveDevice (Wasser HOCH pumpen)</li>
-        <li><b>IBC → Fass:</b> ibcToBarrelValveDevice + optional ibcToBarrelPumpDevice (Schwerkraft oder Pumpe)</li>
+        <li><code>remainingTime</code> - Verbleibende Zeit der aktuellen Operation</li>
+        <li><code>pauseActive</code> - Ist Pause aktiv? (yes/no)</li>
+        <li><code>pauseTimeRemaining</code> - Verbleibende Pause-Zeit</li>
+        <li><code>currentValve</code> - Aktuell aktives Ventil</li>
+        <li><code>phase</code> - Aktuelle Phase der Bewässerung</li>
     </ul>
 </ul>
 
