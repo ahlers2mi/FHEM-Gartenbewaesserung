@@ -2339,31 +2339,4 @@ sub Gartenbewaesserung_GetStatus {
 
 =end html
 
-=begin html_DE
-
-<a id="Gartenbewaesserung"></a>
-<h3>Gartenbewaesserung</h3>
-<ul>
-    <p>FHEM Modul für intelligente Gartenbewässerung mit bis zu 8 Ventilen, Regenwasserfass und IBC-Container.</p>
-    
-    <h4>Features</h4>
-    <ul>
-        <li>Bis zu 8 Magnetventile für verschiedene Bewässerungsbereiche</li>
-        <li>Unterstützt MQTT2 Relay Boards (z.B. Tasmota mit 8-Kanal Relay Board)</li>
-        <li>Automatische Füll-Pausen während der Bewässerung (Fass wird nachgefüllt)</li>
-        <li>Regenwasser-Management mit IBC-Container</li>
-        <li>Feuchtigkeitssensor-Integration (überspringt Bewässerung bei ausreichender Feuchtigkeit)</li>
-        <li>Regensensor-Integration (automatische IBC-Befüllung bei Regen)</li>
-        <li>Zeitgesteuerte Bewässerung (bis zu 3 Startzeiten pro Tag)</li>
-        <li>Einzelkreislauf-Modus (z.B. für Gewächshaus mit eigenem Feuchtigkeitssensor)</li>
-        <li>Flexible Werte-Erkennung (on/off, true/false, 1/0, open/closed, etc.)</li>
-        <li>Live-Countdown der verbleibenden Zeit</li>
-        <li>Umfassende Konfigurationsvalidierung</li>
-    </ul>
-
-    <p>Siehe englische Dokumentation oben für Details zu Define, Set, Get, Attributes, Readings und Beispiele.</p>
-</ul>
-
-=end html_DE
-
 =cut
