@@ -3,9 +3,33 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
+#     Version 1.0.12 - 2026-04-29
+#
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
 #     Automatische Füll-Pausen während Bewässerung
+#
+##############################################################################
+#
+# Versionshistorie:
+# 1.0.12 - 2026-04-29  Fix: Endlosschleife nach Pause behoben (Restzeit wird korrekt fortgesetzt)
+#                      Fix: Fass-voll Sensor schließt Ventil während Pause und beendet Pause vorzeitig
+#                      Neu: Negatives pumpStartDelay (-X = Ventil X Sek VOR Pumpe öffnen)
+#                      Neu: IBC→Fass Befüllung während Pausen (statt Hauswasseranschluss, wenn IBC nicht leer)
+#                      Neu: ibcEmptySensorDevice für intelligente Quellwahl in Pausen
+#                      Neu: Versionsnummer und Änderungshistorie
+# 1.0.11 - 2026-04-29  Neu: Automatische Füll-Pausen während Bewässerung (wateringPauseInterval/Duration)
+# 1.0.10 - 2026-04-29  Neu: Ausführliche Dokumentation
+# 1.0.9  - 2026-04-29  Neu: Verbleibende Zeit als Reading (remainingTime)
+# 1.0.8  - 2026-04-29  Neu: Initiale Sensor-Werte beim Start auslesen
+# 1.0.7  - 2026-04-29  Neu: Optionale separate Pumpe für IBC→Fass Rücklauf (ibcToBarrelPumpDevice)
+# 1.0.6  - 2026-04-29  Neu: IBC-zu-Fass Rücklauf mit Schwerkraft oder Pumpe
+# 1.0.5  - 2026-04-29  Neu: Optionale separate Pumpe für IBC→Fass mit pumpStartDelay
+# 1.0.4  - 2026-04-29  Neu: Ausführliches Set mit Validierung und Einzelkreislauf-Modus
+# 1.0.3  - 2026-04-29  Fix: Set/Get Befehle korrekt implementiert
+# 1.0.2  - 2026-04-29  Neu: Dynamische Werte-Erkennung für Sensoren und Schalter
+# 1.0.1  - 2026-04-29  Neu: MQTT2 Support für Relay Boards (Device:Reading Format)
+# 1.0.0  - 2026-04-29  Initiale Version mit allen Basis-Features
 #
 ##############################################################################
 
@@ -19,6 +43,7 @@ use POSIX;
 sub Gartenbewaesserung_Initialize {
     my ($hash) = @_;
 
+    $hash->{VERSION}    = '1.0.12';
     $hash->{DefFn}      = "Gartenbewaesserung_Define";
     $hash->{UndefFn}    = "Gartenbewaesserung_Undef";
     $hash->{SetFn}      = "Gartenbewaesserung_Set";
@@ -36,6 +61,7 @@ sub Gartenbewaesserung_Initialize {
         "ibcFillValveDevice " .
         "ibcToBarrelValveDevice " .
         "ibcFullSensorDevice " .
+        "ibcEmptySensorDevice " .
         "rainSensorDevice " .
         "moistureSensorDevice " .
         "valve1Duration:slider,1,1,120 valve2Duration:slider,1,1,120 " .
@@ -51,7 +77,7 @@ sub Gartenbewaesserung_Initialize {
         "startTime1 startTime2 startTime3 " .
         "rainDurationForIBC:slider,5,5,180 " .
         "rainCheckInterval:slider,1,1,30 " .
-        "pumpStartDelay:slider,0,1,30 " .
+        "pumpStartDelay:slider,-30,1,30 " .
         "activeValves " .
         "weekdaysOnly:0,1 " .
         "manualMode:0,1 " .
@@ -59,6 +85,7 @@ sub Gartenbewaesserung_Initialize {
         "rainSensorActiveValue rainSensorInactiveValue " .
         "barrelFullSensorActiveValue barrelFullSensorInactiveValue " .
         "ibcFullSensorActiveValue ibcFullSensorInactiveValue " .
+        "ibcEmptySensorActiveValue ibcEmptySensorInactiveValue " .
         "moistureSensorReading moistureSensorInvert:0,1 " .
         "disable:0,1 " .
         $readingFnAttributes;
@@ -121,6 +148,8 @@ sub Gartenbewaesserung_Define {
     
     # Start timer for rain monitoring
     InternalTimer(gettimeofday() + 30, "Gartenbewaesserung_CheckRain", $hash);
+    
+    Log3 $name, 3, "$name: Gartenbewaesserung v" . $hash->{VERSION} . " initialized";
     
     return undef;
 }
@@ -188,13 +217,16 @@ sub Gartenbewaesserung_Set {
 sub Gartenbewaesserung_Get {
     my ($hash, $name, $cmd, @args) = @_;
     
-    my $list = "status:noArg config:noArg";
+    my $list = "status:noArg config:noArg version:noArg";
     
     if($cmd eq "status") {
         return Gartenbewaesserung_GetStatus($hash);
     }
     elsif($cmd eq "config") {
         return Gartenbewaesserung_GetConfig($hash);
+    }
+    elsif($cmd eq "version") {
+        return "Gartenbewaesserung Version " . $hash->{VERSION};
     } else {
         return "Unknown argument $cmd, choose one of $list";
     }
@@ -258,6 +290,22 @@ sub Gartenbewaesserung_Notify {
                 elsif(Gartenbewaesserung_CheckSensorInactive($name, $event, $ibcReading,
                       AttrVal($name, "ibcFullSensorInactiveValue", ""))) {
                     readingsSingleUpdate($hash, "ibcFull", "no", 1);
+                }
+            }
+        }
+        
+        # IBC empty sensor
+        my $ibcEmptySensorDef = AttrVal($name, "ibcEmptySensorDevice", "");
+        if($ibcEmptySensorDef ne "") {
+            my ($ibcEmptyDev, $ibcEmptyReading) = Gartenbewaesserung_ParseDevice($ibcEmptySensorDef);
+            if($devName eq $ibcEmptyDev) {
+                my $activeValue = AttrVal($name, "ibcEmptySensorActiveValue", "");
+                if(Gartenbewaesserung_CheckSensorActive($name, $event, $ibcEmptyReading, $activeValue)) {
+                    readingsSingleUpdate($hash, "ibcEmpty", "yes", 1);
+                }
+                elsif(Gartenbewaesserung_CheckSensorInactive($name, $event, $ibcEmptyReading,
+                      AttrVal($name, "ibcEmptySensorInactiveValue", ""))) {
+                    readingsSingleUpdate($hash, "ibcEmpty", "no", 1);
                 }
             }
         }
@@ -423,6 +471,19 @@ sub Gartenbewaesserung_UpdateSensorReadings {
         readingsBulkUpdate($hash, "ibcFull", "not configured");
     }
     
+    # IBC empty sensor
+    my $ibcEmptySensorDef = AttrVal($name, "ibcEmptySensorDevice", "");
+    if($ibcEmptySensorDef ne "") {
+        my $activeValue = AttrVal($name, "ibcEmptySensorActiveValue", "");
+        my $inactiveValue = AttrVal($name, "ibcEmptySensorInactiveValue", "");
+        my $value = Gartenbewaesserung_GetSensorValue($name, $ibcEmptySensorDef, $activeValue, $inactiveValue);
+        readingsBulkUpdate($hash, "ibcEmpty", $value ? "yes" : "no");
+        Log3 $name, 4, "$name: IBC empty sensor: " . ($value ? "yes" : "no");
+    }
+    else {
+        readingsBulkUpdate($hash, "ibcEmpty", "not configured");
+    }
+    
     # Rain sensor
     my $rainSensorDef = AttrVal($name, "rainSensorDevice", "");
     if($rainSensorDef ne "") {
@@ -468,6 +529,9 @@ sub Gartenbewaesserung_ValidateConfig {
     
     Log3 $name, 3, "$name: Starting configuration validation";
     
+    # Version info
+    push @info, "Version: " . $hash->{VERSION};
+    
     # Check active valves
     my $activeValvesStr = AttrVal($name, "activeValves", "");
     if($activeValvesStr eq "") {
@@ -507,7 +571,7 @@ sub Gartenbewaesserung_ValidateConfig {
     my $pauseInterval = AttrVal($name, "wateringPauseInterval", 8);
     my $pauseDuration = AttrVal($name, "wateringPauseDuration", 20);
     if($pauseInterval > 0) {
-        push @info, "Automatic pause: Every $pauseInterval min for $pauseDuration min barrel refill";
+        push @info, "Automatic pause: Every $pauseInterval min for $pauseDuration min refill";
     }
     else {
         push @info, "Automatic pause: DISABLED (continuous watering)";
@@ -524,7 +588,10 @@ sub Gartenbewaesserung_ValidateConfig {
             push @errors, "Pump device '$device' does not exist";
         }
         else {
-            push @info, "Pump: $pumpDevice OK";
+            my $delay = AttrVal($name, "pumpStartDelay", 3);
+            my $delayInfo = $delay < 0 ? "valve opens ${delay}s BEFORE pump" : 
+                           $delay > 0 ? "pump starts ${delay}s BEFORE valve" : "simultaneous";
+            push @info, "Pump: $pumpDevice ($delayInfo) OK";
         }
     }
     
@@ -539,7 +606,7 @@ sub Gartenbewaesserung_ValidateConfig {
             push @errors, "Barrel fill valve device '$device' does not exist";
         }
         else {
-            push @info, "Barrel fill valve: $barrelFillValve OK";
+            push @info, "Barrel fill valve (water supply): $barrelFillValve OK";
         }
     }
     
@@ -571,7 +638,12 @@ sub Gartenbewaesserung_ValidateConfig {
             push @errors, "IBC fill valve device '$device' does not exist";
         }
         else {
-            push @info, "IBC fill valve: $ibcFillValve OK";
+            push @info, "IBC fill valve (barrel→IBC): $ibcFillValve OK";
+            
+            # WARNING: Check if same as barrel fill valve
+            if($barrelFillValve eq $ibcFillValve) {
+                push @warnings, "⚠️  barrelFillValveDevice and ibcFillValveDevice are IDENTICAL! They should be different valves.";
+            }
         }
     }
     
@@ -586,7 +658,7 @@ sub Gartenbewaesserung_ValidateConfig {
             push @errors, "IBC to barrel valve device '$device' does not exist";
         }
         else {
-            push @info, "IBC to barrel valve: $ibcToBarrelValve OK";
+            push @info, "IBC to barrel valve (IBC→barrel): $ibcToBarrelValve OK";
         }
     }
     
@@ -619,6 +691,23 @@ sub Gartenbewaesserung_ValidateConfig {
             $reading = "state" if($reading eq "");
             my $value = ReadingsVal($device, $reading, "unknown");
             push @info, "IBC full sensor: $ibcFullSensor (current: $value) OK";
+        }
+    }
+    
+    # Check IBC empty sensor
+    my $ibcEmptySensor = AttrVal($name, "ibcEmptySensorDevice", "");
+    if($ibcEmptySensor eq "") {
+        push @info, "No IBC empty sensor (optional, defaults to: use IBC if not full)";
+    }
+    else {
+        my ($device, $reading) = Gartenbewaesserung_ParseDevice($ibcEmptySensor);
+        if(!defined($defs{$device})) {
+            push @errors, "IBC empty sensor device '$device' does not exist";
+        }
+        else {
+            $reading = "state" if($reading eq "");
+            my $value = ReadingsVal($device, $reading, "unknown");
+            push @info, "IBC empty sensor: $ibcEmptySensor (current: $value) OK";
         }
     }
     
@@ -731,7 +820,8 @@ sub Gartenbewaesserung_GetConfig {
     my ($hash) = @_;
     my $name = $hash->{NAME};
     
-    my $config = "\n=== Gartenbewässerung Configuration ===\n\n";
+    my $config = "\n=== Gartenbewässerung Configuration ===\n";
+    $config .= "Version: " . $hash->{VERSION} . "\n\n";
     
     # Valves
     $config .= "VENTILE:\n";
@@ -747,8 +837,10 @@ sub Gartenbewaesserung_GetConfig {
     $config .= "\nPUMPE:\n";
     my $pump = AttrVal($name, "pumpDevice", "not configured");
     my $pumpDelay = AttrVal($name, "pumpStartDelay", 3);
+    my $delayText = $pumpDelay < 0 ? "valve opens " . abs($pumpDelay) . " sec BEFORE pump" :
+                    $pumpDelay > 0 ? "pump starts $pumpDelay sec BEFORE valve" : "simultaneous";
     $config .= "  Main pump: $pump\n";
-    $config .= "  Pump start delay: $pumpDelay sec\n";
+    $config .= "  Pump timing: $delayText\n";
     
     my $ibcToBarrelPump = AttrVal($name, "ibcToBarrelPumpDevice", "not configured");
     $config .= "  IBC to barrel pump: $ibcToBarrelPump\n";
@@ -759,7 +851,7 @@ sub Gartenbewaesserung_GetConfig {
     my $pauseDuration = AttrVal($name, "wateringPauseDuration", 20);
     if($pauseInterval > 0) {
         $config .= "  Pause interval: Every $pauseInterval min\n";
-        $config .= "  Pause duration: $pauseDuration min (barrel refill)\n";
+        $config .= "  Pause duration: $pauseDuration min (refill from IBC or water supply)\n";
     }
     else {
         $config .= "  Automatic pause: DISABLED (continuous watering)\n";
@@ -771,7 +863,7 @@ sub Gartenbewaesserung_GetConfig {
     my $barrelSensor = AttrVal($name, "barrelFullSensorDevice", "not configured");
     my $barrelDur = AttrVal($name, "barrelFillDuration", 10);
     my $barrelThreshold = AttrVal($name, "barrelFillThreshold", 30);
-    $config .= "  Fill valve: $barrelValve\n";
+    $config .= "  Fill valve (water supply): $barrelValve\n";
     $config .= "  Full sensor: $barrelSensor\n";
     $config .= "  Fill duration: $barrelDur min\n";
     $config .= "  Fill threshold: $barrelThreshold%\n";
@@ -781,11 +873,13 @@ sub Gartenbewaesserung_GetConfig {
     my $ibcValve = AttrVal($name, "ibcFillValveDevice", "not configured");
     my $ibcToBarrelValve = AttrVal($name, "ibcToBarrelValveDevice", "not configured");
     my $ibcSensor = AttrVal($name, "ibcFullSensorDevice", "not configured");
+    my $ibcEmptySensor = AttrVal($name, "ibcEmptySensorDevice", "not configured");
     my $rainDur = AttrVal($name, "rainDurationForIBC", 30);
     my $ibcToBarrelDur = AttrVal($name, "ibcToBarrelDuration", 15);
-    $config .= "  Fill valve (from barrel): $ibcValve\n";
-    $config .= "  To barrel valve (return): $ibcToBarrelValve\n";
+    $config .= "  Fill valve (barrel→IBC): $ibcValve\n";
+    $config .= "  To barrel valve (IBC→barrel): $ibcToBarrelValve\n";
     $config .= "  Full sensor: $ibcSensor\n";
+    $config .= "  Empty sensor: $ibcEmptySensor\n";
     $config .= "  Rain duration needed: $rainDur min\n";
     $config .= "  IBC to barrel duration: $ibcToBarrelDur min\n";
     
@@ -1098,53 +1192,57 @@ sub Gartenbewaesserung_RunCircuit {
     # Make sure IBC valve is closed
     Gartenbewaesserung_StopIBCFill($hash);
     
-    # Start pump first
+    # Get pump delay
     my $pumpDevice = AttrVal($name, "pumpDevice", "");
+    my $delay = AttrVal($name, "pumpStartDelay", 3);
+    
     if($pumpDevice ne "") {
-        Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
-        Log3 $name, 4, "$name: Pump started for circuit $circuitNum";
-        
-        # Wait for pump to stabilize
-        my $delay = AttrVal($name, "pumpStartDelay", 3);
-        InternalTimer(gettimeofday() + $delay, sub {
-            # Open valve
+        if($delay < 0) {
+            # Negative delay: Open valve FIRST, then pump
             Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
+            Log3 $name, 4, "$name: Circuit $circuitNum valve opened (negative delay)";
             
-            # Set end time
-            Gartenbewaesserung_SetEndTime($hash, $duration);
-            
-            readingsBeginUpdate($hash);
-            readingsBulkUpdate($hash, "phase", "watering circuit $circuitNum");
-            readingsBulkUpdate($hash, "currentValve", $circuitNum);
-            readingsEndUpdate($hash, 1);
-            
-            Log3 $name, 3, "$name: Circuit $circuitNum valve opened for $duration minutes";
-            
-            # Schedule valve close
-            InternalTimer(gettimeofday() + ($duration * 60), sub {
-                Gartenbewaesserung_FinishCircuit($hash, $circuitNum);
+            InternalTimer(gettimeofday() + abs($delay), sub {
+                Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+                Log3 $name, 4, "$name: Pump started after valve (negative delay)";
             }, $hash);
-        }, $hash);
+        }
+        elsif($delay > 0) {
+            # Positive delay: Start pump FIRST, wait, then valve
+            Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+            Log3 $name, 4, "$name: Pump started for circuit $circuitNum";
+            
+            InternalTimer(gettimeofday() + $delay, sub {
+                Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
+                Log3 $name, 4, "$name: Circuit $circuitNum valve opened after pump delay";
+            }, $hash);
+        }
+        else {
+            # Zero delay: Simultaneous
+            Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+            Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
+            Log3 $name, 4, "$name: Pump and valve started simultaneously";
+        }
     }
     else {
         # No pump, just open valve
         Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
-        
-        # Set end time
-        Gartenbewaesserung_SetEndTime($hash, $duration);
-        
-        readingsBeginUpdate($hash);
-        readingsBulkUpdate($hash, "phase", "watering circuit $circuitNum");
-        readingsBulkUpdate($hash, "currentValve", $circuitNum);
-        readingsEndUpdate($hash, 1);
-        
-        Log3 $name, 3, "$name: Circuit $circuitNum valve opened for $duration minutes (no pump)";
-        
-        # Schedule valve close
-        InternalTimer(gettimeofday() + ($duration * 60), sub {
-            Gartenbewaesserung_FinishCircuit($hash, $circuitNum);
-        }, $hash);
     }
+    
+    # Set end time
+    Gartenbewaesserung_SetEndTime($hash, $duration);
+    
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, "phase", "watering circuit $circuitNum");
+    readingsBulkUpdate($hash, "currentValve", $circuitNum);
+    readingsEndUpdate($hash, 1);
+    
+    Log3 $name, 3, "$name: Circuit $circuitNum watering for $duration minutes";
+    
+    # Schedule valve close
+    InternalTimer(gettimeofday() + ($duration * 60), sub {
+        Gartenbewaesserung_FinishCircuit($hash, $circuitNum);
+    }, $hash);
 }
 
 ##############################################################################
@@ -1224,6 +1322,7 @@ sub Gartenbewaesserung_StartWatering {
     $hash->{HELPER}{totalValves} = scalar(@activeValves);
     $hash->{HELPER}{watering} = 1;
     $hash->{HELPER}{wateringStartTime} = time();  # Track start time for pauses
+    delete $hash->{HELPER}{valveRemainingTime};   # Clear any leftover remaining time
     
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "state", "watering");
@@ -1241,28 +1340,24 @@ sub Gartenbewaesserung_StartWatering {
 }
 
 ##############################################################################
-# Check if pause is needed
+# Calculate remaining time until next pause
 ##############################################################################
-sub Gartenbewaesserung_CheckPauseNeeded {
+sub Gartenbewaesserung_TimeUntilNextPause {
     my ($hash) = @_;
     my $name = $hash->{NAME};
     
     my $pauseInterval = AttrVal($name, "wateringPauseInterval", 8);
     
     # If pause interval is 0, no pauses
-    return 0 if($pauseInterval == 0);
+    return -1 if($pauseInterval == 0);
     
     # Calculate time since watering started (or last pause ended)
     my $lastPauseEnd = $hash->{HELPER}{lastPauseEnd} || $hash->{HELPER}{wateringStartTime} || time();
     my $elapsedMinutes = (time() - $lastPauseEnd) / 60;
     
-    # Check if we need a pause
-    if($elapsedMinutes >= $pauseInterval) {
-        Log3 $name, 3, "$name: Pause needed after $elapsedMinutes minutes of watering";
-        return 1;
-    }
+    my $remainingMinutes = $pauseInterval - $elapsedMinutes;
     
-    return 0;
+    return $remainingMinutes > 0 ? $remainingMinutes : 0;
 }
 
 ##############################################################################
@@ -1276,8 +1371,11 @@ sub Gartenbewaesserung_StartWateringPause {
     
     Log3 $name, 3, "$name: Starting watering pause for $pauseDuration minutes (barrel refill)";
     
-    # Stop current valve and pump
+    # Store current valve info for resume
     my $currentValve = ReadingsVal($name, "currentValve", "none");
+    $hash->{HELPER}{pausedValve} = $currentValve;
+    
+    # Stop current valve and pump
     if($currentValve ne "none" && $currentValve =~ /^\d+$/) {
         my $valveDevice = AttrVal($name, "valve${currentValve}Device", "");
         if($valveDevice ne "") {
@@ -1295,6 +1393,7 @@ sub Gartenbewaesserung_StartWateringPause {
     
     # Mark as paused
     $hash->{HELPER}{pauseActive} = 1;
+    $hash->{HELPER}{pauseStartTime} = time();
     
     # Clear valve end time, set pause end time
     Gartenbewaesserung_ClearEndTime($hash);
@@ -1302,19 +1401,59 @@ sub Gartenbewaesserung_StartWateringPause {
     
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "state", "paused");
-    readingsBulkUpdate($hash, "phase", "pause - barrel refilling");
+    readingsBulkUpdate($hash, "phase", "pause - refilling");
     readingsBulkUpdate($hash, "pauseActive", "yes");
     readingsEndUpdate($hash, 1);
     
-    # Start barrel filling
-    my $fillValve = AttrVal($name, "barrelFillValveDevice", "");
-    if($fillValve ne "") {
-        Gartenbewaesserung_SwitchDevice($name, $fillValve, "on");
-        Log3 $name, 4, "$name: Opened barrel fill valve";
+    # Decide: Fill from IBC or water supply?
+    my $ibcEmpty = ReadingsVal($name, "ibcEmpty", "no");
+    
+    if($ibcEmpty eq "yes") {
+        # IBC is empty, use water supply (barrelFillValveDevice)
+        Log3 $name, 3, "$name: IBC empty, using water supply to fill barrel";
+        my $fillValve = AttrVal($name, "barrelFillValveDevice", "");
+        if($fillValve ne "") {
+            Gartenbewaesserung_SwitchDevice($name, $fillValve, "on");
+            $hash->{HELPER}{pauseSource} = "water_supply";
+            Log3 $name, 4, "$name: Opened water supply valve (barrelFillValveDevice)";
+        }
+    }
+    else {
+        # IBC has water, fill from IBC
+        Log3 $name, 3, "$name: IBC has water, filling barrel from IBC";
+        
+        my $ibcToBarrelPump = AttrVal($name, "ibcToBarrelPumpDevice", "");
+        my $ibcToBarrelValve = AttrVal($name, "ibcToBarrelValveDevice", "");
+        
+        if($ibcToBarrelPump ne "") {
+            # Use pump
+            Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "on");
+            Log3 $name, 4, "$name: Started IBC to barrel pump";
+            
+            my $delay = AttrVal($name, "pumpStartDelay", 3);
+            $delay = abs($delay);  # Use absolute value for pause pumping
+            
+            InternalTimer(gettimeofday() + $delay, sub {
+                if($ibcToBarrelValve ne "") {
+                    Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on");
+                    Log3 $name, 4, "$name: Opened IBC to barrel valve";
+                }
+            }, $hash);
+        }
+        else {
+            # Gravity feed
+            if($ibcToBarrelValve ne "") {
+                Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on");
+                Log3 $name, 4, "$name: Opened IBC to barrel valve (gravity)";
+            }
+        }
+        
+        $hash->{HELPER}{pauseSource} = "ibc";
     }
     
     # Schedule pause end
-    InternalTimer(gettimeofday() + ($pauseDuration * 60), sub {
+    $hash->{HELPER}{pauseEndTimer} = gettimeofday() + ($pauseDuration * 60);
+    InternalTimer($hash->{HELPER}{pauseEndTimer}, sub {
         Gartenbewaesserung_EndWateringPause($hash);
     }, $hash);
 }
@@ -1328,16 +1467,37 @@ sub Gartenbewaesserung_EndWateringPause {
     
     Log3 $name, 3, "$name: Ending watering pause, resuming cycle";
     
-    # Close barrel fill valve
-    my $fillValve = AttrVal($name, "barrelFillValveDevice", "");
-    if($fillValve ne "") {
-        Gartenbewaesserung_SwitchDevice($name, $fillValve, "off");
-        Log3 $name, 4, "$name: Closed barrel fill valve";
+    # Close fill valves
+    my $pauseSource = $hash->{HELPER}{pauseSource} || "";
+    
+    if($pauseSource eq "water_supply") {
+        my $fillValve = AttrVal($name, "barrelFillValveDevice", "");
+        if($fillValve ne "") {
+            Gartenbewaesserung_SwitchDevice($name, $fillValve, "off");
+            Log3 $name, 4, "$name: Closed water supply valve";
+        }
+    }
+    elsif($pauseSource eq "ibc") {
+        my $ibcToBarrelValve = AttrVal($name, "ibcToBarrelValveDevice", "");
+        if($ibcToBarrelValve ne "") {
+            Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "off");
+            Log3 $name, 4, "$name: Closed IBC to barrel valve";
+        }
+        
+        my $ibcToBarrelPump = AttrVal($name, "ibcToBarrelPumpDevice", "");
+        if($ibcToBarrelPump ne "") {
+            Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "off");
+            Log3 $name, 4, "$name: Stopped IBC to barrel pump";
+        }
     }
     
     # Mark pause as ended
     $hash->{HELPER}{pauseActive} = 0;
     $hash->{HELPER}{lastPauseEnd} = time();
+    delete $hash->{HELPER}{pausedValve};
+    delete $hash->{HELPER}{pauseSource};
+    delete $hash->{HELPER}{pauseStartTime};
+    delete $hash->{HELPER}{pauseEndTimer};
     
     # Reset barrel level
     readingsSingleUpdate($hash, "barrelLevel", 100, 1);
@@ -1350,9 +1510,23 @@ sub Gartenbewaesserung_EndWateringPause {
     readingsBulkUpdate($hash, "pauseActive", "no");
     readingsEndUpdate($hash, 1);
     
-    # Small delay, then continue with next valve
+    # Small delay, then continue with current or next valve
     InternalTimer(gettimeofday() + 2, sub {
-        Gartenbewaesserung_NextValve($hash);
+        # Check if we have remaining time for current valve
+        if(defined($hash->{HELPER}{valveRemainingTime}) && $hash->{HELPER}{valveRemainingTime} > 0) {
+            # Resume current valve with remaining time
+            my $queue = $hash->{HELPER}{wateringQueue};
+            my $index = $hash->{HELPER}{wateringIndex};
+            my $valveNum = $queue->[$index];
+            
+            Log3 $name, 3, "$name: Resuming valve $valveNum with remaining time";
+            Gartenbewaesserung_OpenValve($hash, $valveNum);
+        }
+        else {
+            # Move to next valve
+            Log3 $name, 3, "$name: Moving to next valve after pause";
+            Gartenbewaesserung_NextValve($hash);
+        }
     }, $hash);
 }
 
@@ -1364,12 +1538,6 @@ sub Gartenbewaesserung_NextValve {
     my $name = $hash->{NAME};
     
     return if(!$hash->{HELPER}{watering});
-    
-    # Check if pause is needed BEFORE processing next valve
-    if(!$hash->{HELPER}{pauseActive} && Gartenbewaesserung_CheckPauseNeeded($hash)) {
-        Gartenbewaesserung_StartWateringPause($hash);
-        return;
-    }
     
     my $queue = $hash->{HELPER}{wateringQueue};
     my $index = $hash->{HELPER}{wateringIndex};
@@ -1405,21 +1573,8 @@ sub Gartenbewaesserung_NextValve {
         return;
     }
     
-    # Start pump first
-    my $pumpDevice = AttrVal($name, "pumpDevice", "");
-    if($pumpDevice ne "") {
-        Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
-        Log3 $name, 4, "$name: Pump started";
-        
-        # Wait for pump to stabilize
-        my $delay = AttrVal($name, "pumpStartDelay", 3);
-        InternalTimer(gettimeofday() + $delay, sub {
-            Gartenbewaesserung_OpenValve($hash, $valveNum);
-        }, $hash);
-    }
-    else {
-        Gartenbewaesserung_OpenValve($hash, $valveNum);
-    }
+    # Start valve
+    Gartenbewaesserung_OpenValve($hash, $valveNum);
 }
 
 ##############################################################################
@@ -1432,10 +1587,69 @@ sub Gartenbewaesserung_OpenValve {
     my $valveDevice = AttrVal($name, "valve${valveNum}Device", "");
     my $duration = AttrVal($name, "valve${valveNum}Duration", 15);
     
+    # Check if we have remaining time from a pause
+    if(defined($hash->{HELPER}{valveRemainingTime}) && $hash->{HELPER}{valveRemainingTime} > 0) {
+        $duration = $hash->{HELPER}{valveRemainingTime};
+        delete $hash->{HELPER}{valveRemainingTime};
+        Log3 $name, 4, "$name: Using remaining time: $duration minutes";
+    }
+    
     # Make sure IBC valve is closed during watering
     Gartenbewaesserung_StopIBCFill($hash);
     
-    Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
+    # Check if pause is needed DURING this valve
+    my $pauseInterval = AttrVal($name, "wateringPauseInterval", 8);
+    if($pauseInterval > 0) {
+        my $timeUntilPause = Gartenbewaesserung_TimeUntilNextPause($hash);
+        
+        if($timeUntilPause >= 0 && $timeUntilPause < $duration) {
+            # Pause is needed DURING this valve
+            Log3 $name, 4, "$name: Valve $valveNum: Will pause after $timeUntilPause minutes (valve duration: $duration min)";
+            
+            # Store remaining time for after pause
+            $hash->{HELPER}{valveRemainingTime} = $duration - $timeUntilPause;
+            
+            # Open valve for partial time only
+            $duration = $timeUntilPause;
+            Log3 $name, 4, "$name: Valve $valveNum will run for $duration minutes until pause";
+        }
+    }
+    
+    # Get pump and delay
+    my $pumpDevice = AttrVal($name, "pumpDevice", "");
+    my $delay = AttrVal($name, "pumpStartDelay", 3);
+    
+    if($pumpDevice ne "") {
+        if($delay < 0) {
+            # Negative delay: Open valve FIRST, then pump
+            Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
+            Log3 $name, 4, "$name: Valve $valveNum opened (negative delay)";
+            
+            InternalTimer(gettimeofday() + abs($delay), sub {
+                Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+                Log3 $name, 4, "$name: Pump started after valve (negative delay)";
+            }, $hash);
+        }
+        elsif($delay > 0) {
+            # Positive delay: Start pump FIRST, wait, then valve
+            Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+            Log3 $name, 4, "$name: Pump started";
+            
+            InternalTimer(gettimeofday() + $delay, sub {
+                Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
+                Log3 $name, 4, "$name: Valve $valveNum opened after pump delay";
+            }, $hash);
+        }
+        else {
+            # Zero delay: Simultaneous
+            Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+            Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
+            Log3 $name, 4, "$name: Pump and valve $valveNum started simultaneously";
+        }
+    }
+    else {
+        Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
+    }
     
     # Set end time
     Gartenbewaesserung_SetEndTime($hash, $duration);
@@ -1452,7 +1666,8 @@ sub Gartenbewaesserung_OpenValve {
     Log3 $name, 3, "$name: Valve $valveNum opened for $duration minutes ($index/$total)";
     
     # Schedule valve close
-    InternalTimer(gettimeofday() + ($duration * 60), sub {
+    $hash->{HELPER}{valveCloseTimer} = gettimeofday() + ($duration * 60);
+    InternalTimer($hash->{HELPER}{valveCloseTimer}, sub {
         Gartenbewaesserung_CloseValve($hash, $valveNum);
     }, $hash);
 }
@@ -1469,11 +1684,12 @@ sub Gartenbewaesserung_CloseValve {
     
     Log3 $name, 4, "$name: Valve $valveNum closed";
     
+    delete $hash->{HELPER}{valveCloseTimer};
     Gartenbewaesserung_ClearEndTime($hash);
     
     readingsSingleUpdate($hash, "currentValve", "none", 1);
     
-    # Turn off pump briefly
+    # Turn off pump
     my $pumpDevice = AttrVal($name, "pumpDevice", "");
     if($pumpDevice ne "") {
         Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "off");
@@ -1485,7 +1701,14 @@ sub Gartenbewaesserung_CloseValve {
     $newLevel = 0 if($newLevel < 0);
     readingsSingleUpdate($hash, "barrelLevel", $newLevel, 1);
     
-    # Move to next valve
+    # Check if we have remaining time (pause is needed)
+    if(defined($hash->{HELPER}{valveRemainingTime}) && $hash->{HELPER}{valveRemainingTime} > 0) {
+        Log3 $name, 4, "$name: Valve $valveNum has remaining time, starting pause";
+        Gartenbewaesserung_StartWateringPause($hash);
+        return;
+    }
+    
+    # No remaining time, move to next valve
     $hash->{HELPER}{wateringIndex}++;
     InternalTimer(gettimeofday() + 2, sub {
         Gartenbewaesserung_NextValve($hash);
@@ -1550,15 +1773,56 @@ sub Gartenbewaesserung_StopBarrelFill {
 }
 
 ##############################################################################
-# Check if barrel is full
+# Check if barrel is full (called by Notify when sensor triggers)
 ##############################################################################
 sub Gartenbewaesserung_CheckBarrelFull {
     my ($hash) = @_;
     my $name = $hash->{NAME};
     
+    Log3 $name, 3, "$name: Barrel full detected";
+    
+    # If filling barrel directly
     if($hash->{HELPER}{barrelFilling}) {
-        Log3 $name, 3, "$name: Barrel full detected, stopping fill";
+        Log3 $name, 3, "$name: Stopping barrel fill (sensor triggered)";
         Gartenbewaesserung_StopBarrelFill($hash);
+    }
+    
+    # If pause is active
+    if($hash->{HELPER}{pauseActive}) {
+        Log3 $name, 3, "$name: Barrel full during pause, closing valves and ending pause early";
+        
+        # Close fill valves immediately
+        my $pauseSource = $hash->{HELPER}{pauseSource} || "";
+        
+        if($pauseSource eq "water_supply") {
+            my $fillValve = AttrVal($name, "barrelFillValveDevice", "");
+            if($fillValve ne "") {
+                Gartenbewaesserung_SwitchDevice($name, $fillValve, "off");
+                Log3 $name, 4, "$name: Closed water supply valve (barrel full)";
+            }
+        }
+        elsif($pauseSource eq "ibc") {
+            my $ibcToBarrelValve = AttrVal($name, "ibcToBarrelValveDevice", "");
+            if($ibcToBarrelValve ne "") {
+                Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "off");
+                Log3 $name, 4, "$name: Closed IBC to barrel valve (barrel full)";
+            }
+            
+            my $ibcToBarrelPump = AttrVal($name, "ibcToBarrelPumpDevice", "");
+            if($ibcToBarrelPump ne "") {
+                Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "off");
+                Log3 $name, 4, "$name: Stopped IBC to barrel pump (barrel full)";
+            }
+        }
+        
+        # Cancel pause timer
+        if(defined($hash->{HELPER}{pauseEndTimer})) {
+            RemoveInternalTimer($hash, "Gartenbewaesserung_EndWateringPause");
+            delete $hash->{HELPER}{pauseEndTimer};
+        }
+        
+        # End pause early
+        Gartenbewaesserung_EndWateringPause($hash);
     }
 }
 
@@ -1580,6 +1844,9 @@ sub Gartenbewaesserung_FinishWatering {
     delete $hash->{HELPER}{wateringIndex};
     delete $hash->{HELPER}{wateringStartTime};
     delete $hash->{HELPER}{lastPauseEnd};
+    delete $hash->{HELPER}{valveRemainingTime};
+    delete $hash->{HELPER}{pausedValve};
+    delete $hash->{HELPER}{valveCloseTimer};
     
     Gartenbewaesserung_ClearEndTime($hash);
     Gartenbewaesserung_ClearPauseTime($hash);
@@ -1629,19 +1896,34 @@ sub Gartenbewaesserung_StopAll {
         Gartenbewaesserung_SwitchDevice($name, $barrelFillValve, "off");
     }
     
-    # Close IBC fill and IBC to barrel
-    Gartenbewaesserung_StopIBCFill($hash);
-    Gartenbewaesserung_StopIBCtoBarrel($hash);
+    # Close IBC valves
+    my $ibcFillValve = AttrVal($name, "ibcFillValveDevice", "");
+    if($ibcFillValve ne "") {
+        Gartenbewaesserung_SwitchDevice($name, $ibcFillValve, "off");
+    }
+    
+    my $ibcToBarrelValve = AttrVal($name, "ibcToBarrelValveDevice", "");
+    if($ibcToBarrelValve ne "") {
+        Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "off");
+    }
     
     $hash->{HELPER}{watering} = 0;
     $hash->{HELPER}{barrelFilling} = 0;
     $hash->{HELPER}{circuitMode} = 0;
     $hash->{HELPER}{pauseActive} = 0;
+    $hash->{HELPER}{ibcFilling} = 0;
+    $hash->{HELPER}{ibcToBarrelActive} = 0;
     delete $hash->{HELPER}{wateringQueue};
     delete $hash->{HELPER}{wateringIndex};
     delete $hash->{HELPER}{circuitNumber};
     delete $hash->{HELPER}{wateringStartTime};
     delete $hash->{HELPER}{lastPauseEnd};
+    delete $hash->{HELPER}{valveRemainingTime};
+    delete $hash->{HELPER}{pausedValve};
+    delete $hash->{HELPER}{pauseSource};
+    delete $hash->{HELPER}{pauseStartTime};
+    delete $hash->{HELPER}{pauseEndTimer};
+    delete $hash->{HELPER}{valveCloseTimer};
     
     Gartenbewaesserung_ClearEndTime($hash);
     Gartenbewaesserung_ClearPauseTime($hash);
@@ -1764,6 +2046,8 @@ sub Gartenbewaesserung_StartIBCFill {
         
         # Wait for pump, then open valve
         my $delay = AttrVal($name, "pumpStartDelay", 3);
+        $delay = abs($delay);  # Use absolute value
+        
         InternalTimer(gettimeofday() + $delay, sub {
             Gartenbewaesserung_SwitchDevice($name, $ibcValve, "on");
             $hash->{HELPER}{ibcFilling} = 1;
@@ -1867,6 +2151,8 @@ sub Gartenbewaesserung_StartIBCtoBarrel {
         
         # Wait for pump, then open valve
         my $delay = AttrVal($name, "pumpStartDelay", 3);
+        $delay = abs($delay);  # Use absolute value
+        
         InternalTimer(gettimeofday() + $delay, sub {
             Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on");
             $hash->{HELPER}{ibcToBarrelActive} = 1;
@@ -2042,7 +2328,8 @@ sub Gartenbewaesserung_GetStatus {
     my ($hash) = @_;
     my $name = $hash->{NAME};
     
-    my $status = "\n=== Gartenbewässerung Status ===\n\n";
+    my $status = "\n=== Gartenbewässerung Status ===\n";
+    $status .= "Version: " . $hash->{VERSION} . "\n\n";
     $status .= "State: " . ReadingsVal($name, "state", "unknown") . "\n";
     $status .= "Phase: " . ReadingsVal($name, "phase", "unknown") . "\n";
     $status .= "Current Valve: " . ReadingsVal($name, "currentValve", "none") . "\n";
@@ -2054,6 +2341,7 @@ sub Gartenbewaesserung_GetStatus {
     $status .= "IBC to Barrel: " . ReadingsVal($name, "ibcToBarrelActive", "no") . "\n";
     $status .= "Barrel Full: " . ReadingsVal($name, "barrelFull", "not configured") . "\n";
     $status .= "IBC Full: " . ReadingsVal($name, "ibcFull", "not configured") . "\n";
+    $status .= "IBC Empty: " . ReadingsVal($name, "ibcEmpty", "not configured") . "\n";
     $status .= "Raining: " . ReadingsVal($name, "raining", "not configured") . "\n";
     $status .= "Rain Since: " . ReadingsVal($name, "rainDetectedSince", "never") . "\n";
     $status .= "Soil Moisture: " . ReadingsVal($name, "soilMoisture", "not configured") . "\n";
@@ -2076,20 +2364,31 @@ sub Gartenbewaesserung_GetStatus {
 <h3>Gartenbewaesserung</h3>
 <ul>
     <p>FHEM Modul für intelligente Gartenbewässerung mit bis zu 8 Ventilen, Regenwasserfass und IBC-Container.</p>
+    <p><b>Version: 1.0.12</b></p>
     
     <h4>Features</h4>
     <ul>
         <li>Bis zu 8 Magnetventile für verschiedene Bewässerungsbereiche</li>
         <li>Unterstützt MQTT2 Relay Boards (z.B. Tasmota mit 8-Kanal Relay Board)</li>
-        <li>Automatische Füll-Pausen während der Bewässerung (Fass wird nachgefüllt)</li>
+        <li>Automatische Füll-Pausen während der Bewässerung (IBC → Fass oder Hauswasseranschluss)</li>
         <li>Regenwasser-Management mit IBC-Container</li>
         <li>Feuchtigkeitssensor-Integration (überspringt Bewässerung bei ausreichender Feuchtigkeit)</li>
         <li>Regensensor-Integration (automatische IBC-Befüllung bei Regen)</li>
         <li>Zeitgesteuerte Bewässerung (bis zu 3 Startzeiten pro Tag)</li>
         <li>Einzelkreislauf-Modus (z.B. für Gewächshaus mit eigenem Feuchtigkeitssensor)</li>
         <li>Flexible Werte-Erkennung (on/off, true/false, 1/0, open/closed, etc.)</li>
+        <li>Negatives Pumpen-Delay (Ventil öffnet VOR Pumpe)</li>
         <li>Live-Countdown der verbleibenden Zeit</li>
+        <li>Fass-voll Sensor stoppt Pause vorzeitig</li>
         <li>Umfassende Konfigurationsvalidierung</li>
+    </ul>
+
+    <h4>Versionshistorie</h4>
+    <ul>
+        <li><b>1.0.12</b> (2026-04-29): Endlosschleifen-Bug gefixt, negatives Delay, IBC→Fass in Pausen, IBC-Leer-Sensor, Fass-voll stoppt Pause</li>
+        <li><b>1.0.11</b> (2026-04-29): Automatische Füll-Pausen während Bewässerung</li>
+        <li><b>1.0.10</b> (2026-04-29): Ausführliche Dokumentation</li>
+        <li><b>1.0.9</b> (2026-04-29): Verbleibende Zeit als Reading</li>
     </ul>
 
     <a id="Gartenbewaesserung-define"></a>
@@ -2120,6 +2419,7 @@ sub Gartenbewaesserung_GetStatus {
     <ul>
         <li><b>status</b> - Zeigt den aktuellen Status aller Komponenten</li>
         <li><b>config</b> - Zeigt die komplette Konfiguration übersichtlich an</li>
+        <li><b>version</b> - Zeigt die Modulversion an</li>
     </ul>
 
     <a id="Gartenbewaesserung-attr"></a>
@@ -2141,18 +2441,26 @@ sub Gartenbewaesserung_GetStatus {
         <li><b>pumpDevice</b> - Hauptpumpe für Bewässerung und IBC-Befüllung<br>
             Format wie bei Ventilen: <code>DeviceName</code> oder <code>DeviceName:Reading</code>
         </li>
-        <li><b>pumpStartDelay</b> - Verzögerung in Sekunden nach Pumpenstart, bevor Ventile öffnen (Standard: 3)</li>
+        <li><b>pumpStartDelay</b> - Timing zwischen Pumpe und Ventil in Sekunden (Standard: 3)<br>
+            <b>Positiv (+3)</b>: Pumpe startet 3 Sek VOR Ventil (Druckaufbau)<br>
+            <b>Null (0)</b>: Gleichzeitig<br>
+            <b>Negativ (-2)</b>: Ventil öffnet 2 Sek VOR Pumpe (z.B. für empfindliche Systeme)
+        </li>
         <li><b>ibcToBarrelPumpDevice</b> - Optional: Separate Pumpe für IBC → Fass Transfer. Wenn nicht gesetzt, läuft der Transfer mit Schwerkraft</li>
     </ul>
 
     <h5>Fass (Barrel)</h5>
     <ul>
-        <li><b>barrelFillValveDevice</b> - Ventil zum Befüllen des Regenwasserfasses (z.B. vom Hauswasseranschluss)</li>
+        <li><b>barrelFillValveDevice</b> - Ventil zum Befüllen des Regenwasserfasses (Hauswasseranschluss oder Wasserleitung)<br>
+            <b>⚠️ WICHTIG:</b> Dies muss ein ANDERES Ventil sein als <code>ibcFillValveDevice</code>!<br>
+            <i>Wird verwendet wenn IBC leer ist</i>
+        </li>
         <li><b>barrelFillDuration</b> - Dauer der Fass-Befüllung in Minuten (Standard: 10)<br>
-            <i>Dies ist die Zeit, wie lange das Füllventil geöffnet wird, wenn das Fass vor der Bewässerung nachgefüllt werden muss, oder während einer automatischen Pause.</i>
+            <i>Zeit wie lange das Füllventil geöffnet wird, wenn Fass nachgefüllt werden muss (vor Bewässerung oder wenn IBC leer)</i>
         </li>
         <li><b>barrelFillThreshold</b> - Füllstand-Schwellwert in Prozent. Bei Unterschreitung wird vor der Bewässerung nachgefüllt (Standard: 30)</li>
-        <li><b>barrelFullSensorDevice</b> - Kontaktsensor der anzeigt, dass das Fass voll ist (stoppt automatische Befüllung)</li>
+        <li><b>barrelFullSensorDevice</b> - Kontaktsensor der anzeigt, dass das Fass voll ist<br>
+            <b>Wichtig:</b> Stoppt automatische Befüllung UND beendet Pausen vorzeitig!</li>
         <li><b>barrelFullSensorActiveValue</b> - Wert des Sensors wenn Fass voll ist (z.B. "closed", "1", "true")</li>
         <li><b>barrelFullSensorInactiveValue</b> - Wert des Sensors wenn Fass nicht voll ist</li>
     </ul>
@@ -2160,22 +2468,32 @@ sub Gartenbewaesserung_GetStatus {
     <h5>Automatische Füll-Pausen</h5>
     <ul>
         <li><b>wateringPauseInterval</b> - Pause alle X Minuten während der Bewässerung (Standard: 8)<br>
-            <i>Nach dieser Zeit wird die Bewässerung pausiert und das Fass automatisch nachgefüllt.</i><br>
-            Setze auf <b>0</b> um Pausen zu deaktivieren (durchgehende Bewässerung ohne Unterbrechung)
+            <i>Nach dieser Zeit wird die Bewässerung pausiert und das Fass automatisch nachgefüllt (aus IBC oder Hauswasseranschluss).</i><br>
+            Setze auf <b>0</b> um Pausen zu deaktivieren (durchgehende Bewässerung)
         </li>
         <li><b>wateringPauseDuration</b> - Dauer der Pause in Minuten (Standard: 20)<br>
-            <i>So lange wird das Fass nachgefüllt, bevor die Bewässerung fortgesetzt wird.</i>
+            <i>So lange wird das Fass nachgefüllt. Wird automatisch beendet wenn Fass voll ist!</i>
         </li>
     </ul>
 
     <h5>IBC-Container</h5>
     <ul>
-        <li><b>ibcFillValveDevice</b> - Ventil zum Befüllen des IBC aus dem Fass (mit Hauptpumpe)</li>
-        <li><b>ibcToBarrelValveDevice</b> - Ventil für den Rücklauf vom IBC ins Fass</li>
+        <li><b>ibcFillValveDevice</b> - Ventil zum Befüllen des IBC aus dem Fass (mit Hauptpumpe)<br>
+            <b>⚠️ WICHTIG:</b> Dies muss ein ANDERES Ventil sein als <code>barrelFillValveDevice</code>!
+        </li>
+        <li><b>ibcToBarrelValveDevice</b> - Ventil für den Rücklauf vom IBC ins Fass<br>
+            <i>Wird während Pausen verwendet um Fass nachzufüllen (falls IBC nicht leer)</i>
+        </li>
         <li><b>ibcToBarrelDuration</b> - Dauer des IBC → Fass Transfers in Minuten (Standard: 15)</li>
-        <li><b>ibcFullSensorDevice</b> - Kontaktsensor der anzeigt, dass der IBC voll ist</li>
+        <li><b>ibcFullSensorDevice</b> - Kontaktsensor der anzeigt, dass der IBC voll ist (stoppt Überlauf)</li>
         <li><b>ibcFullSensorActiveValue</b> - Wert wenn IBC voll ist</li>
         <li><b>ibcFullSensorInactiveValue</b> - Wert wenn IBC nicht voll ist</li>
+        <li><b>ibcEmptySensorDevice</b> - Optional: Sensor der anzeigt, dass IBC leer ist<br>
+            <i>Falls gesetzt: Bei leerem IBC wird während Pausen Hauswasseranschluss statt IBC genutzt</i><br>
+            <i>Falls nicht gesetzt: IBC wird genutzt solange nicht voll</i>
+        </li>
+        <li><b>ibcEmptySensorActiveValue</b> - Wert wenn IBC leer ist (z.B. "0", "empty", "open")</li>
+        <li><b>ibcEmptySensorInactiveValue</b> - Wert wenn IBC nicht leer ist</li>
     </ul>
 
     <h5>Sensoren</h5>
@@ -2214,7 +2532,7 @@ sub Gartenbewaesserung_GetStatus {
     <h4>Readings</h4>
     <ul>
         <li><b>state</b> - Hauptzustand: idle, watering, paused, circuit mode, ibc to barrel, stopped</li>
-        <li><b>phase</b> - Detaillierte Phase: idle, starting, watering, filling barrel, pause - barrel refilling, etc.</li>
+        <li><b>phase</b> - Detaillierte Phase: idle, starting, watering, filling barrel, pause - refilling, etc.</li>
         <li><b>currentValve</b> - Aktuell geöffnetes Ventil (1-8 oder "none")</li>
         <li><b>remainingTime</b> - Verbleibende Zeit der aktuellen Operation (z.B. "12 min 45 sec")</li>
         <li><b>cycleProgress</b> - Fortschritt des Bewässerungszyklus (z.B. "3/8")</li>
@@ -2223,7 +2541,8 @@ sub Gartenbewaesserung_GetStatus {
         <li><b>ibcFilling</b> - Wird IBC befüllt? (yes/no)</li>
         <li><b>ibcToBarrelActive</b> - Läuft IBC → Fass Transfer? (yes/no)</li>
         <li><b>barrelFull</b> - Status Fass-Sensor (yes/no/not configured)</li>
-        <li><b>ibcFull</b> - Status IBC-Sensor (yes/no/not configured)</li>
+        <li><b>ibcFull</b> - Status IBC-Full-Sensor (yes/no/not configured)</li>
+        <li><b>ibcEmpty</b> - Status IBC-Empty-Sensor (yes/no/not configured)</li>
         <li><b>raining</b> - Regnet es? (yes/no/not configured)</li>
         <li><b>soilMoisture</b> - Aktuelle Bodenfeuchtigkeit (Wert oder "not configured")</li>
         <li><b>rainDetectedSince</b> - Zeitpunkt des Regenbeginns</li>
@@ -2231,110 +2550,6 @@ sub Gartenbewaesserung_GetStatus {
         <li><b>lastCircuitWatering</b> - Zeitpunkt der letzten Einzelkreislauf-Bewässerung</li>
     </ul>
 
-    <a id="Gartenbewaesserung-examples"></a>
-    <h4>Konfigurations-Beispiele</h4>
-    
-    <h5>Basis-Setup mit MQTT2 Relay Board</h5>
-    <code>
-        define Garten Gartenbewaesserung<br>
-        <br>
-        # 4 Ventile am Tasmota 8-Kanal Relay Board<br>
-        attr Garten valve1Device MQTT2_DVES_F96D88:POWER1<br>
-        attr Garten valve2Device MQTT2_DVES_F96D88:POWER2<br>
-        attr Garten valve3Device MQTT2_DVES_F96D88:POWER3<br>
-        attr Garten valve4Device MQTT2_DVES_F96D88:POWER4<br>
-        attr Garten activeValves 1,2,3,4<br>
-        <br>
-        # Pumpe und Fass-Ventil<br>
-        attr Garten pumpDevice MQTT2_DVES_F96D88:POWER5<br>
-        attr Garten barrelFillValveDevice MQTT2_DVES_F96D88:POWER6<br>
-        <br>
-        # Automatische Pausen alle 8 Minuten für 20 Minuten Nachfüllen<br>
-        attr Garten wateringPauseInterval 8<br>
-        attr Garten wateringPauseDuration 20<br>
-        <br>
-        # Zeiten<br>
-        attr Garten startTime1 06:00<br>
-        attr Garten startTime2 18:00<br>
-    </code>
-
-    <h5>Erweitert mit IBC und Sensoren</h5>
-    <code>
-        # IBC-Container<br>
-        attr Garten ibcFillValveDevice MQTT2_DVES_F96D88:POWER7<br>
-        attr Garten ibcToBarrelValveDevice MQTT2_DVES_F96D88:POWER8<br>
-        <br>
-        # Sensoren am gleichen MQTT2 Device<br>
-        attr Garten rainSensorDevice MQTT2_DVES_F96D88:rain<br>
-        attr Garten rainSensorActiveValue true<br>
-        attr Garten rainSensorInactiveValue false<br>
-        <br>
-        attr Garten barrelFullSensorDevice MQTT2_DVES_F96D88:barrel_full<br>
-        attr Garten barrelFullSensorActiveValue 1<br>
-        <br>
-        attr Garten ibcFullSensorDevice MQTT2_DVES_F96D88:ibc_full<br>
-        attr Garten ibcFullSensorActiveValue 1<br>
-        <br>
-        # Feuchtigkeitssensor (separates Device)<br>
-        attr Garten moistureSensorDevice MQTT2_Moisture:moisture<br>
-        attr Garten moistureThreshold 30<br>
-    </code>
-
-    <h5>Gewächshaus mit eigenem Notify</h5>
-    <code>
-        # Notify für Gewächshaus (Kreislauf 4)<br>
-        define n_greenhouse notify greenhouse_moisture:moisture.* {<br>
-        &nbsp;&nbsp;my $moisture = ReadingsVal("greenhouse_moisture", "moisture", 100);;<br>
-        &nbsp;&nbsp;if($moisture < 25) {<br>
-        &nbsp;&nbsp;&nbsp;&nbsp;fhem("set Garten startCircuit 4");;<br>
-        &nbsp;&nbsp;}<br>
-        }<br>
-        attr n_greenhouse room Garten<br>
-    </code>
-
-    <h4>Funktionsweise</h4>
-    
-    <h5>Bewässerungszyklus</h5>
-    <ol>
-        <li>Prüfung der Bodenfeuchtigkeit (wenn Sensor konfiguriert)</li>
-        <li>Start des Zyklus mit allen aktiven Ventilen</li>
-        <li>Für jedes Ventil:
-            <ul>
-                <li>Prüfung ob Pause nötig (nach X Minuten Bewässerung)</li>
-                <li>Falls Pause: Ventil schließen, Fass nachfüllen, nach Y Minuten fortsetzen</li>
-                <li>Prüfung Fass-Füllstand (falls unter Schwellwert: Fass füllen)</li>
-                <li>Pumpe starten + Verzögerung</li>
-                <li>Ventil öffnen</li>
-                <li>Nach konfigurierter Zeit: Ventil schließen</li>
-                <li>Weiter zum nächsten Ventil</li>
-            </ul>
-        </li>
-        <li>Am Ende: Pumpe aus, Status auf "idle"</li>
-    </ol>
-
-    <h5>IBC-Regenwasser-Sammlung</h5>
-    <ul>
-        <li>Bei Regen über konfigurierte Dauer: Automatische IBC-Befüllung startet</li>
-        <li>Ventil zum IBC wird geöffnet (Wasser läuft vom Fass in IBC - schwerkraftgesteuert oder gepumpt)</li>
-        <li>Überlaufschutz durch IBC-Full-Sensor</li>
-        <li>WICHTIG: IBC-Ventil wird IMMER geschlossen, wenn Bewässerung läuft</li>
-    </ul>
-
-    <h5>IBC zu Fass Rücklauf</h5>
-    <ul>
-        <li>Manuell oder per Automatisierung: <code>set Garten startIBCtoBarrel</code></li>
-        <li>Wasser läuft vom IBC zurück ins Fass (Schwerkraft oder optional mit Pumpe)</li>
-        <li>Läuft für konfigurierte Dauer, stoppt dann automatisch</li>
-    </ul>
-
-    <h4>Tipps</h4>
-    <ul>
-        <li>Nutze <code>set Garten validate</code> nach der Konfiguration um Fehler zu finden</li>
-        <li>Nutze <code>get Garten config</code> für eine Übersicht aller Einstellungen</li>
-        <li>Für Gewächshaus o.ä.: Nutze <code>startCircuit</code> statt manuellem Ventil, dann wird auch das Fass geprüft und IBC-Sammlung gestoppt</li>
-        <li>Setze <code>wateringPauseInterval</code> auf 0 wenn dein Fass groß genug ist und keine Pausen brauchst</li>
-        <li>Das Modul unterstützt sowohl klassische FHEM Devices als auch MQTT2 Relay Boards</li>
-    </ul>
 </ul>
 
 =end html
