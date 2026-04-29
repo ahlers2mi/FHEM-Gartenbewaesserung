@@ -2067,62 +2067,303 @@ sub Gartenbewaesserung_GetStatus {
 
 =pod
 =item device
-=item summary Intelligente Gartenbewässerung mit IBC-Container
+=item summary Intelligente Gartenbewässerung mit IBC-Container und Regenwasser-Management
+=item summary_DE Intelligente Gartenbewässerung mit IBC-Container und Regenwasser-Management
+
 =begin html
 
-<a name="Gartenbewaesserung"></a>
+<a id="Gartenbewaesserung"></a>
 <h3>Gartenbewaesserung</h3>
 <ul>
-    <p>Modul für intelligente Gartenbewässerung mit mehreren Ventilen, Regenwasserfass und IBC-Container.</p>
-    <p><b>Unterstützt MQTT2 Relay Boards (z.B. Tasmota) und dynamische Werte-Erkennung</b></p>
-    <p><b>Automatische Pausen zum Fass-Nachfüllen während Bewässerung</b></p>
+    <p>FHEM Modul für intelligente Gartenbewässerung mit bis zu 8 Ventilen, Regenwasserfass und IBC-Container.</p>
     
-    <b>Define</b>
+    <h4>Features</h4>
     <ul>
-        <code>define &lt;name&gt; Gartenbewaesserung</code><br>
-        Beispiel: <code>define myGarden Gartenbewaesserung</code>
+        <li>Bis zu 8 Magnetventile für verschiedene Bewässerungsbereiche</li>
+        <li>Unterstützt MQTT2 Relay Boards (z.B. Tasmota mit 8-Kanal Relay Board)</li>
+        <li>Automatische Füll-Pausen während der Bewässerung (Fass wird nachgefüllt)</li>
+        <li>Regenwasser-Management mit IBC-Container</li>
+        <li>Feuchtigkeitssensor-Integration (überspringt Bewässerung bei ausreichender Feuchtigkeit)</li>
+        <li>Regensensor-Integration (automatische IBC-Befüllung bei Regen)</li>
+        <li>Zeitgesteuerte Bewässerung (bis zu 3 Startzeiten pro Tag)</li>
+        <li>Einzelkreislauf-Modus (z.B. für Gewächshaus mit eigenem Feuchtigkeitssensor)</li>
+        <li>Flexible Werte-Erkennung (on/off, true/false, 1/0, open/closed, etc.)</li>
+        <li>Live-Countdown der verbleibenden Zeit</li>
+        <li>Umfassende Konfigurationsvalidierung</li>
     </ul>
-    
-    <b>Set</b>
+
+    <a id="Gartenbewaesserung-define"></a>
+    <h4>Define</h4>
     <ul>
-        <li><code>start</code> - Startet den kompletten Bewässerungszyklus</li>
-        <li><code>stop</code> - Stoppt alle Operationen</li>
-        <li><code>startCircuit &lt;1-8&gt;</code> - Startet einzelnen Kreislauf mit voller Logik</li>
-        <li><code>startIBCFill</code> - Startet IBC-Befüllung (aus Fass mit Pumpe)</li>
-        <li><code>stopIBCFill</code> - Stoppt IBC-Befüllung</li>
-        <li><code>startIBCtoBarrel</code> - Wasser vom IBC zurück ins Fass (Pumpe oder Schwerkraft)</li>
-        <li><code>stopIBCtoBarrel</code> - Stoppt IBC zu Fass Transfer</li>
-        <li><code>startValve &lt;1-8&gt;</code> - Startet einzelnes Ventil manuell</li>
-        <li><code>stopValve</code> - Stoppt aktuelles Ventil</li>
-        <li><code>validate</code> - Prüft Konfiguration</li>
+        <code>define &lt;name&gt; Gartenbewaesserung</code><br><br>
+        Beispiel:<br>
+        <code>define Garten Gartenbewaesserung</code>
     </ul>
-    
-    <b>Get</b>
+
+    <a id="Gartenbewaesserung-set"></a>
+    <h4>Set-Befehle</h4>
     <ul>
-        <li><code>status</code> - Zeigt aktuellen Status</li>
-        <li><code>config</code> - Zeigt Konfiguration</li>
+        <li><b>start</b> - Startet den kompletten Bewässerungszyklus mit allen aktiven Ventilen</li>
+        <li><b>stop</b> - Stoppt sofort alle laufenden Operationen (Bewässerung, Pumpen, Ventile)</li>
+        <li><b>startCircuit &lt;1-8&gt;</b> - Startet einen einzelnen Bewässerungskreis (mit voller Logik: Fass-Check, Pumpe, Ventil). Perfekt für externe Steuerung z.B. vom Gewächshaus</li>
+        <li><b>startIBCFill</b> - Startet manuelle IBC-Befüllung aus dem Fass (mit Pumpe)</li>
+        <li><b>stopIBCFill</b> - Stoppt IBC-Befüllung</li>
+        <li><b>startIBCtoBarrel</b> - Lässt Wasser vom IBC zurück ins Fass laufen (Schwerkraft oder Pumpe)</li>
+        <li><b>stopIBCtoBarrel</b> - Stoppt IBC zu Fass Transfer</li>
+        <li><b>startValve &lt;1-8&gt;</b> - Startet ein einzelnes Ventil manuell (ohne Automatik)</li>
+        <li><b>stopValve</b> - Stoppt das aktuell laufende Ventil</li>
+        <li><b>validate</b> - Prüft die komplette Konfiguration und zeigt Fehler, Warnungen und Infos an</li>
     </ul>
-    
-    <b>Attributes</b>
+
+    <a id="Gartenbewaesserung-get"></a>
+    <h4>Get-Befehle</h4>
     <ul>
-        <li><code>wateringPauseInterval</code> - Pause alle X Minuten (0 = keine Pausen, Standard: 8)</li>
-        <li><code>wateringPauseDuration</code> - Pause-Dauer zum Nachfüllen (Standard: 20 min)</li>
-        <li><code>pumpDevice</code> - Hauptpumpe (für Bewässerung & IBC-Befüllung)</li>
-        <li><code>ibcToBarrelPumpDevice</code> - Optional: Separate Pumpe für IBC → Fass</li>
-        <li><code>ibcToBarrelValveDevice</code> - Ventil für IBC → Fass</li>
-        <li><code>ibcToBarrelDuration</code> - Dauer des Transfers (Standard: 15 min)</li>
+        <li><b>status</b> - Zeigt den aktuellen Status aller Komponenten</li>
+        <li><b>config</b> - Zeigt die komplette Konfiguration übersichtlich an</li>
     </ul>
+
+    <a id="Gartenbewaesserung-attr"></a>
+    <h4>Attribute</h4>
     
-    <b>Readings</b>
+    <h5>Ventile und Bewässerung</h5>
     <ul>
-        <li><code>remainingTime</code> - Verbleibende Zeit der aktuellen Operation</li>
-        <li><code>pauseActive</code> - Ist Pause aktiv? (yes/no)</li>
-        <li><code>pauseTimeRemaining</code> - Verbleibende Pause-Zeit</li>
-        <li><code>currentValve</code> - Aktuell aktives Ventil</li>
-        <li><code>phase</code> - Aktuelle Phase der Bewässerung</li>
+        <li><b>valve1Device ... valve8Device</b> - Device-Zuordnung für Magnetventile<br>
+            Format: <code>DeviceName</code> oder <code>DeviceName:Reading</code><br>
+            Beispiel: <code>MQTT2_DVES_F96D88:POWER1</code> für MQTT2 Relay Board<br>
+            Beispiel: <code>Ventil_Rasen</code> für klassisches FHEM Device
+        </li>
+        <li><b>valve1Duration ... valve8Duration</b> - Bewässerungsdauer pro Ventil in Minuten (Standard: 15)</li>
+        <li><b>activeValves</b> - Komma-getrennte Liste der aktiven Ventile (z.B. "1,2,3,4"). Nur diese werden im Zyklus benutzt (Standard: 1,2,3,4,5,6,7,8)</li>
+    </ul>
+
+    <h5>Pumpen</h5>
+    <ul>
+        <li><b>pumpDevice</b> - Hauptpumpe für Bewässerung und IBC-Befüllung<br>
+            Format wie bei Ventilen: <code>DeviceName</code> oder <code>DeviceName:Reading</code>
+        </li>
+        <li><b>pumpStartDelay</b> - Verzögerung in Sekunden nach Pumpenstart, bevor Ventile öffnen (Standard: 3)</li>
+        <li><b>ibcToBarrelPumpDevice</b> - Optional: Separate Pumpe für IBC → Fass Transfer. Wenn nicht gesetzt, läuft der Transfer mit Schwerkraft</li>
+    </ul>
+
+    <h5>Fass (Barrel)</h5>
+    <ul>
+        <li><b>barrelFillValveDevice</b> - Ventil zum Befüllen des Regenwasserfasses (z.B. vom Hauswasseranschluss)</li>
+        <li><b>barrelFillDuration</b> - Dauer der Fass-Befüllung in Minuten (Standard: 10)<br>
+            <i>Dies ist die Zeit, wie lange das Füllventil geöffnet wird, wenn das Fass vor der Bewässerung nachgefüllt werden muss, oder während einer automatischen Pause.</i>
+        </li>
+        <li><b>barrelFillThreshold</b> - Füllstand-Schwellwert in Prozent. Bei Unterschreitung wird vor der Bewässerung nachgefüllt (Standard: 30)</li>
+        <li><b>barrelFullSensorDevice</b> - Kontaktsensor der anzeigt, dass das Fass voll ist (stoppt automatische Befüllung)</li>
+        <li><b>barrelFullSensorActiveValue</b> - Wert des Sensors wenn Fass voll ist (z.B. "closed", "1", "true")</li>
+        <li><b>barrelFullSensorInactiveValue</b> - Wert des Sensors wenn Fass nicht voll ist</li>
+    </ul>
+
+    <h5>Automatische Füll-Pausen</h5>
+    <ul>
+        <li><b>wateringPauseInterval</b> - Pause alle X Minuten während der Bewässerung (Standard: 8)<br>
+            <i>Nach dieser Zeit wird die Bewässerung pausiert und das Fass automatisch nachgefüllt.</i><br>
+            Setze auf <b>0</b> um Pausen zu deaktivieren (durchgehende Bewässerung ohne Unterbrechung)
+        </li>
+        <li><b>wateringPauseDuration</b> - Dauer der Pause in Minuten (Standard: 20)<br>
+            <i>So lange wird das Fass nachgefüllt, bevor die Bewässerung fortgesetzt wird.</i>
+        </li>
+    </ul>
+
+    <h5>IBC-Container</h5>
+    <ul>
+        <li><b>ibcFillValveDevice</b> - Ventil zum Befüllen des IBC aus dem Fass (mit Hauptpumpe)</li>
+        <li><b>ibcToBarrelValveDevice</b> - Ventil für den Rücklauf vom IBC ins Fass</li>
+        <li><b>ibcToBarrelDuration</b> - Dauer des IBC → Fass Transfers in Minuten (Standard: 15)</li>
+        <li><b>ibcFullSensorDevice</b> - Kontaktsensor der anzeigt, dass der IBC voll ist</li>
+        <li><b>ibcFullSensorActiveValue</b> - Wert wenn IBC voll ist</li>
+        <li><b>ibcFullSensorInactiveValue</b> - Wert wenn IBC nicht voll ist</li>
+    </ul>
+
+    <h5>Sensoren</h5>
+    <ul>
+        <li><b>rainSensorDevice</b> - Regensensor für automatische IBC-Befüllung<br>
+            Format: <code>DeviceName:Reading</code> (z.B. <code>MQTT2_Rain:rain</code>)
+        </li>
+        <li><b>rainSensorActiveValue</b> - Wert wenn es regnet (z.B. "true", "rain", "1")</li>
+        <li><b>rainSensorInactiveValue</b> - Wert wenn es nicht regnet (z.B. "false", "dry", "0")</li>
+        <li><b>rainDurationForIBC</b> - Mindest-Regendauer in Minuten, bevor IBC-Befüllung startet (Standard: 30)</li>
+        <li><b>rainCheckInterval</b> - Prüfintervall für Regen in Minuten (Standard: 5)</li>
+        <li><b>moistureSensorDevice</b> - Feuchtigkeitssensor im Boden</li>
+        <li><b>moistureSensorReading</b> - Reading-Name des Feuchtigkeitssensors (Standard: "moisture")</li>
+        <li><b>moistureThreshold</b> - Schwellwert in Prozent. Unter diesem Wert wird bewässert (Standard: 40)</li>
+        <li><b>moistureSensorInvert</b> - Invertiere Logik: Hoher Wert = trocken (Standard: 0)</li>
+    </ul>
+
+    <h5>Zeitsteuerung</h5>
+    <ul>
+        <li><b>startTime1, startTime2, startTime3</b> - Bis zu 3 Startzeiten im Format HH:MM (z.B. "06:00", "18:00")</li>
+        <li><b>weekdaysOnly</b> - Nur an Wochentagen bewässern (Montag-Freitag), nicht am Wochenende (0=nein, 1=ja, Standard: 0)</li>
+        <li><b>manualMode</b> - Deaktiviert automatische Zeitsteuerung, nur manuelle Starts (0=auto, 1=manuell, Standard: 0)</li>
+    </ul>
+
+    <h5>Schalter-Werte</h5>
+    <ul>
+        <li><b>switchOnValue</b> - Wert zum Einschalten von Relais/Ventilen (Standard: "ON")<br>
+            Beispiele: "ON", "1", "true" je nach verwendetem Device-Typ
+        </li>
+        <li><b>switchOffValue</b> - Wert zum Ausschalten (Standard: "OFF")<br>
+            Beispiele: "OFF", "0", "false"
+        </li>
+    </ul>
+
+    <a id="Gartenbewaesserung-readings"></a>
+    <h4>Readings</h4>
+    <ul>
+        <li><b>state</b> - Hauptzustand: idle, watering, paused, circuit mode, ibc to barrel, stopped</li>
+        <li><b>phase</b> - Detaillierte Phase: idle, starting, watering, filling barrel, pause - barrel refilling, etc.</li>
+        <li><b>currentValve</b> - Aktuell geöffnetes Ventil (1-8 oder "none")</li>
+        <li><b>remainingTime</b> - Verbleibende Zeit der aktuellen Operation (z.B. "12 min 45 sec")</li>
+        <li><b>cycleProgress</b> - Fortschritt des Bewässerungszyklus (z.B. "3/8")</li>
+        <li><b>pauseActive</b> - Ist eine Füll-Pause aktiv? (yes/no)</li>
+        <li><b>pauseTimeRemaining</b> - Verbleibende Pause-Zeit</li>
+        <li><b>ibcFilling</b> - Wird IBC befüllt? (yes/no)</li>
+        <li><b>ibcToBarrelActive</b> - Läuft IBC → Fass Transfer? (yes/no)</li>
+        <li><b>barrelFull</b> - Status Fass-Sensor (yes/no/not configured)</li>
+        <li><b>ibcFull</b> - Status IBC-Sensor (yes/no/not configured)</li>
+        <li><b>raining</b> - Regnet es? (yes/no/not configured)</li>
+        <li><b>soilMoisture</b> - Aktuelle Bodenfeuchtigkeit (Wert oder "not configured")</li>
+        <li><b>rainDetectedSince</b> - Zeitpunkt des Regenbeginns</li>
+        <li><b>lastWatering</b> - Zeitpunkt der letzten vollständigen Bewässerung</li>
+        <li><b>lastCircuitWatering</b> - Zeitpunkt der letzten Einzelkreislauf-Bewässerung</li>
+    </ul>
+
+    <a id="Gartenbewaesserung-examples"></a>
+    <h4>Konfigurations-Beispiele</h4>
+    
+    <h5>Basis-Setup mit MQTT2 Relay Board</h5>
+    <code>
+        define Garten Gartenbewaesserung<br>
+        <br>
+        # 4 Ventile am Tasmota 8-Kanal Relay Board<br>
+        attr Garten valve1Device MQTT2_DVES_F96D88:POWER1<br>
+        attr Garten valve2Device MQTT2_DVES_F96D88:POWER2<br>
+        attr Garten valve3Device MQTT2_DVES_F96D88:POWER3<br>
+        attr Garten valve4Device MQTT2_DVES_F96D88:POWER4<br>
+        attr Garten activeValves 1,2,3,4<br>
+        <br>
+        # Pumpe und Fass-Ventil<br>
+        attr Garten pumpDevice MQTT2_DVES_F96D88:POWER5<br>
+        attr Garten barrelFillValveDevice MQTT2_DVES_F96D88:POWER6<br>
+        <br>
+        # Automatische Pausen alle 8 Minuten für 20 Minuten Nachfüllen<br>
+        attr Garten wateringPauseInterval 8<br>
+        attr Garten wateringPauseDuration 20<br>
+        <br>
+        # Zeiten<br>
+        attr Garten startTime1 06:00<br>
+        attr Garten startTime2 18:00<br>
+    </code>
+
+    <h5>Erweitert mit IBC und Sensoren</h5>
+    <code>
+        # IBC-Container<br>
+        attr Garten ibcFillValveDevice MQTT2_DVES_F96D88:POWER7<br>
+        attr Garten ibcToBarrelValveDevice MQTT2_DVES_F96D88:POWER8<br>
+        <br>
+        # Sensoren am gleichen MQTT2 Device<br>
+        attr Garten rainSensorDevice MQTT2_DVES_F96D88:rain<br>
+        attr Garten rainSensorActiveValue true<br>
+        attr Garten rainSensorInactiveValue false<br>
+        <br>
+        attr Garten barrelFullSensorDevice MQTT2_DVES_F96D88:barrel_full<br>
+        attr Garten barrelFullSensorActiveValue 1<br>
+        <br>
+        attr Garten ibcFullSensorDevice MQTT2_DVES_F96D88:ibc_full<br>
+        attr Garten ibcFullSensorActiveValue 1<br>
+        <br>
+        # Feuchtigkeitssensor (separates Device)<br>
+        attr Garten moistureSensorDevice MQTT2_Moisture:moisture<br>
+        attr Garten moistureThreshold 30<br>
+    </code>
+
+    <h5>Gewächshaus mit eigenem Notify</h5>
+    <code>
+        # Notify für Gewächshaus (Kreislauf 4)<br>
+        define n_greenhouse notify greenhouse_moisture:moisture.* {<br>
+        &nbsp;&nbsp;my $moisture = ReadingsVal("greenhouse_moisture", "moisture", 100);;<br>
+        &nbsp;&nbsp;if($moisture < 25) {<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;fhem("set Garten startCircuit 4");;<br>
+        &nbsp;&nbsp;}<br>
+        }<br>
+        attr n_greenhouse room Garten<br>
+    </code>
+
+    <h4>Funktionsweise</h4>
+    
+    <h5>Bewässerungszyklus</h5>
+    <ol>
+        <li>Prüfung der Bodenfeuchtigkeit (wenn Sensor konfiguriert)</li>
+        <li>Start des Zyklus mit allen aktiven Ventilen</li>
+        <li>Für jedes Ventil:
+            <ul>
+                <li>Prüfung ob Pause nötig (nach X Minuten Bewässerung)</li>
+                <li>Falls Pause: Ventil schließen, Fass nachfüllen, nach Y Minuten fortsetzen</li>
+                <li>Prüfung Fass-Füllstand (falls unter Schwellwert: Fass füllen)</li>
+                <li>Pumpe starten + Verzögerung</li>
+                <li>Ventil öffnen</li>
+                <li>Nach konfigurierter Zeit: Ventil schließen</li>
+                <li>Weiter zum nächsten Ventil</li>
+            </ul>
+        </li>
+        <li>Am Ende: Pumpe aus, Status auf "idle"</li>
+    </ol>
+
+    <h5>IBC-Regenwasser-Sammlung</h5>
+    <ul>
+        <li>Bei Regen über konfigurierte Dauer: Automatische IBC-Befüllung startet</li>
+        <li>Ventil zum IBC wird geöffnet (Wasser läuft vom Fass in IBC - schwerkraftgesteuert oder gepumpt)</li>
+        <li>Überlaufschutz durch IBC-Full-Sensor</li>
+        <li>WICHTIG: IBC-Ventil wird IMMER geschlossen, wenn Bewässerung läuft</li>
+    </ul>
+
+    <h5>IBC zu Fass Rücklauf</h5>
+    <ul>
+        <li>Manuell oder per Automatisierung: <code>set Garten startIBCtoBarrel</code></li>
+        <li>Wasser läuft vom IBC zurück ins Fass (Schwerkraft oder optional mit Pumpe)</li>
+        <li>Läuft für konfigurierte Dauer, stoppt dann automatisch</li>
+    </ul>
+
+    <h4>Tipps</h4>
+    <ul>
+        <li>Nutze <code>set Garten validate</code> nach der Konfiguration um Fehler zu finden</li>
+        <li>Nutze <code>get Garten config</code> für eine Übersicht aller Einstellungen</li>
+        <li>Für Gewächshaus o.ä.: Nutze <code>startCircuit</code> statt manuellem Ventil, dann wird auch das Fass geprüft und IBC-Sammlung gestoppt</li>
+        <li>Setze <code>wateringPauseInterval</code> auf 0 wenn dein Fass groß genug ist und keine Pausen brauchst</li>
+        <li>Das Modul unterstützt sowohl klassische FHEM Devices als auch MQTT2 Relay Boards</li>
     </ul>
 </ul>
 
 =end html
+
+=begin html_DE
+
+<a id="Gartenbewaesserung"></a>
+<h3>Gartenbewaesserung</h3>
+<ul>
+    <p>FHEM Modul für intelligente Gartenbewässerung mit bis zu 8 Ventilen, Regenwasserfass und IBC-Container.</p>
+    
+    <h4>Features</h4>
+    <ul>
+        <li>Bis zu 8 Magnetventile für verschiedene Bewässerungsbereiche</li>
+        <li>Unterstützt MQTT2 Relay Boards (z.B. Tasmota mit 8-Kanal Relay Board)</li>
+        <li>Automatische Füll-Pausen während der Bewässerung (Fass wird nachgefüllt)</li>
+        <li>Regenwasser-Management mit IBC-Container</li>
+        <li>Feuchtigkeitssensor-Integration (überspringt Bewässerung bei ausreichender Feuchtigkeit)</li>
+        <li>Regensensor-Integration (automatische IBC-Befüllung bei Regen)</li>
+        <li>Zeitgesteuerte Bewässerung (bis zu 3 Startzeiten pro Tag)</li>
+        <li>Einzelkreislauf-Modus (z.B. für Gewächshaus mit eigenem Feuchtigkeitssensor)</li>
+        <li>Flexible Werte-Erkennung (on/off, true/false, 1/0, open/closed, etc.)</li>
+        <li>Live-Countdown der verbleibenden Zeit</li>
+        <li>Umfassende Konfigurationsvalidierung</li>
+    </ul>
+
+    <p>Siehe englische Dokumentation oben für Details zu Define, Set, Get, Attributes, Readings und Beispiele.</p>
+</ul>
+
+=end html_DE
 
 =cut
