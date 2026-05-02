@@ -15,6 +15,9 @@
 # 1.0.14 - 2026-05-02  Fix: manualCircuit-Flag verhindert Regen-/Schedule-Unterbrechung bei startCircuit
 #                      Fix: CheckBarrelFull stoppt bei aktivem IBC→Fass-Transfer statt zurückzupumpen
 #                      Fix: StartIBCFill verweigert Befüllung während aktivem IBC→Fass-Transfer
+#                      Neu: Event-basierter IBC-Befüllungstrigger (Fass-voll-Sensor bei Regen)
+#                      Neu: NotifyFn überwacht auch Rain-Sensor für sofortige Reaktion
+#                      Neu: Vollständige Attribut-Beschreibungen im Commandref
 # 1.0.13 - 2026-04-29  Fix: Automatische Pausen auch bei startCircuit (Einzelkreislauf)
 # 1.0.12 - 2026-04-29  Fix: Endlosschleife nach Pause behoben (Restzeit wird korrekt fortgesetzt)
 #                      Fix: Fass-voll Sensor schließt Ventil während Pause und beendet Pause vorzeitig
@@ -55,18 +58,18 @@ sub Gartenbewaesserung_Initialize {
     $hash->{NotifyFn}   = "Gartenbewaesserung_Notify";
     
     $hash->{AttrList} = 
-        "valve1Device valve2Device valve3Device valve4Device " .
-        "valve5Device valve6Device valve7Device valve8Device " .
-        "pumpDevice " .
-        "ibcToBarrelPumpDevice " .
-        "barrelFillValveDevice " .
-        "barrelFullSensorDevice " .
-        "ibcFillValveDevice " .
-        "ibcToBarrelValveDevice " .
-        "ibcFullSensorDevice " .
-        "ibcEmptySensorDevice " .
-        "rainSensorDevice " .
-        "moistureSensorDevice " .
+        "valve1Device:textField valve2Device:textField valve3Device:textField valve4Device:textField " .
+        "valve5Device:textField valve6Device:textField valve7Device:textField valve8Device:textField " .
+        "pumpDevice:textField " .
+        "ibcToBarrelPumpDevice:textField " .
+        "barrelFillValveDevice:textField " .
+        "barrelFullSensorDevice:textField " .
+        "ibcFillValveDevice:textField " .
+        "ibcToBarrelValveDevice:textField " .
+        "ibcFullSensorDevice:textField " .
+        "ibcEmptySensorDevice:textField " .
+        "rainSensorDevice:textField " .
+        "moistureSensorDevice:textField " .
         "valve1Duration:slider,1,1,120 valve2Duration:slider,1,1,120 " .
         "valve3Duration:slider,1,1,120 valve4Duration:slider,1,1,120 " .
         "valve5Duration:slider,1,1,120 valve6Duration:slider,1,1,120 " .
@@ -77,19 +80,19 @@ sub Gartenbewaesserung_Initialize {
         "moistureThreshold:slider,0,5,100 " .
         "wateringPauseInterval:slider,0,1,60 " .
         "wateringPauseDuration:slider,0,1,60 " .
-        "startTime1 startTime2 startTime3 " .
+        "startTime1:textField startTime2:textField startTime3:textField " .
         "rainDurationForIBC:slider,5,5,180 " .
         "rainCheckInterval:slider,1,1,30 " .
         "pumpStartDelay:slider,-30,1,30 " .
-        "activeValves " .
+        "activeValves:textField " .
         "weekdaysOnly:0,1 " .
         "manualMode:0,1 " .
-        "switchOnValue switchOffValue " .
-        "rainSensorActiveValue rainSensorInactiveValue " .
-        "barrelFullSensorActiveValue barrelFullSensorInactiveValue " .
-        "ibcFullSensorActiveValue ibcFullSensorInactiveValue " .
-        "ibcEmptySensorActiveValue ibcEmptySensorInactiveValue " .
-        "moistureSensorReading moistureSensorInvert:0,1 " .
+        "switchOnValue:textField switchOffValue:textField " .
+        "rainSensorActiveValue:textField rainSensorInactiveValue:textField " .
+        "barrelFullSensorActiveValue:textField barrelFullSensorInactiveValue:textField " .
+        "ibcFullSensorActiveValue:textField ibcFullSensorInactiveValue:textField " .
+        "ibcEmptySensorActiveValue:textField ibcEmptySensorInactiveValue:textField " .
+        "moistureSensorReading:textField moistureSensorInvert:0,1 " .
         "disable:0,1 " .
         $readingFnAttributes;
 }
@@ -274,6 +277,14 @@ sub Gartenbewaesserung_Notify {
                 if(Gartenbewaesserung_CheckSensorActive($name, $event, $barrelReading, $activeValue)) {
                     readingsSingleUpdate($hash, "barrelFull", "yes", 1);
                     Gartenbewaesserung_CheckBarrelFull($hash);
+                    # If raining and idle, start IBC fill immediately (event-triggered)
+                    if(ReadingsVal($name, "raining", "no") eq "yes" &&
+                       !$hash->{HELPER}{ibcFilling} &&
+                       !$hash->{HELPER}{watering} &&
+                       !$hash->{HELPER}{circuitMode}) {
+                        Log3 $name, 3, "$name: Barrel full and raining, starting IBC fill (event-triggered)";
+                        Gartenbewaesserung_StartIBCFill($hash, 0);
+                    }
                 }
                 elsif(Gartenbewaesserung_CheckSensorInactive($name, $event, $barrelReading, 
                       AttrVal($name, "barrelFullSensorInactiveValue", ""))) {
@@ -311,6 +322,31 @@ sub Gartenbewaesserung_Notify {
                 elsif(Gartenbewaesserung_CheckSensorInactive($name, $event, $ibcEmptyReading,
                       AttrVal($name, "ibcEmptySensorInactiveValue", ""))) {
                     readingsSingleUpdate($hash, "ibcEmpty", "no", 1);
+                }
+            }
+        }
+        
+        # Rain sensor - event-triggered response
+        my $rainSensorDef = AttrVal($name, "rainSensorDevice", "");
+        if($rainSensorDef ne "") {
+            my ($rainDev, $rainReading) = Gartenbewaesserung_ParseDevice($rainSensorDef);
+            if($devName eq $rainDev) {
+                my $activeValue = AttrVal($name, "rainSensorActiveValue", "");
+                if(Gartenbewaesserung_CheckSensorActive($name, $event, $rainReading, $activeValue)) {
+                    readingsSingleUpdate($hash, "raining", "yes", 1);
+                    Log3 $name, 4, "$name: Rain sensor active (event), triggering CheckRain immediately";
+                    # Remove pending timer and run CheckRain right now
+                    RemoveInternalTimer($hash, "Gartenbewaesserung_CheckRain");
+                    Gartenbewaesserung_CheckRain($hash);
+                }
+                elsif(Gartenbewaesserung_CheckSensorInactive($name, $event, $rainReading,
+                      AttrVal($name, "rainSensorInactiveValue", ""))) {
+                    readingsSingleUpdate($hash, "raining", "no", 1);
+                    delete $hash->{HELPER}{rainingSince};
+                    Log3 $name, 4, "$name: Rain sensor inactive (event), stopping IBC fill if running";
+                    if($hash->{HELPER}{ibcFilling}) {
+                        Gartenbewaesserung_StopIBCFill($hash);
+                    }
                 }
             }
         }
@@ -2483,12 +2519,24 @@ sub Gartenbewaesserung_CheckRain {
                 Log3 $name, 4, "$name: Rain detected";
             }
             
-            my $rainDuration = time() - $hash->{HELPER}{rainingSince};
-            my $requiredDuration = AttrVal($name, "rainDurationForIBC", 30) * 60;
-            
-            if($rainDuration >= $requiredDuration && !$hash->{HELPER}{ibcFilling}) {
-                Log3 $name, 3, "$name: Rain duration threshold reached, starting IBC fill";
-                Gartenbewaesserung_StartIBCFill($hash, 0);
+            # Check how to trigger IBC fill: sensor-based or time-based
+            my $barrelSensorDef = AttrVal($name, "barrelFullSensorDevice", "");
+            if($barrelSensorDef ne "") {
+                # Sensor-based: start IBC fill only when barrel is full
+                if(ReadingsVal($name, "barrelFull", "no") eq "yes" && !$hash->{HELPER}{ibcFilling}) {
+                    Log3 $name, 3, "$name: Rain active and barrel full, starting IBC fill";
+                    Gartenbewaesserung_StartIBCFill($hash, 0);
+                }
+            }
+            else {
+                # Time-based fallback: start IBC fill after rainDurationForIBC minutes
+                my $rainDuration = time() - $hash->{HELPER}{rainingSince};
+                my $requiredDuration = AttrVal($name, "rainDurationForIBC", 30) * 60;
+                
+                if($rainDuration >= $requiredDuration && !$hash->{HELPER}{ibcFilling}) {
+                    Log3 $name, 3, "$name: Rain duration threshold reached, starting IBC fill";
+                    Gartenbewaesserung_StartIBCFill($hash, 0);
+                }
             }
         }
         else {
@@ -2593,6 +2641,8 @@ sub Gartenbewaesserung_GetStatus {
         <li>Bis zu 8 Magnetventile für verschiedene Bewässerungsbereiche</li>
         <li>Unterstützt MQTT2 Relay Boards (z.B. Tasmota mit 8-Kanal Relay Board)</li>
         <li>Automatische Füll-Pausen während der Bewässerung (IBC → Fass oder Hauswasseranschluss)</li>
+        <li><b>NEU in 1.0.14:</b> Ereignisgesteuerter IBC-Befüllungs-Trigger: Fass-voll-Sensor löst IBC-Fill bei Regen sofort aus</li>
+        <li><b>NEU in 1.0.14:</b> NotifyFn überwacht den Regensensor für sofortige Reaktion (kein Polling-Delay)</li>
         <li><b>NEU in 1.0.14:</b> Manueller startCircuit wird nicht mehr durch Regen oder Scheduler unterbrochen</li>
         <li><b>NEU in 1.0.14:</b> IBC→Fass-Transfer stoppt korrekt bei vollem Fass (kein Rückpumpen mehr)</li>
         <li><b>NEU in 1.0.13:</b> Pausen auch bei Einzelkreislauf-Modus (startCircuit)</li>
@@ -2610,7 +2660,7 @@ sub Gartenbewaesserung_GetStatus {
 
     <h4>Versionshistorie</h4>
     <ul>
-        <li><b>1.0.14</b> (2026-05-02): manualCircuit-Flag (Regen/Schedule blockiert startCircuit nicht mehr), IBC→Fass stoppt bei vollem Fass korrekt</li>
+        <li><b>1.0.14</b> (2026-05-02): Ereignisgesteuerter IBC-Befüllungs-Trigger, Regensensor in NotifyFn, manualCircuit-Flag, IBC→Fass korrekt bei vollem Fass</li>
         <li><b>1.0.13</b> (2026-04-29): Automatische Pausen auch bei startCircuit (Einzelkreislauf)</li>
         <li><b>1.0.12</b> (2026-04-29): Endlosschleifen-Bug gefixt, negatives Delay, IBC→Fass in Pausen, IBC-Leer-Sensor, Fass-voll stoppt Pause</li>
         <li><b>1.0.11</b> (2026-04-29): Automatische Füll-Pausen während Bewässerung</li>
@@ -2646,6 +2696,235 @@ sub Gartenbewaesserung_GetStatus {
         <li><b>status</b> - Zeigt den aktuellen Status aller Komponenten</li>
         <li><b>config</b> - Zeigt die komplette Konfiguration übersichtlich an</li>
         <li><b>version</b> - Zeigt die Modulversion an</li>
+    </ul>
+
+    <a id="Gartenbewaesserung-attr"></a>
+    <h4>Attribute</h4>
+    <ul>
+        <p><b>Geräte-Attribute (Device-Namen oder Device:Reading)</b></p>
+        <li><a id="Gartenbewaesserung-attr-valve1Device"></a>
+            <b>valve1Device</b> .. <b>valve8Device</b><br>
+            Typ: textField. Standardwert: keiner.<br>
+            FHEM-Gerätename des jeweiligen Magnetventils (z.B. <code>MQTT2_RELAIS:POWER1</code>).
+            Unterstützt das Format <code>Device</code> oder <code>Device:Reading</code>.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-pumpDevice"></a>
+            <b>pumpDevice</b><br>
+            Typ: textField. Standardwert: keiner.<br>
+            FHEM-Gerätename der Hauptwasserpumpe (Fass → Ventile).
+            Wird vor dem Öffnen eines Ventils eingeschaltet.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-ibcToBarrelPumpDevice"></a>
+            <b>ibcToBarrelPumpDevice</b><br>
+            Typ: textField. Standardwert: keiner.<br>
+            FHEM-Gerätename der Pumpe für den IBC→Fass-Transfer.
+            Optional: Ohne Pumpe läuft der Transfer per Schwerkraft (Ventil <code>ibcToBarrelValveDevice</code> öffnen).
+        </li>
+        <li><a id="Gartenbewaesserung-attr-barrelFillValveDevice"></a>
+            <b>barrelFillValveDevice</b><br>
+            Typ: textField. Standardwert: keiner.<br>
+            FHEM-Gerätename des Ventils am Hauswasseranschluss (füllt das Regenwasserfass aus dem Netz).
+            Wird während Bewässerungs-Pausen geöffnet, wenn der IBC leer ist.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-barrelFullSensorDevice"></a>
+            <b>barrelFullSensorDevice</b><br>
+            Typ: textField. Standardwert: keiner.<br>
+            FHEM-Gerätename des Fass-voll-Sensors. Wenn konfiguriert, wird die IBC-Befüllung
+            automatisch gestartet, sobald der Sensor „voll" meldet UND es gerade regnet
+            (statt nach einer festen Regendauer). Stoppt außerdem Pausen und Direktbefüllung früh.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-ibcFillValveDevice"></a>
+            <b>ibcFillValveDevice</b><br>
+            Typ: textField. Standardwert: keiner.<br>
+            FHEM-Gerätename des Ventils Fass→IBC (pumpt Regenwasser in den IBC-Container).
+        </li>
+        <li><a id="Gartenbewaesserung-attr-ibcToBarrelValveDevice"></a>
+            <b>ibcToBarrelValveDevice</b><br>
+            Typ: textField. Standardwert: keiner.<br>
+            FHEM-Gerätename des Ventils IBC→Fass (gibt Wasser aus dem IBC zurück ins Fass;
+            Schwerkraft oder separate Pumpe <code>ibcToBarrelPumpDevice</code>).
+        </li>
+        <li><a id="Gartenbewaesserung-attr-ibcFullSensorDevice"></a>
+            <b>ibcFullSensorDevice</b><br>
+            Typ: textField. Standardwert: keiner.<br>
+            FHEM-Gerätename des IBC-voll-Sensors. Stoppt die IBC-Befüllung automatisch,
+            wenn der IBC-Container voll ist.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-ibcEmptySensorDevice"></a>
+            <b>ibcEmptySensorDevice</b><br>
+            Typ: textField. Standardwert: keiner.<br>
+            FHEM-Gerätename des IBC-leer-Sensors. Steuert die Quellenauswahl während Pausen:
+            Wenn IBC leer → Hauswasseranschluss (<code>barrelFillValveDevice</code>),
+            sonst → IBC→Fass (<code>ibcToBarrelValveDevice</code>).
+        </li>
+        <li><a id="Gartenbewaesserung-attr-rainSensorDevice"></a>
+            <b>rainSensorDevice</b><br>
+            Typ: textField. Standardwert: keiner.<br>
+            FHEM-Gerätename des Regensensors. Bei Aktivierung des Sensors wird sofort
+            <code>CheckRain</code> aufgerufen (ereignisgesteuert). Wenn <code>barrelFullSensorDevice</code>
+            konfiguriert ist, startet die IBC-Befüllung erst bei vollem Fass.
+            Ohne Fass-voll-Sensor wird nach <code>rainDurationForIBC</code> Minuten Regen gestartet.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-moistureSensorDevice"></a>
+            <b>moistureSensorDevice</b><br>
+            Typ: textField. Standardwert: keiner.<br>
+            FHEM-Gerätename des Bodenfeuchtigkeitssensors. Überspringt den Bewässerungszyklus,
+            wenn die Feuchtigkeit über <code>moistureThreshold</code> liegt.
+        </li>
+
+        <p><b>Zeitdauer-Attribute (Slider)</b></p>
+        <li><a id="Gartenbewaesserung-attr-valve1Duration"></a>
+            <b>valve1Duration</b> .. <b>valve8Duration</b><br>
+            Typ: Slider (1–120 Minuten). Standardwert: 15 Minuten.<br>
+            Bewässerungsdauer des jeweiligen Ventils in Minuten.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-barrelFillDuration"></a>
+            <b>barrelFillDuration</b><br>
+            Typ: Slider (1–60 Minuten). Standardwert: 10 Minuten.<br>
+            Maximale Befüllungsdauer des Fasses aus dem Hauswasseranschluss (ohne Fass-voll-Sensor).
+        </li>
+        <li><a id="Gartenbewaesserung-attr-barrelFillThreshold"></a>
+            <b>barrelFillThreshold</b><br>
+            Typ: Slider (0–100 %). Standardwert: 30 %.<br>
+            Simulierter Füllstand-Schwellwert: Fällt <code>barrelLevel</code> darunter,
+            wird vor dem nächsten Ventil eine Befüllung gestartet.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-ibcToBarrelDuration"></a>
+            <b>ibcToBarrelDuration</b><br>
+            Typ: Slider (1–60 Minuten). Standardwert: 15 Minuten.<br>
+            Maximale Dauer des IBC→Fass-Transfers (wird durch Fass-voll-Sensor früh beendet).
+        </li>
+        <li><a id="Gartenbewaesserung-attr-moistureThreshold"></a>
+            <b>moistureThreshold</b><br>
+            Typ: Slider (0–100). Standardwert: 40.<br>
+            Feuchtigkeitsschwellwert: Liegt die Bodenfeuchtigkeit über diesem Wert,
+            wird der Bewässerungszyklus übersprungen.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-wateringPauseInterval"></a>
+            <b>wateringPauseInterval</b><br>
+            Typ: Slider (0–60 Minuten). Standardwert: 8 Minuten.<br>
+            Abstand zwischen automatischen Bewässerungs-Pausen (Fass-Nachfüllpausen).
+            0 = Pausen deaktiviert.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-wateringPauseDuration"></a>
+            <b>wateringPauseDuration</b><br>
+            Typ: Slider (0–60 Minuten). Standardwert: 20 Minuten.<br>
+            Dauer der automatischen Bewässerungs-Pause zum Nachfüllen des Fasses.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-rainDurationForIBC"></a>
+            <b>rainDurationForIBC</b><br>
+            Typ: Slider (5–180 Minuten, Schritt 5). Standardwert: 30 Minuten.<br>
+            Nur relevant wenn <b>kein</b> <code>barrelFullSensorDevice</code> konfiguriert ist:
+            Mindestdauer des Regens, bevor die IBC-Befüllung automatisch gestartet wird.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-rainCheckInterval"></a>
+            <b>rainCheckInterval</b><br>
+            Typ: Slider (1–30 Minuten). Standardwert: 5 Minuten.<br>
+            Polling-Intervall des Regen-Check-Timers (Fallback wenn NotifyFn nicht greift).
+        </li>
+        <li><a id="Gartenbewaesserung-attr-pumpStartDelay"></a>
+            <b>pumpStartDelay</b><br>
+            Typ: Slider (-30 bis +30 Sekunden). Standardwert: 3 Sekunden.<br>
+            Startverzögerung zwischen Pumpe und Ventil.
+            Positiv: Pumpe startet X Sekunden VOR dem Ventil.
+            Negativ: Ventil öffnet X Sekunden VOR der Pumpe (Druckentlastung).
+        </li>
+
+        <p><b>Zeitplan-Attribute</b></p>
+        <li><a id="Gartenbewaesserung-attr-startTime1"></a>
+            <b>startTime1</b>, <b>startTime2</b>, <b>startTime3</b><br>
+            Typ: textField (Format HH:MM). Standardwert: keiner.<br>
+            Bis zu 3 tägliche Startzeiten für den automatischen Bewässerungszyklus.
+            Beispiel: <code>06:00</code>
+        </li>
+        <li><a id="Gartenbewaesserung-attr-activeValves"></a>
+            <b>activeValves</b><br>
+            Typ: textField. Standardwert: <code>1,2,3,4,5,6,7,8</code>.<br>
+            Kommagetrennte Liste der aktiven Ventilnummern (1–8), die im Zyklus verwendet werden.
+            Beispiel: <code>1,3,5,8</code>
+        </li>
+
+        <p><b>Boolean-Attribute</b></p>
+        <li><a id="Gartenbewaesserung-attr-weekdaysOnly"></a>
+            <b>weekdaysOnly</b><br>
+            Typ: 0/1. Standardwert: 0.<br>
+            1 = Automatische Bewässerung nur an Werktagen (Mo–Fr). 0 = täglich.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-manualMode"></a>
+            <b>manualMode</b><br>
+            Typ: 0/1. Standardwert: 0.<br>
+            1 = Automatischer Zeitplan deaktiviert (nur manuelle Steuerung per Set-Befehlen).
+        </li>
+        <li><a id="Gartenbewaesserung-attr-moistureSensorInvert"></a>
+            <b>moistureSensorInvert</b><br>
+            Typ: 0/1. Standardwert: 0.<br>
+            1 = Feuchtigkeitssensor-Logik umkehren (nützlich wenn hoher Wert = trocken).
+        </li>
+        <li><a id="Gartenbewaesserung-attr-disable"></a>
+            <b>disable</b><br>
+            Typ: 0/1. Standardwert: 0.<br>
+            1 = Modul komplett deaktivieren (keine Timer, keine Events).
+        </li>
+
+        <p><b>Sensor-Werte-Attribute</b></p>
+        <li><a id="Gartenbewaesserung-attr-switchOnValue"></a>
+            <b>switchOnValue</b><br>
+            Typ: textField. Standardwert: <code>ON</code>.<br>
+            Wert zum Einschalten von Ventilen und Pumpen (z.B. <code>ON</code>, <code>1</code>, <code>true</code>).
+        </li>
+        <li><a id="Gartenbewaesserung-attr-switchOffValue"></a>
+            <b>switchOffValue</b><br>
+            Typ: textField. Standardwert: <code>OFF</code>.<br>
+            Wert zum Ausschalten von Ventilen und Pumpen (z.B. <code>OFF</code>, <code>0</code>, <code>false</code>).
+        </li>
+        <li><a id="Gartenbewaesserung-attr-rainSensorActiveValue"></a>
+            <b>rainSensorActiveValue</b><br>
+            Typ: textField. Standardwert: automatisch.<br>
+            Wert des Regensensors bei aktivem Regen. Leer = automatische Erkennung
+            (on/1/true/yes/rain/raining/wet/closed/active).
+        </li>
+        <li><a id="Gartenbewaesserung-attr-rainSensorInactiveValue"></a>
+            <b>rainSensorInactiveValue</b><br>
+            Typ: textField. Standardwert: automatisch.<br>
+            Wert des Regensensors bei kein Regen. Leer = automatische Erkennung
+            (off/0/false/no/open/inactive/dry).
+        </li>
+        <li><a id="Gartenbewaesserung-attr-barrelFullSensorActiveValue"></a>
+            <b>barrelFullSensorActiveValue</b><br>
+            Typ: textField. Standardwert: automatisch.<br>
+            Wert des Fass-voll-Sensors wenn Fass voll. Leer = automatische Erkennung.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-barrelFullSensorInactiveValue"></a>
+            <b>barrelFullSensorInactiveValue</b><br>
+            Typ: textField. Standardwert: automatisch.<br>
+            Wert des Fass-voll-Sensors wenn Fass nicht voll. Leer = automatische Erkennung.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-ibcFullSensorActiveValue"></a>
+            <b>ibcFullSensorActiveValue</b><br>
+            Typ: textField. Standardwert: automatisch.<br>
+            Wert des IBC-voll-Sensors wenn IBC voll. Leer = automatische Erkennung.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-ibcFullSensorInactiveValue"></a>
+            <b>ibcFullSensorInactiveValue</b><br>
+            Typ: textField. Standardwert: automatisch.<br>
+            Wert des IBC-voll-Sensors wenn IBC nicht voll. Leer = automatische Erkennung.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-ibcEmptySensorActiveValue"></a>
+            <b>ibcEmptySensorActiveValue</b><br>
+            Typ: textField. Standardwert: automatisch.<br>
+            Wert des IBC-leer-Sensors wenn IBC leer. Leer = automatische Erkennung.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-ibcEmptySensorInactiveValue"></a>
+            <b>ibcEmptySensorInactiveValue</b><br>
+            Typ: textField. Standardwert: automatisch.<br>
+            Wert des IBC-leer-Sensors wenn IBC nicht leer. Leer = automatische Erkennung.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-moistureSensorReading"></a>
+            <b>moistureSensorReading</b><br>
+            Typ: textField. Standardwert: <code>moisture</code>.<br>
+            Name des Readings am Feuchtigkeitssensor-Device (z.B. <code>humidity</code>,
+            <code>soil_moisture</code>).
+        </li>
     </ul>
 
 </ul>
