@@ -22,7 +22,7 @@ jobs:
 
       - name: Commit updated controls_Gartenbewaesserung.txt
         run: |
-          SIZE=$(wc -c < FHEM/98_OpenRouter.pm)
+          SIZE=$(wc -c < FHEM/98_Gartenbewaesserung.pm)
           DATE=$(date -u +"%Y-%m-%d_%H:%M:%S")
           echo "UPD ${DATE} ${SIZE} FHEM/98_Gartenbewaesserung.pm" > controls_Gartenbewaesserung.txt
 
