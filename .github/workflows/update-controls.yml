@@ -3,7 +3,7 @@ name: Update controls_Gartenbewaesserung.txt
 on:
   push:
     paths:
-      - 'FHEM/98_Gemini.pm'
+      - 'FHEM/98_Gartenbewaesserung.pm'
   workflow_dispatch:
 
 jobs:
@@ -14,11 +14,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Update controls_Gemini.txt
+      - name: Update controls_Gartenbewaesserung.txt
         run: |
-          SIZE=$(wc -c < FHEM/98_Gemini.pm)
+          SIZE=$(wc -c < FHEM/98_Gartenbewaesserung.pm)
           DATE=$(date -u +"%Y-%m-%d_%H:%M:%S")
-          echo "UPD ${DATE} ${SIZE} FHEM/98_Gemini.pm" > controls_Gemini.txt
+          echo "UPD ${DATE} ${SIZE} FHEM/98_Gemini.pm" > controls_Gartenbewaesserung.txt
 
-      - name: Commit updated controls_Gemini.txt
+      - name: Commit updated controls_Gartenbewaesserung.txt
         run: |
