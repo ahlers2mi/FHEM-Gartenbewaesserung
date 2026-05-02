@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.13 - 2026-04-29
+#     Version 1.0.14 - 2026-05-02
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,9 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.14 - 2026-05-02  Fix: manualCircuit-Flag verhindert Regen-/Schedule-Unterbrechung bei startCircuit
+#                      Fix: CheckBarrelFull stoppt bei aktivem IBC→Fass-Transfer statt zurückzupumpen
+#                      Fix: StartIBCFill verweigert Befüllung während aktivem IBC→Fass-Transfer
 # 1.0.13 - 2026-04-29  Fix: Automatische Pausen auch bei startCircuit (Einzelkreislauf)
 # 1.0.12 - 2026-04-29  Fix: Endlosschleife nach Pause behoben (Restzeit wird korrekt fortgesetzt)
 #                      Fix: Fass-voll Sensor schließt Ventil während Pause und beendet Pause vorzeitig
@@ -98,7 +101,7 @@ sub Gartenbewaesserung_Define {
     
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.13';
+    $hash->{VERSION}    = '1.0.14';
     
     my $name = $a[0];
     
@@ -1092,6 +1095,7 @@ sub Gartenbewaesserung_StartCircuit {
     
     # Set circuit mode
     $hash->{HELPER}{circuitMode} = 1;
+    $hash->{HELPER}{manualCircuit} = 1;  # Prevents rain/schedule from interrupting manual circuit
     $hash->{HELPER}{circuitNumber} = $circuitNum;
     $hash->{HELPER}{circuitStartTime} = time();  # Track start time for pauses
     delete $hash->{HELPER}{valveRemainingTime};  # Clear any leftover remaining time
@@ -1446,6 +1450,7 @@ sub Gartenbewaesserung_FinishCircuit {
     my $name = $hash->{NAME};
     
     $hash->{HELPER}{circuitMode} = 0;
+    delete $hash->{HELPER}{manualCircuit};
     delete $hash->{HELPER}{circuitNumber};
     delete $hash->{HELPER}{circuitStartTime};
     delete $hash->{HELPER}{lastPauseEnd};
@@ -1967,6 +1972,13 @@ sub Gartenbewaesserung_CheckBarrelFull {
     
     Log3 $name, 3, "$name: Barrel full detected";
     
+    # If IBC→Barrel transfer is active, stop the transfer and do NOT pump back
+    if($hash->{HELPER}{ibcToBarrelActive}) {
+        Log3 $name, 3, "$name: Barrel full during IBC-to-barrel transfer, stopping transfer";
+        Gartenbewaesserung_StopIBCtoBarrel($hash);
+        return;
+    }
+    
     # If filling barrel directly
     if($hash->{HELPER}{barrelFilling}) {
         Log3 $name, 3, "$name: Stopping barrel fill (sensor triggered)";
@@ -2106,6 +2118,7 @@ sub Gartenbewaesserung_StopAll {
     $hash->{HELPER}{pauseActive} = 0;
     $hash->{HELPER}{ibcFilling} = 0;
     $hash->{HELPER}{ibcToBarrelActive} = 0;
+    delete $hash->{HELPER}{manualCircuit};
     delete $hash->{HELPER}{wateringQueue};
     delete $hash->{HELPER}{wateringIndex};
     delete $hash->{HELPER}{circuitNumber};
@@ -2217,6 +2230,13 @@ sub Gartenbewaesserung_StartIBCFill {
     if($hash->{HELPER}{watering} || $hash->{HELPER}{circuitMode}) {
         Log3 $name, 3, "$name: Cannot start IBC fill during watering";
         return "Cannot start IBC fill during watering" if($manual);
+        return;
+    }
+    
+    # Don't start if IBC→Barrel transfer is running (would pump water in wrong direction)
+    if($hash->{HELPER}{ibcToBarrelActive}) {
+        Log3 $name, 3, "$name: Cannot fill IBC while IBC-to-barrel transfer is active";
+        return "Cannot fill IBC while IBC-to-barrel transfer is active" if($manual);
         return;
     }
     
@@ -2442,6 +2462,13 @@ sub Gartenbewaesserung_CheckRain {
     
     return if(IsDisabled($name));
     
+    # Do not interrupt a manually started circuit
+    if($hash->{HELPER}{manualCircuit}) {
+        my $interval = AttrVal($name, "rainCheckInterval", 5) * 60;
+        InternalTimer(gettimeofday() + $interval, "Gartenbewaesserung_CheckRain", $hash);
+        return;
+    }
+    
     my $rainSensorDef = AttrVal($name, "rainSensorDevice", "");
     if($rainSensorDef ne "") {
         my $activeValue = AttrVal($name, "rainSensorActiveValue", "");
@@ -2506,7 +2533,7 @@ sub Gartenbewaesserung_CheckSchedule {
     for(my $i = 1; $i <= 3; $i++) {
         my $startTime = AttrVal($name, "startTime$i", "");
         if($startTime ne "" && $startTime eq $currentTime) {
-            if(!$hash->{HELPER}{watering}) {
+            if(!$hash->{HELPER}{watering} && !$hash->{HELPER}{manualCircuit}) {
                 Log3 $name, 3, "$name: Schedule triggered at $currentTime";
                 Gartenbewaesserung_StartWatering($hash);
             }
@@ -2559,13 +2586,15 @@ sub Gartenbewaesserung_GetStatus {
 <h3>Gartenbewaesserung</h3>
 <ul>
     <p>FHEM Modul für intelligente Gartenbewässerung mit bis zu 8 Ventilen, Regenwasserfass und IBC-Container.</p>
-    <p><b>Version: 1.0.13</b></p>
+    <p><b>Version: 1.0.14</b></p>
     
     <h4>Features</h4>
     <ul>
         <li>Bis zu 8 Magnetventile für verschiedene Bewässerungsbereiche</li>
         <li>Unterstützt MQTT2 Relay Boards (z.B. Tasmota mit 8-Kanal Relay Board)</li>
         <li>Automatische Füll-Pausen während der Bewässerung (IBC → Fass oder Hauswasseranschluss)</li>
+        <li><b>NEU in 1.0.14:</b> Manueller startCircuit wird nicht mehr durch Regen oder Scheduler unterbrochen</li>
+        <li><b>NEU in 1.0.14:</b> IBC→Fass-Transfer stoppt korrekt bei vollem Fass (kein Rückpumpen mehr)</li>
         <li><b>NEU in 1.0.13:</b> Pausen auch bei Einzelkreislauf-Modus (startCircuit)</li>
         <li>Regenwasser-Management mit IBC-Container</li>
         <li>Feuchtigkeitssensor-Integration (überspringt Bewässerung bei ausreichender Feuchtigkeit)</li>
@@ -2581,6 +2610,7 @@ sub Gartenbewaesserung_GetStatus {
 
     <h4>Versionshistorie</h4>
     <ul>
+        <li><b>1.0.14</b> (2026-05-02): manualCircuit-Flag (Regen/Schedule blockiert startCircuit nicht mehr), IBC→Fass stoppt bei vollem Fass korrekt</li>
         <li><b>1.0.13</b> (2026-04-29): Automatische Pausen auch bei startCircuit (Einzelkreislauf)</li>
         <li><b>1.0.12</b> (2026-04-29): Endlosschleifen-Bug gefixt, negatives Delay, IBC→Fass in Pausen, IBC-Leer-Sensor, Fass-voll stoppt Pause</li>
         <li><b>1.0.11</b> (2026-04-29): Automatische Füll-Pausen während Bewässerung</li>
