@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.14 - 2026-05-02
+#     Version 1.0.15 - 2026-05-03
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,8 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.15 - 2026-05-03  Fix: Ghost-Timer nach vorzeitigem Pause-Ende (phase: resuming hängt nicht mehr)
+#                      Fix: remainingTime bleibt während Pause sichtbar (zeigt verbleibende Ventilzeit)
 # 1.0.14 - 2026-05-02  Fix: manualCircuit-Flag verhindert Regen-/Schedule-Unterbrechung bei startCircuit
 #                      Fix: CheckBarrelFull stoppt bei aktivem IBC→Fass-Transfer statt zurückzupumpen
 #                      Fix: StartIBCFill verweigert Befüllung während aktivem IBC→Fass-Transfer
@@ -104,7 +106,7 @@ sub Gartenbewaesserung_Define {
     
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.14';
+    $hash->{VERSION}    = '1.0.15';
     
     my $name = $a[0];
     
@@ -1373,6 +1375,12 @@ sub Gartenbewaesserung_StartCircuitPause {
     Gartenbewaesserung_ClearEndTime($hash);
     Gartenbewaesserung_SetPauseEndTime($hash, $pauseDuration);
     
+    if(defined($hash->{HELPER}{valveRemainingTime}) && $hash->{HELPER}{valveRemainingTime} > 0) {
+        my $rem = $hash->{HELPER}{valveRemainingTime};
+        my $timeStr = $rem >= 1 ? sprintf("%d min", $rem) : "< 1 min";
+        readingsSingleUpdate($hash, "remainingTime", "$timeStr (paused)", 1);
+    }
+    
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "state", "paused");
     readingsBulkUpdate($hash, "phase", "pause - refilling");
@@ -1421,9 +1429,16 @@ sub Gartenbewaesserung_StartCircuitPause {
     
     # Schedule pause end
     $hash->{HELPER}{pauseEndTimer} = gettimeofday() + ($pauseDuration * 60);
-    InternalTimer($hash->{HELPER}{pauseEndTimer}, sub {
-        Gartenbewaesserung_EndCircuitPause($hash, $circuitNum);
-    }, $hash);
+    InternalTimer($hash->{HELPER}{pauseEndTimer}, "Gartenbewaesserung_EndCircuitPauseTimer", $hash);
+}
+
+##############################################################################
+# Named timer callback for circuit pause end (needed for RemoveInternalTimer)
+##############################################################################
+sub Gartenbewaesserung_EndCircuitPauseTimer {
+    my ($hash) = @_;
+    my $circuitNum = $hash->{HELPER}{pausedCircuit};
+    Gartenbewaesserung_EndCircuitPause($hash, $circuitNum);
 }
 
 ##############################################################################
@@ -1432,6 +1447,8 @@ sub Gartenbewaesserung_StartCircuitPause {
 sub Gartenbewaesserung_EndCircuitPause {
     my ($hash, $circuitNum) = @_;
     my $name = $hash->{NAME};
+    
+    return if(!$hash->{HELPER}{pauseActive});
     
     Log3 $name, 3, "$name: Ending circuit $circuitNum pause, resuming";
     
@@ -1626,6 +1643,12 @@ sub Gartenbewaesserung_StartWateringPause {
     Gartenbewaesserung_ClearEndTime($hash);
     Gartenbewaesserung_SetPauseEndTime($hash, $pauseDuration);
     
+    if(defined($hash->{HELPER}{valveRemainingTime}) && $hash->{HELPER}{valveRemainingTime} > 0) {
+        my $rem = $hash->{HELPER}{valveRemainingTime};
+        my $timeStr = $rem >= 1 ? sprintf("%d min", $rem) : "< 1 min";
+        readingsSingleUpdate($hash, "remainingTime", "$timeStr (paused)", 1);
+    }
+    
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "state", "paused");
     readingsBulkUpdate($hash, "phase", "pause - refilling");
@@ -1680,9 +1703,7 @@ sub Gartenbewaesserung_StartWateringPause {
     
     # Schedule pause end
     $hash->{HELPER}{pauseEndTimer} = gettimeofday() + ($pauseDuration * 60);
-    InternalTimer($hash->{HELPER}{pauseEndTimer}, sub {
-        Gartenbewaesserung_EndWateringPause($hash);
-    }, $hash);
+    InternalTimer($hash->{HELPER}{pauseEndTimer}, "Gartenbewaesserung_EndWateringPause", $hash);
 }
 
 ##############################################################################
@@ -1691,6 +1712,8 @@ sub Gartenbewaesserung_StartWateringPause {
 sub Gartenbewaesserung_EndWateringPause {
     my ($hash) = @_;
     my $name = $hash->{NAME};
+    
+    return if(!$hash->{HELPER}{pauseActive});
     
     Log3 $name, 3, "$name: Ending watering pause, resuming cycle";
     
@@ -2052,7 +2075,7 @@ sub Gartenbewaesserung_CheckBarrelFull {
         # Cancel pause timer
         if(defined($hash->{HELPER}{pauseEndTimer})) {
             RemoveInternalTimer($hash, "Gartenbewaesserung_EndWateringPause");
-            RemoveInternalTimer($hash, "Gartenbewaesserung_EndCircuitPause");
+            RemoveInternalTimer($hash, "Gartenbewaesserung_EndCircuitPauseTimer");
             delete $hash->{HELPER}{pauseEndTimer};
         }
         
@@ -2634,7 +2657,7 @@ sub Gartenbewaesserung_GetStatus {
 <h3>Gartenbewaesserung</h3>
 <ul>
     <p>FHEM Modul für intelligente Gartenbewässerung mit bis zu 8 Ventilen, Regenwasserfass und IBC-Container.</p>
-    <p><b>Version: 1.0.14</b></p>
+    <p><b>Version: 1.0.15</b></p>
     
     <h4>Features</h4>
     <ul>
