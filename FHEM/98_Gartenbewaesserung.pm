@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.15 - 2026-05-03
+#     Version 1.0.16 - 2026-05-04
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,9 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.16 - 2026-05-04  Neu: barrelEmptySensorDevice – Fass-leer-Sensor schaltet Pumpe sofort ab
+#                      Neu: Bewässerung/Kreis wird gestoppt wenn Fass leer gemeldet wird
+#                      Neu: Pumpe kann wieder starten sobald Fass-leer-Sensor inaktiv wird
 # 1.0.15 - 2026-05-03  Fix: Ghost-Timer nach vorzeitigem Pause-Ende (phase: resuming hängt nicht mehr)
 #                      Fix: remainingTime bleibt während Pause sichtbar (zeigt verbleibende Ventilzeit)
 # 1.0.14 - 2026-05-02  Fix: manualCircuit-Flag verhindert Regen-/Schedule-Unterbrechung bei startCircuit
@@ -70,6 +73,7 @@ sub Gartenbewaesserung_Initialize {
         "ibcToBarrelValveDevice:textField " .
         "ibcFullSensorDevice:textField " .
         "ibcEmptySensorDevice:textField " .
+        "barrelEmptySensorDevice:textField " .
         "rainSensorDevice:textField " .
         "moistureSensorDevice:textField " .
         "valve1Duration:slider,1,1,120 valve2Duration:slider,1,1,120 " .
@@ -94,6 +98,7 @@ sub Gartenbewaesserung_Initialize {
         "barrelFullSensorActiveValue:textField barrelFullSensorInactiveValue:textField " .
         "ibcFullSensorActiveValue:textField ibcFullSensorInactiveValue:textField " .
         "ibcEmptySensorActiveValue:textField ibcEmptySensorInactiveValue:textField " .
+        "barrelEmptySensorActiveValue:textField barrelEmptySensorInactiveValue:textField " .
         "moistureSensorReading:textField moistureSensorInvert:0,1 " .
         "disable:0,1 " .
         $readingFnAttributes;
@@ -106,7 +111,7 @@ sub Gartenbewaesserung_Define {
     
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.15';
+    $hash->{VERSION}    = '1.0.16';
     
     my $name = $a[0];
     
@@ -122,6 +127,7 @@ sub Gartenbewaesserung_Define {
     readingsBulkUpdate($hash, "remainingTime", "-");
     readingsBulkUpdate($hash, "pauseActive", "no");
     readingsBulkUpdate($hash, "pauseTimeRemaining", "-");
+    readingsBulkUpdate($hash, "barrelEmpty", "no");
     readingsEndUpdate($hash, 1);
     
     # Set default attributes
@@ -328,6 +334,25 @@ sub Gartenbewaesserung_Notify {
             }
         }
         
+        # Barrel empty sensor
+        my $barrelEmptySensorDef = AttrVal($name, "barrelEmptySensorDevice", "");
+        if($barrelEmptySensorDef ne "") {
+            my ($barrelEmptyDev, $barrelEmptyReading) = Gartenbewaesserung_ParseDevice($barrelEmptySensorDef);
+            if($devName eq $barrelEmptyDev) {
+                my $activeValue = AttrVal($name, "barrelEmptySensorActiveValue", "");
+                if(Gartenbewaesserung_CheckSensorActive($name, $event, $barrelEmptyReading, $activeValue)) {
+                    readingsSingleUpdate($hash, "barrelEmpty", "yes", 1);
+                    Log3 $name, 3, "$name: Barrel empty detected, stopping pump and watering";
+                    Gartenbewaesserung_HandleBarrelEmpty($hash);
+                }
+                elsif(Gartenbewaesserung_CheckSensorInactive($name, $event, $barrelEmptyReading,
+                      AttrVal($name, "barrelEmptySensorInactiveValue", ""))) {
+                    readingsSingleUpdate($hash, "barrelEmpty", "no", 1);
+                    Log3 $name, 3, "$name: Barrel no longer empty, pump can be used again";
+                }
+            }
+        }
+        
         # Rain sensor - event-triggered response
         my $rainSensorDef = AttrVal($name, "rainSensorDevice", "");
         if($rainSensorDef ne "") {
@@ -525,6 +550,19 @@ sub Gartenbewaesserung_UpdateSensorReadings {
     }
     else {
         readingsBulkUpdate($hash, "ibcEmpty", "not configured");
+    }
+    
+    # Barrel empty sensor
+    my $barrelEmptySensorDef = AttrVal($name, "barrelEmptySensorDevice", "");
+    if($barrelEmptySensorDef ne "") {
+        my $activeValue = AttrVal($name, "barrelEmptySensorActiveValue", "");
+        my $inactiveValue = AttrVal($name, "barrelEmptySensorInactiveValue", "");
+        my $value = Gartenbewaesserung_GetSensorValue($name, $barrelEmptySensorDef, $activeValue, $inactiveValue);
+        readingsBulkUpdate($hash, "barrelEmpty", $value ? "yes" : "no");
+        Log3 $name, 4, "$name: Barrel empty sensor: " . ($value ? "yes" : "no");
+    }
+    else {
+        readingsBulkUpdate($hash, "barrelEmpty", "not configured");
     }
     
     # Rain sensor
@@ -754,6 +792,23 @@ sub Gartenbewaesserung_ValidateConfig {
         }
     }
     
+    # Check barrel empty sensor
+    my $barrelEmptySensor = AttrVal($name, "barrelEmptySensorDevice", "");
+    if($barrelEmptySensor eq "") {
+        push @info, "No barrel empty sensor configured (optional, barrelEmptySensorDevice)";
+    }
+    else {
+        my ($device, $reading) = Gartenbewaesserung_ParseDevice($barrelEmptySensor);
+        if(!defined($defs{$device})) {
+            push @errors, "Barrel empty sensor device '$device' does not exist";
+        }
+        else {
+            $reading = "state" if($reading eq "");
+            my $value = ReadingsVal($device, $reading, "unknown");
+            push @info, "Barrel empty sensor: $barrelEmptySensor (current: $value) OK";
+        }
+    }
+    
     # Check rain sensor
     my $rainSensor = AttrVal($name, "rainSensorDevice", "");
     if($rainSensor eq "") {
@@ -904,10 +959,12 @@ sub Gartenbewaesserung_GetConfig {
     $config .= "\nFASS:\n";
     my $barrelValve = AttrVal($name, "barrelFillValveDevice", "not configured");
     my $barrelSensor = AttrVal($name, "barrelFullSensorDevice", "not configured");
+    my $barrelEmptySensor = AttrVal($name, "barrelEmptySensorDevice", "not configured");
     my $barrelDur = AttrVal($name, "barrelFillDuration", 10);
     my $barrelThreshold = AttrVal($name, "barrelFillThreshold", 30);
     $config .= "  Fill valve (water supply): $barrelValve\n";
     $config .= "  Full sensor: $barrelSensor\n";
+    $config .= "  Empty sensor: $barrelEmptySensor\n";
     $config .= "  Fill duration: $barrelDur min\n";
     $config .= "  Fill threshold: $barrelThreshold%\n";
     
@@ -1246,6 +1303,13 @@ sub Gartenbewaesserung_RunCircuit {
     # Make sure IBC valve is closed
     Gartenbewaesserung_StopIBCFill($hash);
     
+    # Check if barrel is empty - do not run pump
+    if(ReadingsVal($name, "barrelEmpty", "no") eq "yes") {
+        Log3 $name, 3, "$name: Cannot start circuit $circuitNum - barrel is empty";
+        readingsSingleUpdate($hash, "state", "stopped - barrel empty", 1);
+        return;
+    }
+    
     # Check if pause is needed DURING this circuit run
     my $pauseInterval = AttrVal($name, "wateringPauseInterval", 8);
     if($pauseInterval > 0) {
@@ -1529,6 +1593,12 @@ sub Gartenbewaesserung_StartWatering {
     my $name = $hash->{NAME};
     
     return "Watering disabled" if(IsDisabled($name));
+    
+    # Check if barrel is empty
+    if(ReadingsVal($name, "barrelEmpty", "no") eq "yes") {
+        Log3 $name, 3, "$name: Watering skipped - barrel is empty";
+        return "Barrel is empty - watering cannot be started";
+    }
     
     # Check moisture if sensor configured
     my $moistureSensorDef = AttrVal($name, "moistureSensorDevice", "");
@@ -1847,6 +1917,13 @@ sub Gartenbewaesserung_OpenValve {
     # Make sure IBC valve is closed during watering
     Gartenbewaesserung_StopIBCFill($hash);
     
+    # Check if barrel is empty - do not run pump
+    if(ReadingsVal($name, "barrelEmpty", "no") eq "yes") {
+        Log3 $name, 3, "$name: Cannot open valve $valveNum - barrel is empty";
+        readingsSingleUpdate($hash, "state", "stopped - barrel empty", 1);
+        return;
+    }
+    
     # Check if pause is needed DURING this valve
     my $pauseInterval = AttrVal($name, "wateringPauseInterval", 8);
     if($pauseInterval > 0) {
@@ -2091,6 +2168,28 @@ sub Gartenbewaesserung_CheckBarrelFull {
 }
 
 ##############################################################################
+# Handle barrel empty: stop pump and all active watering immediately
+##############################################################################
+sub Gartenbewaesserung_HandleBarrelEmpty {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+    
+    # Stop pump immediately
+    my $pumpDevice = AttrVal($name, "pumpDevice", "");
+    if($pumpDevice ne "") {
+        Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "off");
+        Log3 $name, 3, "$name: Pump switched off (barrel empty)";
+    }
+    
+    # If watering or circuit mode is active, stop all operations
+    if($hash->{HELPER}{watering} || $hash->{HELPER}{circuitMode}) {
+        Log3 $name, 3, "$name: Stopping watering/circuit because barrel is empty";
+        Gartenbewaesserung_StopAll($hash);
+        readingsSingleUpdate($hash, "state", "stopped - barrel empty", 1);
+    }
+}
+
+##############################################################################
 # Finish watering cycle
 ##############################################################################
 sub Gartenbewaesserung_FinishWatering {
@@ -2226,6 +2325,11 @@ sub Gartenbewaesserung_StartSingleValve {
     # Make sure IBC fill is stopped
     Gartenbewaesserung_StopIBCFill($hash);
     Gartenbewaesserung_StopIBCtoBarrel($hash);
+    
+    # Check if barrel is empty - do not run pump
+    if(ReadingsVal($name, "barrelEmpty", "no") eq "yes") {
+        return "Barrel is empty - pump cannot be started";
+    }
     
     # Start pump
     my $pumpDevice = AttrVal($name, "pumpDevice", "");
@@ -2633,6 +2737,7 @@ sub Gartenbewaesserung_GetStatus {
     $status .= "IBC Filling: " . ReadingsVal($name, "ibcFilling", "no") . "\n";
     $status .= "IBC to Barrel: " . ReadingsVal($name, "ibcToBarrelActive", "no") . "\n";
     $status .= "Barrel Full: " . ReadingsVal($name, "barrelFull", "not configured") . "\n";
+    $status .= "Barrel Empty: " . ReadingsVal($name, "barrelEmpty", "not configured") . "\n";
     $status .= "IBC Full: " . ReadingsVal($name, "ibcFull", "not configured") . "\n";
     $status .= "IBC Empty: " . ReadingsVal($name, "ibcEmpty", "not configured") . "\n";
     $status .= "Raining: " . ReadingsVal($name, "raining", "not configured") . "\n";
@@ -2657,13 +2762,14 @@ sub Gartenbewaesserung_GetStatus {
 <h3>Gartenbewaesserung</h3>
 <ul>
     <p>FHEM Modul für intelligente Gartenbewässerung mit bis zu 8 Ventilen, Regenwasserfass und IBC-Container.</p>
-    <p><b>Version: 1.0.15</b></p>
+    <p><b>Version: 1.0.16</b></p>
     
     <h4>Features</h4>
     <ul>
         <li>Bis zu 8 Magnetventile für verschiedene Bewässerungsbereiche</li>
         <li>Unterstützt MQTT2 Relay Boards (z.B. Tasmota mit 8-Kanal Relay Board)</li>
         <li>Automatische Füll-Pausen während der Bewässerung (IBC → Fass oder Hauswasseranschluss)</li>
+        <li><b>NEU in 1.0.16:</b> Fass-leer-Sensor (<code>barrelEmptySensorDevice</code>): Pumpe wird sofort abgeschaltet wenn das Fass leer ist; Bewässerung startet wieder sobald der Sensor inaktiv wird</li>
         <li><b>NEU in 1.0.14:</b> Ereignisgesteuerter IBC-Befüllungs-Trigger: Fass-voll-Sensor löst IBC-Fill bei Regen sofort aus</li>
         <li><b>NEU in 1.0.14:</b> NotifyFn überwacht den Regensensor für sofortige Reaktion (kein Polling-Delay)</li>
         <li><b>NEU in 1.0.14:</b> Manueller startCircuit wird nicht mehr durch Regen oder Scheduler unterbrochen</li>
@@ -2683,6 +2789,7 @@ sub Gartenbewaesserung_GetStatus {
 
     <h4>Versionshistorie</h4>
     <ul>
+        <li><b>1.0.16</b> (2026-05-04): Fass-leer-Sensor (barrelEmptySensorDevice): Pumpe aus wenn Fass leer, Pumpe frei wenn Fass wieder voll</li>
         <li><b>1.0.14</b> (2026-05-02): Ereignisgesteuerter IBC-Befüllungs-Trigger, Regensensor in NotifyFn, manualCircuit-Flag, IBC→Fass korrekt bei vollem Fass</li>
         <li><b>1.0.13</b> (2026-04-29): Automatische Pausen auch bei startCircuit (Einzelkreislauf)</li>
         <li><b>1.0.12</b> (2026-04-29): Endlosschleifen-Bug gefixt, negatives Delay, IBC→Fass in Pausen, IBC-Leer-Sensor, Fass-voll stoppt Pause</li>
@@ -2779,6 +2886,16 @@ sub Gartenbewaesserung_GetStatus {
             FHEM-Gerätename des IBC-leer-Sensors. Steuert die Quellenauswahl während Pausen:
             Wenn IBC leer → Hauswasseranschluss (<code>barrelFillValveDevice</code>),
             sonst → IBC→Fass (<code>ibcToBarrelValveDevice</code>).
+        </li>
+        <li><a id="Gartenbewaesserung-attr-barrelEmptySensorDevice"></a>
+            <b>barrelEmptySensorDevice</b><br>
+            Typ: textField. Standardwert: keiner.<br>
+            FHEM-Gerätename des Fass-leer-Sensors. Wenn der Sensor „leer" meldet, wird die Pumpe
+            sofort abgeschaltet und jede aktive Bewässerung gestoppt (Reading <code>barrelEmpty: yes</code>).
+            Sobald der Sensor wieder inaktiv ist (Fass nicht mehr leer), wird das Reading auf
+            <code>barrelEmpty: no</code> gesetzt und die Bewässerung kann erneut gestartet werden.<br>
+            Optionale Sensor-Wert-Attribute: <code>barrelEmptySensorActiveValue</code>,
+            <code>barrelEmptySensorInactiveValue</code>.
         </li>
         <li><a id="Gartenbewaesserung-attr-rainSensorDevice"></a>
             <b>rainSensorDevice</b><br>
