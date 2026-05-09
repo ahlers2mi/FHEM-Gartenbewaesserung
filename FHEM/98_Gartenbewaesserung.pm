@@ -349,6 +349,10 @@ sub Gartenbewaesserung_Notify {
                       AttrVal($name, "barrelEmptySensorInactiveValue", ""))) {
                     readingsSingleUpdate($hash, "barrelEmpty", "no", 1);
                     Log3 $name, 3, "$name: Barrel no longer empty, pump can be used again";
+                    if($hash->{HELPER}{barrelEmptyRefilling}) {
+                        Log3 $name, 3, "$name: Stopping barrel empty refill (barrel no longer empty)";
+                        Gartenbewaesserung_StopBarrelEmptyRefill($hash);
+                    }
                 }
             }
         }
@@ -2111,14 +2115,24 @@ sub Gartenbewaesserung_CheckBarrelFull {
     # If IBC→Barrel transfer is active, stop the transfer and do NOT pump back
     if($hash->{HELPER}{ibcToBarrelActive}) {
         Log3 $name, 3, "$name: Barrel full during IBC-to-barrel transfer, stopping transfer";
-        Gartenbewaesserung_StopIBCtoBarrel($hash);
+        if($hash->{HELPER}{barrelEmptyRefilling}) {
+            Gartenbewaesserung_StopBarrelEmptyRefill($hash);
+        }
+        else {
+            Gartenbewaesserung_StopIBCtoBarrel($hash);
+        }
         return;
     }
     
     # If filling barrel directly
     if($hash->{HELPER}{barrelFilling}) {
         Log3 $name, 3, "$name: Stopping barrel fill (sensor triggered)";
-        Gartenbewaesserung_StopBarrelFill($hash);
+        if($hash->{HELPER}{barrelEmptyRefilling}) {
+            Gartenbewaesserung_StopBarrelEmptyRefill($hash);
+        }
+        else {
+            Gartenbewaesserung_StopBarrelFill($hash);
+        }
     }
     
     # If pause is active (during watering cycle OR circuit mode)
@@ -2187,6 +2201,122 @@ sub Gartenbewaesserung_HandleBarrelEmpty {
         Gartenbewaesserung_StopAll($hash);
         readingsSingleUpdate($hash, "state", "stopped - barrel empty", 1);
     }
+    
+    # Start automatic refilling of the barrel
+    Log3 $name, 3, "$name: Barrel empty - starting automatic refill";
+    my $ibcEmpty = ReadingsVal($name, "ibcEmpty", "no");
+    
+    if($ibcEmpty eq "yes") {
+        # IBC is empty, use water supply (barrelFillValveDevice)
+        my $fillValve = AttrVal($name, "barrelFillValveDevice", "");
+        if($fillValve ne "") {
+            Log3 $name, 3, "$name: IBC empty, using water supply to refill barrel";
+            Gartenbewaesserung_SwitchDevice($name, $fillValve, "on");
+            $hash->{HELPER}{barrelEmptyRefilling} = 1;
+            $hash->{HELPER}{barrelEmptyRefillSource} = "water_supply";
+            $hash->{HELPER}{barrelFilling} = 1;
+            
+            my $duration = AttrVal($name, "barrelFillDuration", 10);
+            InternalTimer(gettimeofday() + ($duration * 60), sub {
+                Gartenbewaesserung_StopBarrelEmptyRefill($hash);
+            }, $hash);
+            
+            readingsSingleUpdate($hash, "state", "stopped - barrel empty - refilling", 1);
+            Log3 $name, 4, "$name: Opened water supply valve for barrel empty refill ($duration min)";
+        }
+        else {
+            Log3 $name, 3, "$name: No fill valve configured (barrelFillValveDevice), cannot refill barrel";
+        }
+    }
+    else {
+        # IBC has water, fill from IBC (ibcToBarrelValveDevice)
+        my $ibcToBarrelValve = AttrVal($name, "ibcToBarrelValveDevice", "");
+        if($ibcToBarrelValve ne "") {
+            Log3 $name, 3, "$name: IBC has water, refilling barrel from IBC";
+            my $ibcToBarrelPump = AttrVal($name, "ibcToBarrelPumpDevice", "");
+            
+            $hash->{HELPER}{barrelEmptyRefilling} = 1;
+            $hash->{HELPER}{barrelEmptyRefillSource} = "ibc";
+            $hash->{HELPER}{ibcToBarrelActive} = 1;
+            
+            if($ibcToBarrelPump ne "") {
+                Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "on");
+                Log3 $name, 4, "$name: Started IBC to barrel pump (barrel empty refill)";
+                
+                my $delay = AttrVal($name, "pumpStartDelay", 3);
+                $delay = abs($delay);
+                
+                InternalTimer(gettimeofday() + $delay, sub {
+                    Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on");
+                    Log3 $name, 4, "$name: Opened IBC to barrel valve (barrel empty refill)";
+                }, $hash);
+            }
+            else {
+                Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on");
+                Log3 $name, 4, "$name: Opened IBC to barrel valve (barrel empty refill, gravity)";
+            }
+            
+            my $duration = AttrVal($name, "ibcToBarrelDuration", 15);
+            InternalTimer(gettimeofday() + ($duration * 60), sub {
+                Gartenbewaesserung_StopBarrelEmptyRefill($hash);
+            }, $hash);
+            
+            readingsSingleUpdate($hash, "state", "stopped - barrel empty - refilling", 1);
+            Log3 $name, 4, "$name: IBC to barrel transfer started for barrel empty refill ($duration min)";
+        }
+        else {
+            Log3 $name, 3, "$name: No IBC to barrel valve configured (ibcToBarrelValveDevice), cannot refill barrel";
+        }
+    }
+}
+
+##############################################################################
+# Stop barrel empty refill (called by timer, barrel-full sensor, or barrel-empty-inactive sensor)
+##############################################################################
+sub Gartenbewaesserung_StopBarrelEmptyRefill {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+    
+    return if(!$hash->{HELPER}{barrelEmptyRefilling});
+    
+    Log3 $name, 3, "$name: Stopping barrel empty refill";
+    
+    my $source = $hash->{HELPER}{barrelEmptyRefillSource} || "";
+    
+    if($source eq "ibc") {
+        my $ibcToBarrelValve = AttrVal($name, "ibcToBarrelValveDevice", "");
+        if($ibcToBarrelValve ne "") {
+            Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "off");
+        }
+        my $ibcToBarrelPump = AttrVal($name, "ibcToBarrelPumpDevice", "");
+        if($ibcToBarrelPump ne "") {
+            Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "off");
+        }
+        $hash->{HELPER}{ibcToBarrelActive} = 0;
+    }
+    elsif($source eq "water_supply") {
+        my $fillValve = AttrVal($name, "barrelFillValveDevice", "");
+        if($fillValve ne "") {
+            Gartenbewaesserung_SwitchDevice($name, $fillValve, "off");
+        }
+        $hash->{HELPER}{barrelFilling} = 0;
+    }
+    
+    delete $hash->{HELPER}{barrelEmptyRefilling};
+    delete $hash->{HELPER}{barrelEmptyRefillSource};
+    
+    Gartenbewaesserung_ClearEndTime($hash);
+    
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, "state", "idle");
+    readingsBulkUpdate($hash, "phase", "idle");
+    readingsBulkUpdate($hash, "barrelLevel", 100);
+    if($source eq "ibc") {
+        readingsBulkUpdate($hash, "ibcToBarrelActive", "no");
+    }
+    readingsEndUpdate($hash, 1);
+    
+    Log3 $name, 3, "$name: Barrel empty refill stopped, state set to idle";
 }
 
 ##############################################################################
@@ -2892,8 +3022,15 @@ sub Gartenbewaesserung_GetStatus {
             Typ: textField. Standardwert: keiner.<br>
             FHEM-Gerätename des Fass-leer-Sensors. Wenn der Sensor „leer" meldet, wird die Pumpe
             sofort abgeschaltet und jede aktive Bewässerung gestoppt (Reading <code>barrelEmpty: yes</code>).
-            Sobald der Sensor wieder inaktiv ist (Fass nicht mehr leer), wird das Reading auf
-            <code>barrelEmpty: no</code> gesetzt und die Bewässerung kann erneut gestartet werden.<br>
+            Anschließend wird automatisch eine Befüllung des Fasses gestartet: Wenn <code>ibcEmpty: no</code>,
+            wird Wasser über <code>ibcToBarrelValveDevice</code> (ggf. mit <code>ibcToBarrelPumpDevice</code>)
+            aus dem IBC-Container ins Fass geleitet; wenn <code>ibcEmpty: yes</code>, wird der
+            Hauswasseranschluss (<code>barrelFillValveDevice</code>) geöffnet.
+            Die Befüllung stoppt automatisch nach der konfigurierten Dauer, wenn der
+            <code>barrelFullSensorDevice</code> anschlägt oder wenn der Fass-leer-Sensor wieder
+            inaktiv ist. Der State wird dabei auf <code>stopped - barrel empty - refilling</code> gesetzt.
+            Sobald die Befüllung abgeschlossen ist, wird der State auf <code>idle</code> zurückgesetzt
+            und die Bewässerung kann erneut gestartet werden.<br>
             Optionale Sensor-Wert-Attribute: <code>barrelEmptySensorActiveValue</code>,
             <code>barrelEmptySensorInactiveValue</code>.
         </li>
