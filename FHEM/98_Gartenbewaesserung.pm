@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.17 - 2026-05-10
+#     Version 1.0.18 - 2026-05-10
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,8 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.18 - 2026-05-10  Fix: Bewässerung/Kreis setzt nach barrelEmpty-Refill automatisch fort
+#                      Neu: Restlaufzeit und Ventil/Kreis-Kontext werden bei barrelEmpty-Stopp gespeichert
 # 1.0.17 - 2026-05-10  Fix: Verzögerter Pumpen-/Ventilstart wird abgebrochen wenn Kreis bereits beendet ist
 #                      Fix: Bei sehr kurzer Restlaufzeit (<= abs(pumpStartDelay)) wird Delay ignoriert
 # 1.0.16 - 2026-05-04  Neu: barrelEmptySensorDevice – Fass-leer-Sensor schaltet Pumpe sofort ab
@@ -113,7 +115,7 @@ sub Gartenbewaesserung_Define {
     
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.17';
+    $hash->{VERSION}    = '1.0.18';
     
     my $name = $a[0];
     
@@ -354,6 +356,10 @@ sub Gartenbewaesserung_Notify {
                     if($hash->{HELPER}{barrelEmptyRefilling}) {
                         Log3 $name, 3, "$name: Stopping barrel empty refill (barrel no longer empty)";
                         Gartenbewaesserung_StopBarrelEmptyRefill($hash);
+                    }
+                    elsif($hash->{HELPER}{barrelEmptyResumePending}) {
+                        Log3 $name, 3, "$name: Barrel refilled, trying to resume interrupted operation";
+                        Gartenbewaesserung_ResumeAfterBarrelEmpty($hash);
                     }
                 }
             }
@@ -2210,9 +2216,266 @@ sub Gartenbewaesserung_CheckBarrelFull {
 ##############################################################################
 # Handle barrel empty: stop pump and all active watering immediately
 ##############################################################################
+sub Gartenbewaesserung_SaveBarrelEmptyResumeContext {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+    
+    my $mode = "";
+    if($hash->{HELPER}{watering}) {
+        $mode = "watering";
+    }
+    elsif($hash->{HELPER}{circuitMode}) {
+        $mode = "circuit";
+    }
+    
+    return 0 if($mode eq "");
+    
+    my $remainingMinutes;
+    if(defined($hash->{HELPER}{valveRemainingTime}) && $hash->{HELPER}{valveRemainingTime} > 0) {
+        $remainingMinutes = $hash->{HELPER}{valveRemainingTime};
+    }
+    elsif(defined($hash->{HELPER}{endTime})) {
+        my $remainingSeconds = $hash->{HELPER}{endTime} - time();
+        if($remainingSeconds > 0) {
+            $remainingMinutes = $remainingSeconds / 60;
+        }
+    }
+    
+    my %context = (
+        mode      => $mode,
+        createdAt => time()
+    );
+    
+    if(defined($remainingMinutes) && $remainingMinutes > 0) {
+        $context{remainingMinutes} = $remainingMinutes;
+    }
+    
+    if($mode eq "watering") {
+        my $queueRef = $hash->{HELPER}{wateringQueue};
+        my @queue = (defined($queueRef) && ref($queueRef) eq "ARRAY") ? @$queueRef : ();
+        my $index = defined($hash->{HELPER}{wateringIndex}) ? $hash->{HELPER}{wateringIndex} : 0;
+        
+        if($index < 0) {
+            $index = 0;
+        }
+        
+        my $resumeValve = ReadingsVal($name, "currentValve", "none");
+        if($resumeValve !~ /^\d+$/) {
+            my $pausedValve = $hash->{HELPER}{pausedValve} || "";
+            $resumeValve = $pausedValve if($pausedValve =~ /^\d+$/);
+        }
+        if($resumeValve !~ /^\d+$/ && $index < scalar(@queue)) {
+            my $queuedValve = $queue[$index];
+            $resumeValve = $queuedValve if(defined($queuedValve) && $queuedValve =~ /^\d+$/);
+        }
+        
+        $context{queue} = \@queue;
+        $context{index} = $index;
+        $context{totalValves} = defined($hash->{HELPER}{totalValves}) ? $hash->{HELPER}{totalValves} : scalar(@queue);
+        $context{wateringStartTime} = $hash->{HELPER}{wateringStartTime} if(defined($hash->{HELPER}{wateringStartTime}));
+        $context{lastPauseEnd} = $hash->{HELPER}{lastPauseEnd} if(defined($hash->{HELPER}{lastPauseEnd}));
+        $context{resumeValve} = $resumeValve if($resumeValve =~ /^\d+$/);
+    }
+    else {
+        my $circuitNum = $hash->{HELPER}{circuitNumber};
+        $circuitNum = $hash->{HELPER}{pausedCircuit} if(!defined($circuitNum));
+        
+        if(!defined($circuitNum) || $circuitNum !~ /^\d+$/) {
+            Log3 $name, 2, "$name: Cannot store barrel-empty resume context for circuit mode (missing circuit number)";
+            return 0;
+        }
+        
+        $context{circuitNumber} = $circuitNum;
+        $context{manualCircuit} = $hash->{HELPER}{manualCircuit} ? 1 : 0;
+        $context{circuitStartTime} = $hash->{HELPER}{circuitStartTime} if(defined($hash->{HELPER}{circuitStartTime}));
+        $context{lastPauseEnd} = $hash->{HELPER}{lastPauseEnd} if(defined($hash->{HELPER}{lastPauseEnd}));
+    }
+    
+    $hash->{HELPER}{barrelEmptyResumePending} = 1;
+    $hash->{HELPER}{barrelEmptyResumeContext} = \%context;
+    
+    Log3 $name, 3, "$name: Stored barrel-empty resume context ($mode)";
+    return 1;
+}
+
+##############################################################################
+sub Gartenbewaesserung_ClearBarrelEmptyResumeContext {
+    my ($hash) = @_;
+    
+    delete $hash->{HELPER}{barrelEmptyResumePending};
+    delete $hash->{HELPER}{barrelEmptyResumeContext};
+}
+
+##############################################################################
+sub Gartenbewaesserung_ResumeAfterBarrelEmpty {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+    
+    return "none" if(!$hash->{HELPER}{barrelEmptyResumePending});
+    
+    my $context = $hash->{HELPER}{barrelEmptyResumeContext};
+    if(!defined($context) || ref($context) ne "HASH") {
+        Gartenbewaesserung_ClearBarrelEmptyResumeContext($hash);
+        return "none";
+    }
+    
+    if(ReadingsVal($name, "barrelEmpty", "no") eq "yes") {
+        Log3 $name, 3, "$name: Resume blocked: barrelEmpty is still active";
+        return "blocked";
+    }
+    
+    my $mode = $context->{mode} || "";
+    my $remainingMinutes = $context->{remainingMinutes};
+    
+    if($mode eq "watering") {
+        my $queueRef = $context->{queue};
+        if(!defined($queueRef) || ref($queueRef) ne "ARRAY" || scalar(@$queueRef) == 0) {
+            Log3 $name, 2, "$name: Resume context for watering is incomplete, not resuming automatically";
+            Gartenbewaesserung_ClearBarrelEmptyResumeContext($hash);
+            return "none";
+        }
+        
+        my @queue = @$queueRef;
+        my $index = defined($context->{index}) ? $context->{index} : 0;
+        $index = 0 if($index < 0);
+        $index = scalar(@queue) if($index > scalar(@queue));
+        
+        $hash->{HELPER}{watering} = 1;
+        $hash->{HELPER}{circuitMode} = 0;
+        $hash->{HELPER}{wateringQueue} = \@queue;
+        $hash->{HELPER}{wateringIndex} = $index;
+        $hash->{HELPER}{totalValves} = defined($context->{totalValves}) ? $context->{totalValves} : scalar(@queue);
+        $hash->{HELPER}{wateringStartTime} = defined($context->{wateringStartTime}) ? $context->{wateringStartTime} : time();
+        
+        if(defined($context->{lastPauseEnd})) {
+            $hash->{HELPER}{lastPauseEnd} = $context->{lastPauseEnd};
+        }
+        else {
+            delete $hash->{HELPER}{lastPauseEnd};
+        }
+        
+        delete $hash->{HELPER}{manualCircuit};
+        delete $hash->{HELPER}{circuitNumber};
+        delete $hash->{HELPER}{circuitStartTime};
+        delete $hash->{HELPER}{pausedValve};
+        delete $hash->{HELPER}{pausedCircuit};
+        delete $hash->{HELPER}{pauseSource};
+        delete $hash->{HELPER}{pauseStartTime};
+        delete $hash->{HELPER}{pauseEndTimer};
+        delete $hash->{HELPER}{valveCloseTimer};
+        $hash->{HELPER}{pauseActive} = 0;
+        
+        if(defined($remainingMinutes) && $remainingMinutes > 0) {
+            $hash->{HELPER}{valveRemainingTime} = $remainingMinutes;
+        }
+        else {
+            delete $hash->{HELPER}{valveRemainingTime};
+        }
+        
+        Gartenbewaesserung_ClearPauseTime($hash);
+        
+        readingsBeginUpdate($hash);
+        readingsBulkUpdate($hash, "state", "watering");
+        readingsBulkUpdate($hash, "phase", "resuming after barrel refill");
+        readingsBulkUpdate($hash, "pauseActive", "no");
+        readingsBulkUpdate($hash, "currentValve", "none");
+        readingsEndUpdate($hash, 1);
+        
+        my $resumeValve = $context->{resumeValve};
+        Gartenbewaesserung_ClearBarrelEmptyResumeContext($hash);
+        
+        if(defined($remainingMinutes) && $remainingMinutes > 0 && defined($resumeValve) && $resumeValve =~ /^\d+$/) {
+            Log3 $name, 3, "$name: Resuming valve $resumeValve after barrel refill";
+            InternalTimer(gettimeofday() + 2, sub {
+                return if(!$hash->{HELPER}{watering});
+                Gartenbewaesserung_OpenValve($hash, $resumeValve);
+            }, $hash);
+        }
+        else {
+            Log3 $name, 3, "$name: Continuing watering queue after barrel refill";
+            InternalTimer(gettimeofday() + 2, sub {
+                return if(!$hash->{HELPER}{watering});
+                Gartenbewaesserung_NextValve($hash);
+            }, $hash);
+        }
+        
+        return "resumed";
+    }
+    elsif($mode eq "circuit") {
+        my $circuitNum = $context->{circuitNumber};
+        if(!defined($circuitNum) || $circuitNum !~ /^\d+$/) {
+            Log3 $name, 2, "$name: Resume context for circuit mode is incomplete, not resuming automatically";
+            Gartenbewaesserung_ClearBarrelEmptyResumeContext($hash);
+            return "none";
+        }
+        
+        $hash->{HELPER}{watering} = 0;
+        $hash->{HELPER}{circuitMode} = 1;
+        $hash->{HELPER}{circuitNumber} = $circuitNum;
+        $hash->{HELPER}{manualCircuit} = $context->{manualCircuit} ? 1 : 0;
+        $hash->{HELPER}{circuitStartTime} = defined($context->{circuitStartTime}) ? $context->{circuitStartTime} : time();
+        
+        if(defined($context->{lastPauseEnd})) {
+            $hash->{HELPER}{lastPauseEnd} = $context->{lastPauseEnd};
+        }
+        else {
+            delete $hash->{HELPER}{lastPauseEnd};
+        }
+        
+        delete $hash->{HELPER}{wateringQueue};
+        delete $hash->{HELPER}{wateringIndex};
+        delete $hash->{HELPER}{totalValves};
+        delete $hash->{HELPER}{pausedValve};
+        delete $hash->{HELPER}{pausedCircuit};
+        delete $hash->{HELPER}{pauseSource};
+        delete $hash->{HELPER}{pauseStartTime};
+        delete $hash->{HELPER}{pauseEndTimer};
+        delete $hash->{HELPER}{valveCloseTimer};
+        $hash->{HELPER}{pauseActive} = 0;
+        
+        if(defined($remainingMinutes) && $remainingMinutes > 0) {
+            $hash->{HELPER}{valveRemainingTime} = $remainingMinutes;
+        }
+        else {
+            delete $hash->{HELPER}{valveRemainingTime};
+        }
+        
+        Gartenbewaesserung_ClearPauseTime($hash);
+        
+        readingsBeginUpdate($hash);
+        readingsBulkUpdate($hash, "state", "circuit mode");
+        readingsBulkUpdate($hash, "phase", "resuming circuit $circuitNum after barrel refill");
+        readingsBulkUpdate($hash, "pauseActive", "no");
+        readingsBulkUpdate($hash, "cycleProgress", "1/1");
+        readingsBulkUpdate($hash, "currentValve", "none");
+        readingsEndUpdate($hash, 1);
+        
+        Gartenbewaesserung_ClearBarrelEmptyResumeContext($hash);
+        
+        Log3 $name, 3, "$name: Resuming circuit $circuitNum after barrel refill";
+        InternalTimer(gettimeofday() + 2, sub {
+            return if(!$hash->{HELPER}{circuitMode});
+            Gartenbewaesserung_RunCircuit($hash, $circuitNum);
+        }, $hash);
+        
+        return "resumed";
+    }
+    
+    Gartenbewaesserung_ClearBarrelEmptyResumeContext($hash);
+    return "none";
+}
+
+##############################################################################
+# Handle barrel empty: stop pump and all active watering immediately
+##############################################################################
 sub Gartenbewaesserung_HandleBarrelEmpty {
     my ($hash) = @_;
     my $name = $hash->{NAME};
+    
+    if($hash->{HELPER}{barrelEmptyRefilling}) {
+        Log3 $name, 4, "$name: Barrel empty refill is already active";
+        return;
+    }
     
     # Stop pump immediately
     my $pumpDevice = AttrVal($name, "pumpDevice", "");
@@ -2223,8 +2486,9 @@ sub Gartenbewaesserung_HandleBarrelEmpty {
     
     # If watering or circuit mode is active, stop all operations
     if($hash->{HELPER}{watering} || $hash->{HELPER}{circuitMode}) {
+        Gartenbewaesserung_SaveBarrelEmptyResumeContext($hash);
         Log3 $name, 3, "$name: Stopping watering/circuit because barrel is empty";
-        Gartenbewaesserung_StopAll($hash);
+        Gartenbewaesserung_StopAll($hash, { preserveBarrelEmptyResume => 1 });
         readingsSingleUpdate($hash, "state", "stopped - barrel empty", 1);
     }
     
@@ -2333,13 +2597,31 @@ sub Gartenbewaesserung_StopBarrelEmptyRefill {
     
     Gartenbewaesserung_ClearEndTime($hash);
     
+    my $resumeStatus = Gartenbewaesserung_ResumeAfterBarrelEmpty($hash);
+    
     readingsBeginUpdate($hash);
-    readingsBulkUpdate($hash, "state", "idle");
-    readingsBulkUpdate($hash, "phase", "idle");
     readingsBulkUpdate($hash, "barrelLevel", 100);
     if($source eq "ibc") {
         readingsBulkUpdate($hash, "ibcToBarrelActive", "no");
     }
+    
+    if($resumeStatus eq "resumed") {
+        readingsEndUpdate($hash, 1);
+        Log3 $name, 3, "$name: Barrel empty refill stopped, interrupted operation resumed";
+        return;
+    }
+    
+    if($resumeStatus eq "blocked") {
+        readingsBulkUpdate($hash, "state", "stopped - barrel empty");
+        readingsBulkUpdate($hash, "phase", "waiting for barrel refill");
+        readingsBulkUpdate($hash, "pauseActive", "no");
+        readingsEndUpdate($hash, 1);
+        Log3 $name, 3, "$name: Barrel empty refill stopped, resume is blocked while barrelEmpty stays active";
+        return;
+    }
+    
+    readingsBulkUpdate($hash, "state", "idle");
+    readingsBulkUpdate($hash, "phase", "idle");
     readingsEndUpdate($hash, 1);
     
     Log3 $name, 3, "$name: Barrel empty refill stopped, state set to idle";
@@ -2385,8 +2667,9 @@ sub Gartenbewaesserung_FinishWatering {
 # Stop everything
 ##############################################################################
 sub Gartenbewaesserung_StopAll {
-    my ($hash) = @_;
+    my ($hash, $opts) = @_;
     my $name = $hash->{NAME};
+    my $preserveBarrelEmptyResume = (defined($opts) && ref($opts) eq "HASH" && $opts->{preserveBarrelEmptyResume}) ? 1 : 0;
     
     RemoveInternalTimer($hash);
     
@@ -2432,6 +2715,8 @@ sub Gartenbewaesserung_StopAll {
     $hash->{HELPER}{pauseActive} = 0;
     $hash->{HELPER}{ibcFilling} = 0;
     $hash->{HELPER}{ibcToBarrelActive} = 0;
+    delete $hash->{HELPER}{barrelEmptyRefilling};
+    delete $hash->{HELPER}{barrelEmptyRefillSource};
     delete $hash->{HELPER}{manualCircuit};
     delete $hash->{HELPER}{wateringQueue};
     delete $hash->{HELPER}{wateringIndex};
@@ -2449,6 +2734,10 @@ sub Gartenbewaesserung_StopAll {
     
     Gartenbewaesserung_ClearEndTime($hash);
     Gartenbewaesserung_ClearPauseTime($hash);
+    
+    if(!$preserveBarrelEmptyResume) {
+        Gartenbewaesserung_ClearBarrelEmptyResumeContext($hash);
+    }
     
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "state", "stopped");
@@ -3057,8 +3346,10 @@ sub Gartenbewaesserung_GetStatus {
             Die Befüllung stoppt automatisch nach der konfigurierten Dauer, wenn der
             <code>barrelFullSensorDevice</code> anschlägt oder wenn der Fass-leer-Sensor wieder
             inaktiv ist. Der State wird dabei auf <code>stopped - barrel empty - refilling</code> gesetzt.
-            Sobald die Befüllung abgeschlossen ist, wird der State auf <code>idle</code> zurückgesetzt
-            und die Bewässerung kann erneut gestartet werden.<br>
+            Wenn eine laufende Bewässerung oder ein aktiver Einzelkreis durch den Fass-leer-Stop
+            unterbrochen wurde, versucht das Modul nach erfolgreichem Refill automatisch an der
+            unterbrochenen Stelle (inkl. Restlaufzeit) weiterzumachen. Falls das nicht sicher möglich ist,
+            wird dies im Log gemeldet und der State bleibt bei <code>stopped - barrel empty</code>.<br>
             Optionale Sensor-Wert-Attribute: <code>barrelEmptySensorActiveValue</code>,
             <code>barrelEmptySensorInactiveValue</code>.
         </li>

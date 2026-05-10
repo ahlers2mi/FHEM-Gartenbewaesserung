@@ -430,6 +430,7 @@ get Garten validate
 
 | Version | Datum | Änderungen |
 |---|---|---|
+| **1.0.18** | 2026-05-10 | Fix: Nach `barrelEmpty`-Stop wird unterbrochene Bewässerung/`startCircuit` nach erfolgreichem Refill automatisch fortgesetzt (inkl. Restlaufzeit und Position im Zyklus). |
 | **1.0.14** | 2026-05-02 | Fix: `manualCircuit`-Flag — `startCircuit` wird nicht mehr durch Regen-Logik oder Scheduler unterbrochen. Fix: `CheckBarrelFull` stoppt IBC→Fass-Transfer korrekt statt zurückzupumpen. Fix: `startIBCFill` blockiert Befüllung während aktivem IBC→Fass-Transfer. |
 | **1.0.13** | 2026-04-29 | Fix: Automatische Pausen auch bei `startCircuit` (Einzelkreislauf) |
 | **1.0.12** | 2026-04-29 | Fix: Endlosschleife nach Pause; negatives `pumpStartDelay`; IBC→Fass in Pausen; `ibcEmptySensorDevice`; Fass-voll stoppt Pause |
