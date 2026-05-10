@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.16 - 2026-05-04
+#     Version 1.0.17 - 2026-05-10
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,8 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.17 - 2026-05-10  Fix: Verzögerter Pumpen-/Ventilstart wird abgebrochen wenn Kreis bereits beendet ist
+#                      Fix: Bei sehr kurzer Restlaufzeit (<= abs(pumpStartDelay)) wird Delay ignoriert
 # 1.0.16 - 2026-05-04  Neu: barrelEmptySensorDevice – Fass-leer-Sensor schaltet Pumpe sofort ab
 #                      Neu: Bewässerung/Kreis wird gestoppt wenn Fass leer gemeldet wird
 #                      Neu: Pumpe kann wieder starten sobald Fass-leer-Sensor inaktiv wird
@@ -111,7 +113,7 @@ sub Gartenbewaesserung_Define {
     
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.16';
+    $hash->{VERSION}    = '1.0.17';
     
     my $name = $a[0];
     
@@ -1337,24 +1339,36 @@ sub Gartenbewaesserung_RunCircuit {
     # Get pump and delay
     my $pumpDevice = AttrVal($name, "pumpDevice", "");
     my $delay = AttrVal($name, "pumpStartDelay", 3);
+    my $effectiveDelay = $delay;
+    
+    if($delay != 0 && ($duration * 60) <= abs($delay)) {
+        $effectiveDelay = 0;
+        Log3 $name, 4, "$name: Circuit $circuitNum duration too short for pumpStartDelay ($delay s), using simultaneous start";
+    }
     
     if($pumpDevice ne "") {
-        if($delay < 0) {
+        if($effectiveDelay < 0) {
             # Negative delay: Open valve FIRST, then pump
             Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
             Log3 $name, 4, "$name: Circuit $circuitNum valve opened (negative delay)";
             
-            InternalTimer(gettimeofday() + abs($delay), sub {
+            InternalTimer(gettimeofday() + abs($effectiveDelay), sub {
+                return if(!$hash->{HELPER}{circuitMode});
+                my $currentValve = ReadingsVal($name, "currentValve", "none");
+                return if($currentValve eq "none" || $currentValve ne $circuitNum);
                 Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
                 Log3 $name, 4, "$name: Pump started after valve (negative delay)";
             }, $hash);
         }
-        elsif($delay > 0) {
+        elsif($effectiveDelay > 0) {
             # Positive delay: Start pump FIRST, wait, then valve
             Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
             Log3 $name, 4, "$name: Pump started for circuit $circuitNum";
             
-            InternalTimer(gettimeofday() + $delay, sub {
+            InternalTimer(gettimeofday() + $effectiveDelay, sub {
+                return if(!$hash->{HELPER}{circuitMode});
+                my $currentValve = ReadingsVal($name, "currentValve", "none");
+                return if($currentValve eq "none" || $currentValve ne $circuitNum);
                 Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
                 Log3 $name, 4, "$name: Circuit $circuitNum valve opened after pump delay";
             }, $hash);
@@ -1949,24 +1963,36 @@ sub Gartenbewaesserung_OpenValve {
     # Get pump and delay
     my $pumpDevice = AttrVal($name, "pumpDevice", "");
     my $delay = AttrVal($name, "pumpStartDelay", 3);
+    my $effectiveDelay = $delay;
+    
+    if($delay != 0 && ($duration * 60) <= abs($delay)) {
+        $effectiveDelay = 0;
+        Log3 $name, 4, "$name: Valve $valveNum duration too short for pumpStartDelay ($delay s), using simultaneous start";
+    }
     
     if($pumpDevice ne "") {
-        if($delay < 0) {
+        if($effectiveDelay < 0) {
             # Negative delay: Open valve FIRST, then pump
             Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
             Log3 $name, 4, "$name: Valve $valveNum opened (negative delay)";
             
-            InternalTimer(gettimeofday() + abs($delay), sub {
+            InternalTimer(gettimeofday() + abs($effectiveDelay), sub {
+                return if(!$hash->{HELPER}{watering} && !$hash->{HELPER}{circuitMode});
+                my $currentValve = ReadingsVal($name, "currentValve", "none");
+                return if($currentValve eq "none" || $currentValve ne $valveNum);
                 Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
                 Log3 $name, 4, "$name: Pump started after valve (negative delay)";
             }, $hash);
         }
-        elsif($delay > 0) {
+        elsif($effectiveDelay > 0) {
             # Positive delay: Start pump FIRST, wait, then valve
             Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
             Log3 $name, 4, "$name: Pump started";
             
-            InternalTimer(gettimeofday() + $delay, sub {
+            InternalTimer(gettimeofday() + $effectiveDelay, sub {
+                return if(!$hash->{HELPER}{watering} && !$hash->{HELPER}{circuitMode});
+                my $currentValve = ReadingsVal($name, "currentValve", "none");
+                return if($currentValve eq "none" || $currentValve ne $valveNum);
                 Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
                 Log3 $name, 4, "$name: Valve $valveNum opened after pump delay";
             }, $hash);
@@ -2892,13 +2918,14 @@ sub Gartenbewaesserung_GetStatus {
 <h3>Gartenbewaesserung</h3>
 <ul>
     <p>FHEM Modul für intelligente Gartenbewässerung mit bis zu 8 Ventilen, Regenwasserfass und IBC-Container.</p>
-    <p><b>Version: 1.0.16</b></p>
+    <p><b>Version: 1.0.17</b></p>
     
     <h4>Features</h4>
     <ul>
         <li>Bis zu 8 Magnetventile für verschiedene Bewässerungsbereiche</li>
         <li>Unterstützt MQTT2 Relay Boards (z.B. Tasmota mit 8-Kanal Relay Board)</li>
         <li>Automatische Füll-Pausen während der Bewässerung (IBC → Fass oder Hauswasseranschluss)</li>
+        <li><b>NEU in 1.0.17:</b> Verzögerter Pumpen-/Ventilstart wird nach Pause-Ende sicher abgebrochen, wenn kein aktiver Kreis mehr läuft</li>
         <li><b>NEU in 1.0.16:</b> Fass-leer-Sensor (<code>barrelEmptySensorDevice</code>): Pumpe wird sofort abgeschaltet wenn das Fass leer ist; Bewässerung startet wieder sobald der Sensor inaktiv wird</li>
         <li><b>NEU in 1.0.14:</b> Ereignisgesteuerter IBC-Befüllungs-Trigger: Fass-voll-Sensor löst IBC-Fill bei Regen sofort aus</li>
         <li><b>NEU in 1.0.14:</b> NotifyFn überwacht den Regensensor für sofortige Reaktion (kein Polling-Delay)</li>
@@ -2919,6 +2946,7 @@ sub Gartenbewaesserung_GetStatus {
 
     <h4>Versionshistorie</h4>
     <ul>
+        <li><b>1.0.17</b> (2026-05-10): Fix für kurze Restzeiten nach Pause: Delay-Start wird bei inaktivem Kreis verworfen, bei Laufzeit &lt;= abs(pumpStartDelay) wird ohne Delay gestartet</li>
         <li><b>1.0.16</b> (2026-05-04): Fass-leer-Sensor (barrelEmptySensorDevice): Pumpe aus wenn Fass leer, Pumpe frei wenn Fass wieder voll</li>
         <li><b>1.0.14</b> (2026-05-02): Ereignisgesteuerter IBC-Befüllungs-Trigger, Regensensor in NotifyFn, manualCircuit-Flag, IBC→Fass korrekt bei vollem Fass</li>
         <li><b>1.0.13</b> (2026-04-29): Automatische Pausen auch bei startCircuit (Einzelkreislauf)</li>
