@@ -1112,8 +1112,7 @@ sub Gartenbewaesserung_CheckSensorActive {
         else {
             # Event format: "value"
             return 1 if($event =~ /^$customActiveValue$/i);
-        }
-        Log3 $name, 5, "$name: Event $event, Wert nicht gefunden: ($customActiveValue)";
+        }        
         return 0;
     }
 
