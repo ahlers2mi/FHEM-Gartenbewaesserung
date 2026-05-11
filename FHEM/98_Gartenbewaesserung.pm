@@ -297,6 +297,7 @@ sub Gartenbewaesserung_Notify {
         my $barrelSensorDef = AttrVal($name, "barrelFullSensorDevice", "");
         if($barrelSensorDef ne "") {
             my ($barrelDev, $barrelReading) = Gartenbewaesserung_ParseDevice($barrelSensorDef);
+            $barrelReading = "state" if($barrelReading eq "");  # ← NEU!
             if($devName eq $barrelDev) {
                 my $activeValue = AttrVal($name, "barrelFullSensorActiveValue", "");
                 if(Gartenbewaesserung_CheckSensorActive($name, $event, $barrelReading, $activeValue)) {
@@ -1112,6 +1113,7 @@ sub Gartenbewaesserung_CheckSensorActive {
             # Event format: "value"
             return 1 if($event =~ /^$customActiveValue$/i);
         }
+        Log3 $name, 5, "$name: Event $event, Wert nicht gefunden: ($customActiveValue)";
         return 0;
     }
 
