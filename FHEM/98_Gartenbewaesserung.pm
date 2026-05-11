@@ -627,11 +627,11 @@ sub Gartenbewaesserung_UpdateSensorReadings {
 # Default sensor values for auto-detection
 ##############################################################################
 sub Gartenbewaesserung_DefaultSensorActiveValues {
-    return ('on', '1', 'true', 'yes', 'closed', 'active', 'wet', 'rain', 'raining');
+    return ('on', 'ON', '1', 'true', 'yes', 'closed', 'active', 'wet', 'rain', 'raining');
 }
 
 sub Gartenbewaesserung_DefaultSensorInactiveValues {
-    return ('off', '0', 'false', 'no', 'open', 'inactive', 'dry');
+    return ('off', 'OFF', '0', 'false', 'no', 'open', 'inactive', 'dry');
 }
 
 sub Gartenbewaesserung_SensorValueMatches {
