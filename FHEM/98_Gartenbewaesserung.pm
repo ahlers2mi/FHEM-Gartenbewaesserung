@@ -327,6 +327,7 @@ sub Gartenbewaesserung_Notify {
         my $ibcSensorDef = AttrVal($name, "ibcFullSensorDevice", "");
         if($ibcSensorDef ne "") {
             my ($ibcDev, $ibcReading) = Gartenbewaesserung_ParseDevice($ibcSensorDef);
+            $ibcReading = "state" if($ibcReading eq "");  # ← NEU!
             if($devName eq $ibcDev) {
                 my $activeValue = AttrVal($name, "ibcFullSensorActiveValue", "");
                 if(Gartenbewaesserung_CheckSensorActive($name, $event, $ibcReading, $activeValue)) {
@@ -344,6 +345,7 @@ sub Gartenbewaesserung_Notify {
         my $ibcEmptySensorDef = AttrVal($name, "ibcEmptySensorDevice", "");
         if($ibcEmptySensorDef ne "") {
             my ($ibcEmptyDev, $ibcEmptyReading) = Gartenbewaesserung_ParseDevice($ibcEmptySensorDef);
+            $ibcEmptyReading = "state" if($ibcEmptyReading eq "");  # ← NEU!
             if($devName eq $ibcEmptyDev) {
                 my $activeValue = AttrVal($name, "ibcEmptySensorActiveValue", "");
                 if(Gartenbewaesserung_CheckSensorActive($name, $event, $ibcEmptyReading, $activeValue)) {
@@ -360,6 +362,7 @@ sub Gartenbewaesserung_Notify {
         my $barrelEmptySensorDef = AttrVal($name, "barrelEmptySensorDevice", "");
         if($barrelEmptySensorDef ne "") {
             my ($barrelEmptyDev, $barrelEmptyReading) = Gartenbewaesserung_ParseDevice($barrelEmptySensorDef);
+            $barrelEmptyReading = "state" if($barrelEmptyReading eq "");  # ← NEU!
             if($devName eq $barrelEmptyDev) {
                 my $activeValue = AttrVal($name, "barrelEmptySensorActiveValue", "");
                 if(Gartenbewaesserung_CheckSensorActive($name, $event, $barrelEmptyReading, $activeValue)) {
@@ -392,6 +395,7 @@ sub Gartenbewaesserung_Notify {
         my $rainSensorDef = AttrVal($name, "rainSensorDevice", "");
         if($rainSensorDef ne "") {
             my ($rainDev, $rainReading) = Gartenbewaesserung_ParseDevice($rainSensorDef);
+            $rainReading = "state" if($rainReading eq "");  # ← NEU!
             if($devName eq $rainDev) {
                 my $activeValue = AttrVal($name, "rainSensorActiveValue", "");
                 if(Gartenbewaesserung_CheckSensorActive($name, $event, $rainReading, $activeValue)) {
