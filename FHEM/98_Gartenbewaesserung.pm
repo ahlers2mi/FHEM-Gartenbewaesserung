@@ -286,8 +286,13 @@ sub Gartenbewaesserung_Notify {
     my $events = deviceEvents($dev, 1);
     return if(!$events);
 
+    Log3 $name, 5, "$name: Notify called for device: $devName";  # ← NEU
+
     # Monitor sensor changes
     foreach my $event (@{$events}) {
+
+        Log3 $name, 5, "$name: Processing event: $event";  # ← NEU  
+    
         # Barrel full sensor
         my $barrelSensorDef = AttrVal($name, "barrelFullSensorDevice", "");
         if($barrelSensorDef ne "") {
