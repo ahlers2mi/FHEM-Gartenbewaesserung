@@ -12,6 +12,7 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.20 - 2026-05-11  Fix: Event-basierte Sensorwerte
 # 1.0.19 - 2026-05-10  Fix: barrelEmpty:no löst Bewässerung nicht mehr sofort aus
 #                      Neu: Nach barrelEmpty wird Befüllpause gestartet (IBC oder Stadtwasser)
 #                      Fix: Resume erst nach barrelFull-Event oder Pause-Timer
@@ -119,7 +120,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.19';
+    $hash->{VERSION}    = '1.0.20';
 
     my $name = $a[0];
 
@@ -174,6 +175,8 @@ sub Gartenbewaesserung_Define {
     InternalTimer(gettimeofday() + 30, "Gartenbewaesserung_CheckRain", $hash);
 
     Log3 $name, 3, "$name: Gartenbewaesserung v" . $hash->{VERSION} . " initialized";
+
+    Gartenbewaesserung_UpdateNotifyDev($hash);
 
     return undef;
 }
@@ -265,6 +268,7 @@ sub Gartenbewaesserung_Attr {
     if($cmd eq "set" && $attrName =~ /(barrel|ibc|rain|moisture).*Device/) {
         InternalTimer(gettimeofday() + 1, sub {
             Gartenbewaesserung_UpdateSensorReadings($hash);
+            Gartenbewaesserung_UpdateNotifyDev($hash);  # ← NEU!
         }, $hash);
     }
 
@@ -3368,6 +3372,41 @@ sub Gartenbewaesserung_GetStatus {
     $status .= "Last Circuit: " . ReadingsVal($name, "lastCircuitWatering", "never") . "\n";
 
     return $status;
+}
+
+##############################################################################
+# Update NOTIFYDEV to monitor all configured sensor devices
+##############################################################################
+sub Gartenbewaesserung_UpdateNotifyDev {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+    
+    my @devices;
+    
+    # Collect all sensor device names
+    my @sensorAttrs = qw(
+        barrelFullSensorDevice barrelEmptySensorDevice
+        ibcFullSensorDevice ibcEmptySensorDevice
+        rainSensorDevice moistureSensorDevice
+    );
+    
+    foreach my $attr (@sensorAttrs) {
+        my $deviceDef = AttrVal($name, $attr, "");
+        if($deviceDef ne "") {
+            my ($device, $reading) = Gartenbewaesserung_ParseDevice($deviceDef);
+            push @devices, $device if($device ne "" && defined($defs{$device}));
+        }
+    }
+    
+    if(@devices) {
+        # Set NOTIFYDEV to monitor these devices
+        $hash->{NOTIFYDEV} = join(",", @devices);
+        Log3 $name, 4, "$name: NOTIFYDEV set to: " . $hash->{NOTIFYDEV};
+    } else {
+        # No sensors configured, monitor nothing (or global: .*)
+        delete $hash->{NOTIFYDEV};
+        Log3 $name, 4, "$name: No sensors configured, NOTIFYDEV cleared";
+    }
 }
 
 1;
