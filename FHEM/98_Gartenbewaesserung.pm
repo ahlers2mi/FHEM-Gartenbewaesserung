@@ -2657,6 +2657,12 @@ sub Gartenbewaesserung_HandleBarrelEmpty {
         Log3 $name, 3, "$name: Pump switched off (barrel empty)";
     }
 
+    # Stop IBC filling if active (pump was running barrel→IBC and emptied the barrel)
+    if($hash->{HELPER}{ibcFilling}) {
+        Log3 $name, 3, "$name: Stopping IBC fill before barrel empty refill (barrel was emptied during IBC fill)";
+        Gartenbewaesserung_StopIBCFill($hash);
+    }
+
     # If watering or circuit mode is active, stop all operations
     if($hash->{HELPER}{watering} || $hash->{HELPER}{circuitMode}) {
         Gartenbewaesserung_SaveBarrelEmptyResumeContext($hash);
