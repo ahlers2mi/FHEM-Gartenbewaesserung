@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.20 - 2026-05-11
+#     Version 1.0.21 - 2026-05-19
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,7 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.21 - 2026-05-19  Neu: Pumpen-Laufzeit-Watchdog (pumpMaxRuntime) mit Overrun-Alarm und Not-Aus
 # 1.0.20 - 2026-05-11  Fix: Event-basierte Sensorwerte
 # 1.0.19 - 2026-05-10  Fix: barrelEmpty:no löst Bewässerung nicht mehr sofort aus
 #                      Neu: Nach barrelEmpty wird Befüllpause gestartet (IBC oder Stadtwasser)
@@ -99,6 +100,7 @@ sub Gartenbewaesserung_Initialize {
         "rainDurationForIBC:slider,5,5,180 " .
         "rainCheckInterval:slider,1,1,30 " .
         "pumpStartDelay:slider,-30,1,30 " .
+        "pumpMaxRuntime:slider,0,1,240 " .
         "activeValves:textField " .
         "weekdaysOnly:0,1 " .
         "manualMode:0,1 " .
@@ -120,7 +122,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.20';
+    $hash->{VERSION}    = '1.0.21';
 
     my $name = $a[0];
 
@@ -156,12 +158,20 @@ sub Gartenbewaesserung_Define {
     $attr{$name}{rainDurationForIBC} = 30 if(!defined($attr{$name}{rainDurationForIBC}));
     $attr{$name}{rainCheckInterval} = 5 if(!defined($attr{$name}{rainCheckInterval}));
     $attr{$name}{pumpStartDelay} = 3 if(!defined($attr{$name}{pumpStartDelay}));
+    $attr{$name}{pumpMaxRuntime} = 0 if(!defined($attr{$name}{pumpMaxRuntime}));
     $attr{$name}{wateringPauseInterval} = 8 if(!defined($attr{$name}{wateringPauseInterval}));
     $attr{$name}{wateringPauseDuration} = 20 if(!defined($attr{$name}{wateringPauseDuration}));
 
     # Default values for switches and sensors
     $attr{$name}{switchOnValue} = "ON" if(!defined($attr{$name}{switchOnValue}));
     $attr{$name}{switchOffValue} = "OFF" if(!defined($attr{$name}{switchOffValue}));
+
+    my $pumpDevice = AttrVal($name, "pumpDevice", "");
+    my $ibcToBarrelPump = AttrVal($name, "ibcToBarrelPumpDevice", "");
+    if(!Gartenbewaesserung_IsDeviceOn($name, $pumpDevice) &&
+       !Gartenbewaesserung_IsDeviceOn($name, $ibcToBarrelPump)) {
+        readingsSingleUpdate($hash, "pumpOverrunAlert", "no", 1);
+    }
 
     # Read initial sensor values
     InternalTimer(gettimeofday() + 2, sub {
@@ -200,6 +210,7 @@ sub Gartenbewaesserung_Set {
                "startIBCFill:noArg stopIBCFill:noArg " .
                "startIBCtoBarrel:noArg stopIBCtoBarrel:noArg " .
                "startValve:1,2,3,4,5,6,7,8 stopValve:noArg " .
+               "resetPumpOverrunAlert:noArg " .
                "validate:noArg";
 
     if($cmd eq "start") {
@@ -233,6 +244,10 @@ sub Gartenbewaesserung_Set {
     elsif($cmd eq "stopValve") {
         return Gartenbewaesserung_StopCurrentValve($hash);
     }
+    elsif($cmd eq "resetPumpOverrunAlert") {
+        readingsSingleUpdate($hash, "pumpOverrunAlert", "no", 1);
+        return undef;
+    }
     elsif($cmd eq "validate") {
         return Gartenbewaesserung_ValidateConfig($hash);
     } else {
@@ -263,6 +278,27 @@ sub Gartenbewaesserung_Get {
 sub Gartenbewaesserung_Attr {
     my ($cmd, $name, $attrName, $attrVal) = @_;
     my $hash = $defs{$name};
+
+    if($cmd eq "set" && $attrName eq "pumpMaxRuntime") {
+        return "pumpMaxRuntime must be a number between 0 and 240"
+            if($attrVal !~ /^\d+$/ || $attrVal < 0 || $attrVal > 240);
+
+        if($attrVal == 0) {
+            Gartenbewaesserung_StopPumpWatchdog($hash);
+        }
+        else {
+            my $pumpDevice = AttrVal($name, "pumpDevice", "");
+            my $ibcToBarrelPump = AttrVal($name, "ibcToBarrelPumpDevice", "");
+            if(Gartenbewaesserung_IsDeviceOn($name, $pumpDevice) ||
+               Gartenbewaesserung_IsDeviceOn($name, $ibcToBarrelPump)) {
+                Gartenbewaesserung_StartPumpWatchdog($hash);
+            }
+        }
+    }
+
+    if($cmd eq "del" && $attrName eq "pumpMaxRuntime") {
+        Gartenbewaesserung_StopPumpWatchdog($hash);
+    }
 
     # Update sensor readings when sensor attributes change
     if($cmd eq "set" && $attrName =~ /(barrel|ibc|rain|moisture).*Device/) {
@@ -795,9 +831,11 @@ sub Gartenbewaesserung_ValidateConfig {
         }
         else {
             my $delay = AttrVal($name, "pumpStartDelay", 3);
+            my $maxRuntime = AttrVal($name, "pumpMaxRuntime", 0);
             my $delayInfo = $delay < 0 ? "valve opens ${delay}s BEFORE pump" :
                            $delay > 0 ? "pump starts ${delay}s BEFORE valve" : "simultaneous";
-            push @info, "Pump: $pumpDevice ($delayInfo) OK";
+            my $watchdogInfo = $maxRuntime > 0 ? ", watchdog ${maxRuntime}min" : ", watchdog disabled";
+            push @info, "Pump: $pumpDevice ($delayInfo$watchdogInfo) OK";
         }
     }
 
@@ -1003,10 +1041,12 @@ sub Gartenbewaesserung_GetConfig {
     $config .= "\nPUMPE:\n";
     my $pump = AttrVal($name, "pumpDevice", "not configured");
     my $pumpDelay = AttrVal($name, "pumpStartDelay", 3);
+    my $pumpMaxRuntime = AttrVal($name, "pumpMaxRuntime", 0);
     my $delayText = $pumpDelay < 0 ? "valve opens " . abs($pumpDelay) . " sec BEFORE pump" :
                     $pumpDelay > 0 ? "pump starts $pumpDelay sec BEFORE valve" : "simultaneous";
     $config .= "  Main pump: $pump\n";
     $config .= "  Pump timing: $delayText\n";
+    $config .= "  Pump max runtime watchdog: " . ($pumpMaxRuntime > 0 ? "$pumpMaxRuntime min" : "disabled") . "\n";
 
     my $ibcToBarrelPump = AttrVal($name, "ibcToBarrelPumpDevice", "not configured");
     $config .= "  IBC to barrel pump: $ibcToBarrelPump\n";
@@ -1095,6 +1135,25 @@ sub Gartenbewaesserung_ParseDevice {
         # Format: Device (klassisches FHEM Device)
         return ($deviceDef, "");
     }
+}
+
+##############################################################################
+# Check if a switch device is currently ON (based on switchOnValue)
+##############################################################################
+sub Gartenbewaesserung_IsDeviceOn {
+    my ($name, $deviceDef) = @_;
+
+    return 0 if(!defined($deviceDef) || $deviceDef eq "");
+
+    my ($device, $reading) = Gartenbewaesserung_ParseDevice($deviceDef);
+    return 0 if($device eq "");
+    return 0 if(!defined($defs{$device}));
+
+    $reading = "state" if($reading eq "");
+    my $value = ReadingsVal($device, $reading, "");
+    my $onValue = AttrVal($name, "switchOnValue", "ON");
+
+    return ($value =~ /^$onValue$/i) ? 1 : 0;
 }
 
 ##############################################################################
@@ -1245,6 +1304,63 @@ sub Gartenbewaesserung_SwitchDevice {
         fhem("set $device $cmdValue");
         Log3 $name, 4, "$name: Switched $device to $cmdValue";
     }
+
+    my $pumpDevice = AttrVal($name, "pumpDevice", "");
+    my $ibcToBarrelPump = AttrVal($name, "ibcToBarrelPumpDevice", "");
+    if($deviceDef eq $pumpDevice || $deviceDef eq $ibcToBarrelPump) {
+        if($state eq "on") {
+            Gartenbewaesserung_StartPumpWatchdog($defs{$name});
+        }
+        else {
+            if(!Gartenbewaesserung_IsDeviceOn($name, $pumpDevice) &&
+               !Gartenbewaesserung_IsDeviceOn($name, $ibcToBarrelPump)) {
+                Gartenbewaesserung_StopPumpWatchdog($defs{$name});
+            }
+        }
+    }
+}
+
+##############################################################################
+# Start pump runtime watchdog timer
+##############################################################################
+sub Gartenbewaesserung_StartPumpWatchdog {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    RemoveInternalTimer($hash, "Gartenbewaesserung_PumpOverrun");
+
+    my $maxRuntime = AttrVal($name, "pumpMaxRuntime", 0);
+    return if($maxRuntime <= 0);
+
+    InternalTimer(gettimeofday() + ($maxRuntime * 60), "Gartenbewaesserung_PumpOverrun", $hash);
+    Log3 $name, 4, "$name: Pump watchdog started ($maxRuntime min)";
+}
+
+##############################################################################
+# Stop pump runtime watchdog timer
+##############################################################################
+sub Gartenbewaesserung_StopPumpWatchdog {
+    my ($hash) = @_;
+
+    RemoveInternalTimer($hash, "Gartenbewaesserung_PumpOverrun");
+}
+
+##############################################################################
+# Pump watchdog timeout handler (emergency stop)
+##############################################################################
+sub Gartenbewaesserung_PumpOverrun {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+    my $maxRuntime = AttrVal($name, "pumpMaxRuntime", 0);
+
+    Gartenbewaesserung_StopAll($hash);
+
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, "pumpOverrunAlert", "yes");
+    readingsBulkUpdate($hash, "state", "stopped - pump overrun");
+    readingsEndUpdate($hash, 1);
+
+    Log3 $name, 1, "$name: WARNUNG - Pumpe wurde nach $maxRuntime Minuten Maximallaufzeit abgeschaltet (pumpOverrunAlert)";
 }
 
 ##############################################################################
@@ -1735,6 +1851,7 @@ sub Gartenbewaesserung_StartWatering {
     delete $hash->{HELPER}{valveRemainingTime};   # Clear any leftover remaining time
 
     readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, "pumpOverrunAlert", "no");
     readingsBulkUpdate($hash, "state", "watering");
     readingsBulkUpdate($hash, "phase", "starting");
     readingsBulkUpdate($hash, "cycleProgress", "0/" . scalar(@activeValves));
@@ -2867,6 +2984,7 @@ sub Gartenbewaesserung_StopAll {
     my $name = $hash->{NAME};
     my $preserveBarrelEmptyResume = (defined($opts) && ref($opts) eq "HASH" && $opts->{preserveBarrelEmptyResume}) ? 1 : 0;
 
+    Gartenbewaesserung_StopPumpWatchdog($hash);
     RemoveInternalTimer($hash);
 
     # Close all valves
@@ -3377,6 +3495,7 @@ sub Gartenbewaesserung_GetStatus {
     $status .= "Pause Time Remaining: " . ReadingsVal($name, "pauseTimeRemaining", "-") . "\n";
     $status .= "IBC Filling: " . ReadingsVal($name, "ibcFilling", "no") . "\n";
     $status .= "IBC to Barrel: " . ReadingsVal($name, "ibcToBarrelActive", "no") . "\n";
+    $status .= "Pump Overrun Alert: " . ReadingsVal($name, "pumpOverrunAlert", "no") . "\n";
     $status .= "Barrel Full: " . ReadingsVal($name, "barrelFull", "not configured") . "\n";
     $status .= "Barrel Empty: " . ReadingsVal($name, "barrelEmpty", "not configured") . "\n";
     $status .= "IBC Full: " . ReadingsVal($name, "ibcFull", "not configured") . "\n";
@@ -3438,7 +3557,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
 <h3>Gartenbewaesserung</h3>
 <ul>
     <p>FHEM Modul für intelligente Gartenbewässerung mit bis zu 8 Ventilen, Regenwasserfass und IBC-Container.</p>
-    <p><b>Version: 1.0.17</b></p>
+    <p><b>Version: 1.0.21</b></p>
 
     <h4>Features</h4>
     <ul>
@@ -3466,6 +3585,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
 
     <h4>Versionshistorie</h4>
     <ul>
+        <li><b>1.0.21</b> (2026-05-19): Neu: Pumpen-Laufzeit-Watchdog (<code>pumpMaxRuntime</code>) mit Not-Aus, Reading <code>pumpOverrunAlert</code> und manuellem Reset per <code>set resetPumpOverrunAlert</code></li>
         <li><b>1.0.19</b> (2026-05-10): barrelEmpty:no startet jetzt erst eine Befüllpause; Resume erst nach barrelFull oder Pause-Timer; barrelLevel=100 nur bei echtem barrelFull</li>
         <li><b>1.0.17</b> (2026-05-10): Fix für kurze Restzeiten nach Pause: Delay-Start wird bei inaktivem Kreis verworfen, bei Laufzeit &lt;= abs(pumpStartDelay) wird ohne Delay gestartet</li>
         <li><b>1.0.16</b> (2026-05-04): Fass-leer-Sensor (barrelEmptySensorDevice): Pumpe aus wenn Fass leer, Pumpe frei wenn Fass wieder voll</li>
@@ -3496,6 +3616,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>stopIBCtoBarrel</b> - Stoppt IBC zu Fass Transfer</li>
         <li><b>startValve &lt;1-8&gt;</b> - Startet ein einzelnes Ventil manuell (ohne Automatik)</li>
         <li><b>stopValve</b> - Stoppt das aktuell laufende Ventil</li>
+        <li><b>resetPumpOverrunAlert</b> - Setzt das Reading <code>pumpOverrunAlert</code> manuell auf <code>no</code> zurück</li>
         <li><b>validate</b> - Prüft die komplette Konfiguration und zeigt Fehler, Warnungen und Infos an</li>
     </ul>
 
@@ -3657,6 +3778,13 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Positiv: Pumpe startet X Sekunden VOR dem Ventil.
             Negativ: Ventil öffnet X Sekunden VOR der Pumpe (Druckentlastung).
         </li>
+        <li><a id="Gartenbewaesserung-attr-pumpMaxRuntime"></a>
+            <b>pumpMaxRuntime</b><br>
+            Typ: Slider (0–240 Minuten). Standardwert: 0 Minuten.<br>
+            Maximale kontinuierliche Laufzeit der Pumpe. 0 = deaktiviert.
+            Bei Überschreitung wird die Pumpe per Not-Aus gestoppt und
+            <code>pumpOverrunAlert</code> auf <code>yes</code> gesetzt.
+        </li>
 
         <p><b>Zeitplan-Attribute</b></p>
         <li><a id="Gartenbewaesserung-attr-startTime1"></a>
@@ -3753,6 +3881,12 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Name des Readings am Feuchtigkeitssensor-Device (z.B. <code>humidity</code>,
             <code>soil_moisture</code>).
         </li>
+    </ul>
+
+    <a id="Gartenbewaesserung-readings"></a>
+    <h4>Readings</h4>
+    <ul>
+        <li><b>pumpOverrunAlert</b> - <code>yes</code>/<code>no</code>; wird auf <code>yes</code> gesetzt, wenn die Pumpe wegen überschrittener <code>pumpMaxRuntime</code> abgeschaltet wurde.</li>
     </ul>
 
 </ul>
