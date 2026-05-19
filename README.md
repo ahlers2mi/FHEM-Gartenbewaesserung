@@ -150,6 +150,7 @@ get Garten validate
 | `pumpDevice` | Hauptpumpe (Fass → Garten) | – |
 | `ibcToBarrelPumpDevice` | Separate Pumpe für IBC→Fass-Transfer (optional, sonst Schwerkraft) | – |
 | `pumpStartDelay` | Zeitversatz zwischen Pumpe und Ventil in Sekunden (−30 … +30) | 3 |
+| `pumpMaxRuntime` | Maximale kontinuierliche Pumpenlaufzeit in Minuten (0 = deaktiviert, 1–240 aktiv) | 0 |
 
 ### Fass
 
@@ -235,6 +236,7 @@ get Garten validate
 | `set <name> stopIBCtoBarrel` | Stoppt den IBC→Fass-Transfer sofort. |
 | `set <name> startValve <1-8>` | Öffnet ein einzelnes Ventil manuell (ohne Zeitbegrenzung, ohne Automatik). |
 | `set <name> stopValve` | Schließt das aktuell geöffnete Ventil. |
+| `set <name> resetPumpOverrunAlert` | Setzt das Reading `pumpOverrunAlert` manuell auf `no`. |
 | `set <name> validate` | Prüft die komplette Konfiguration und gibt Fehler, Warnungen und Informationen aus. |
 
 ---
@@ -263,6 +265,7 @@ get Garten validate
 | `ibcFilling` | `yes` / `no` — IBC-Befüllung aktiv? |
 | `ibcFillStarted` | Zeitstempel des letzten IBC-Befüll-Starts |
 | `ibcToBarrelActive` | `yes` / `no` — IBC→Fass-Transfer aktiv? |
+| `pumpOverrunAlert` | `yes` / `no` — Pumpe wurde wegen überschrittener `pumpMaxRuntime` not-abgeschaltet |
 | `barrelFull` | `yes` / `no` / `not configured` |
 | `barrelLevel` | Simulierter Füllstand in % (wird durch Bewässerung reduziert, durch Pause zurückgesetzt) |
 | `ibcFull` | `yes` / `no` / `not configured` |
@@ -430,6 +433,7 @@ get Garten validate
 
 | Version | Datum | Änderungen |
 |---|---|---|
+| **1.0.21** | 2026-05-19 | Neu: Pumpen-Laufzeit-Watchdog `pumpMaxRuntime` (1–240, 0=aus), Not-Aus bei Überlauf, Reading `pumpOverrunAlert`, manueller Reset per `set resetPumpOverrunAlert`. |
 | **1.0.18** | 2026-05-10 | Fix: Nach `barrelEmpty`-Stop wird unterbrochene Bewässerung/`startCircuit` nach erfolgreichem Refill automatisch fortgesetzt (inkl. Restlaufzeit und Position im Zyklus). |
 | **1.0.14** | 2026-05-02 | Fix: `manualCircuit`-Flag — `startCircuit` wird nicht mehr durch Regen-Logik oder Scheduler unterbrochen. Fix: `CheckBarrelFull` stoppt IBC→Fass-Transfer korrekt statt zurückzupumpen. Fix: `startIBCFill` blockiert Befüllung während aktivem IBC→Fass-Transfer. |
 | **1.0.13** | 2026-04-29 | Fix: Automatische Pausen auch bei `startCircuit` (Einzelkreislauf) |
