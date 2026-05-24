@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.21 - 2026-05-19
+#     Version 1.0.22 - 2026-05-24
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,8 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.22 - 2026-05-24  Fix: barrelEmpty:no stoppt laufenden barrelEmpty-Refill nicht mehr vorzeitig
+#                      Neu: barrelEmpty:no wird während aktivem Refill nur geloggt
 # 1.0.21 - 2026-05-19  Neu: Pumpen-Laufzeit-Watchdog (pumpMaxRuntime) mit Overrun-Alarm und Not-Aus
 # 1.0.20 - 2026-05-11  Fix: Event-basierte Sensorwerte
 # 1.0.19 - 2026-05-10  Fix: barrelEmpty:no löst Bewässerung nicht mehr sofort aus
@@ -122,7 +124,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.21';
+    $hash->{VERSION}    = '1.0.22';
 
     my $name = $a[0];
 
@@ -409,20 +411,19 @@ sub Gartenbewaesserung_Notify {
                 }
                 elsif(Gartenbewaesserung_CheckSensorInactive($name, $event, $barrelEmptyReading,
                       AttrVal($name, "barrelEmptySensorInactiveValue", ""))) {
-                    readingsSingleUpdate($hash, "barrelEmpty", "no", 1);
-                    Log3 $name, 3, "$name: Barrel no longer empty, pump can be used again";
                     my $resumePending = $hash->{HELPER}{barrelEmptyResumePending};
                     if($hash->{HELPER}{barrelEmptyRefilling}) {
-                        Log3 $name, 3, "$name: Stopping barrel empty refill (barrel no longer empty)";
-                        Gartenbewaesserung_StopBarrelEmptyRefill($hash, { skipResume => 1 });
-                        if($resumePending) {
-                            Log3 $name, 3, "$name: Barrel no longer empty, starting refill pause before resuming";
-                            Gartenbewaesserung_StartBarrelEmptyRefillPause($hash);
-                        }
+                        Log3 $name, 3, "$name: barrelEmpty inactive during refill - letting timer/sensor finish the refill";
+                        readingsSingleUpdate($hash, "barrelEmpty", "no", 1);
                     }
                     elsif($resumePending) {
                         Log3 $name, 3, "$name: Barrel no longer empty, starting refill pause before resuming";
+                        readingsSingleUpdate($hash, "barrelEmpty", "no", 1);
                         Gartenbewaesserung_StartBarrelEmptyRefillPause($hash);
+                    }
+                    else {
+                        readingsSingleUpdate($hash, "barrelEmpty", "no", 1);
+                        Log3 $name, 3, "$name: Barrel no longer empty, pump can be used again";
                     }
                 }
             }
@@ -3557,7 +3558,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
 <h3>Gartenbewaesserung</h3>
 <ul>
     <p>FHEM Modul für intelligente Gartenbewässerung mit bis zu 8 Ventilen, Regenwasserfass und IBC-Container.</p>
-    <p><b>Version: 1.0.21</b></p>
+    <p><b>Version: 1.0.22</b></p>
 
     <h4>Features</h4>
     <ul>
@@ -3585,6 +3586,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
 
     <h4>Versionshistorie</h4>
     <ul>
+        <li><b>1.0.22</b> (2026-05-24): Fix: <code>barrelEmpty:no</code> stoppt einen laufenden Fass-Refill nicht mehr vorzeitig; während aktivem Refill wird das Event nur geloggt</li>
         <li><b>1.0.21</b> (2026-05-19): Neu: Pumpen-Laufzeit-Watchdog (<code>pumpMaxRuntime</code>) mit Not-Aus, Reading <code>pumpOverrunAlert</code> und manuellem Reset per <code>set resetPumpOverrunAlert</code></li>
         <li><b>1.0.19</b> (2026-05-10): barrelEmpty:no startet jetzt erst eine Befüllpause; Resume erst nach barrelFull oder Pause-Timer; barrelLevel=100 nur bei echtem barrelFull</li>
         <li><b>1.0.17</b> (2026-05-10): Fix für kurze Restzeiten nach Pause: Delay-Start wird bei inaktivem Kreis verworfen, bei Laufzeit &lt;= abs(pumpStartDelay) wird ohne Delay gestartet</li>
@@ -3696,9 +3698,11 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             wird Wasser über <code>ibcToBarrelValveDevice</code> (ggf. mit <code>ibcToBarrelPumpDevice</code>)
             aus dem IBC-Container ins Fass geleitet; wenn <code>ibcEmpty: yes</code>, wird der
             Hauswasseranschluss (<code>barrelFillValveDevice</code>) geöffnet.
-            Die Befüllung stoppt automatisch nach der konfigurierten Dauer, wenn der
-            <code>barrelFullSensorDevice</code> anschlägt oder wenn der Fass-leer-Sensor wieder
-            inaktiv ist. Der State wird dabei auf <code>stopped - barrel empty - refilling</code> gesetzt.
+            Die Befüllung stoppt automatisch nach der konfigurierten Dauer oder wenn der
+            <code>barrelFullSensorDevice</code> anschlägt. Wenn der Fass-leer-Sensor während einer
+            laufenden Befüllung wieder inaktiv wird, wird nur das Reading <code>barrelEmpty: no</code>
+            aktualisiert; die Befüllung läuft bis Timer oder Fass-voll-Sensor weiter. Der State wird
+            dabei auf <code>stopped - barrel empty - refilling</code> gesetzt.
             Wenn eine laufende Bewässerung oder ein aktiver Einzelkreis durch den Fass-leer-Stop
             unterbrochen wurde, versucht das Modul nach erfolgreichem Refill automatisch an der
             unterbrochenen Stelle (inkl. Restlaufzeit) weiterzumachen. Falls das nicht sicher möglich ist,
