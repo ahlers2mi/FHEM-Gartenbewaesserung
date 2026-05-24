@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.22 - 2026-05-24
+#     Version 1.0.23 - 2026-05-24
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,8 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.23 - 2026-05-24  Fix: Pumpen-Watchdog wird bei Bewässerungs-/Kreis-Pausen korrekt gestoppt und beim Resume neu gestartet
+#                      Fix: Konsistentes Watchdog-Handling auch in barrelEmpty-Refill-Pausen
 # 1.0.22 - 2026-05-24  Fix: barrelEmpty:no stoppt laufenden barrelEmpty-Refill nicht mehr vorzeitig
 #                      Neu: barrelEmpty:no wird während aktivem Refill nur geloggt
 # 1.0.21 - 2026-05-19  Neu: Pumpen-Laufzeit-Watchdog (pumpMaxRuntime) mit Overrun-Alarm und Not-Aus
@@ -124,7 +126,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.22';
+    $hash->{VERSION}    = '1.0.23';
 
     my $name = $a[0];
 
@@ -1664,6 +1666,8 @@ sub Gartenbewaesserung_StartCircuitPause {
     readingsBulkUpdate($hash, "pauseActive", "yes");
     readingsEndUpdate($hash, 1);
 
+    Gartenbewaesserung_StopPumpWatchdog($hash);
+
     # Fill from IBC or water supply
     my $ibcEmpty = ReadingsVal($name, "ibcEmpty", "no");
 
@@ -1769,6 +1773,12 @@ sub Gartenbewaesserung_EndCircuitPause {
     # Resume circuit with remaining time
     InternalTimer(gettimeofday() + 2, sub {
         Gartenbewaesserung_RunCircuit($hash, $circuitNum);
+        my $pumpDevice = AttrVal($name, "pumpDevice", "");
+        my $ibcToBarrelPump = AttrVal($name, "ibcToBarrelPumpDevice", "");
+        if(Gartenbewaesserung_IsDeviceOn($name, $pumpDevice) ||
+           Gartenbewaesserung_IsDeviceOn($name, $ibcToBarrelPump)) {
+            Gartenbewaesserung_StartPumpWatchdog($hash);
+        }
     }, $hash);
 }
 
@@ -1919,6 +1929,8 @@ sub Gartenbewaesserung_StartWateringPause {
         Log3 $name, 4, "$name: Stopped pump for pause";
     }
 
+    Gartenbewaesserung_StopPumpWatchdog($hash);
+
     # Mark as paused
     $hash->{HELPER}{pauseActive} = 1;
     $hash->{HELPER}{pauseStartTime} = time();
@@ -2060,6 +2072,13 @@ sub Gartenbewaesserung_EndWateringPause {
             # Move to next valve
             Log3 $name, 3, "$name: Moving to next valve after pause";
             Gartenbewaesserung_NextValve($hash);
+        }
+
+        my $pumpDevice = AttrVal($name, "pumpDevice", "");
+        my $ibcToBarrelPump = AttrVal($name, "ibcToBarrelPumpDevice", "");
+        if(Gartenbewaesserung_IsDeviceOn($name, $pumpDevice) ||
+           Gartenbewaesserung_IsDeviceOn($name, $ibcToBarrelPump)) {
+            Gartenbewaesserung_StartPumpWatchdog($hash);
         }
     }, $hash);
 }
@@ -2579,6 +2598,12 @@ sub Gartenbewaesserung_ResumeAfterBarrelEmpty {
             InternalTimer(gettimeofday() + 2, sub {
                 return if(!$hash->{HELPER}{watering});
                 Gartenbewaesserung_OpenValve($hash, $resumeValve);
+                my $pumpDevice = AttrVal($name, "pumpDevice", "");
+                my $ibcToBarrelPump = AttrVal($name, "ibcToBarrelPumpDevice", "");
+                if(Gartenbewaesserung_IsDeviceOn($name, $pumpDevice) ||
+                   Gartenbewaesserung_IsDeviceOn($name, $ibcToBarrelPump)) {
+                    Gartenbewaesserung_StartPumpWatchdog($hash);
+                }
             }, $hash);
         }
         else {
@@ -2586,6 +2611,12 @@ sub Gartenbewaesserung_ResumeAfterBarrelEmpty {
             InternalTimer(gettimeofday() + 2, sub {
                 return if(!$hash->{HELPER}{watering});
                 Gartenbewaesserung_NextValve($hash);
+                my $pumpDevice = AttrVal($name, "pumpDevice", "");
+                my $ibcToBarrelPump = AttrVal($name, "ibcToBarrelPumpDevice", "");
+                if(Gartenbewaesserung_IsDeviceOn($name, $pumpDevice) ||
+                   Gartenbewaesserung_IsDeviceOn($name, $ibcToBarrelPump)) {
+                    Gartenbewaesserung_StartPumpWatchdog($hash);
+                }
             }, $hash);
         }
 
@@ -2646,6 +2677,12 @@ sub Gartenbewaesserung_ResumeAfterBarrelEmpty {
         InternalTimer(gettimeofday() + 2, sub {
             return if(!$hash->{HELPER}{circuitMode});
             Gartenbewaesserung_RunCircuit($hash, $circuitNum);
+            my $pumpDevice = AttrVal($name, "pumpDevice", "");
+            my $ibcToBarrelPump = AttrVal($name, "ibcToBarrelPumpDevice", "");
+            if(Gartenbewaesserung_IsDeviceOn($name, $pumpDevice) ||
+               Gartenbewaesserung_IsDeviceOn($name, $ibcToBarrelPump)) {
+                Gartenbewaesserung_StartPumpWatchdog($hash);
+            }
         }, $hash);
 
         return "resumed";
@@ -2669,6 +2706,8 @@ sub Gartenbewaesserung_StartBarrelEmptyRefillPause {
     Log3 $name, 3, "$name: Starting barrel refill pause ($pauseDuration min) after barrel-empty event";
 
     $hash->{HELPER}{barrelEmptyRefillPause} = 1;
+
+    Gartenbewaesserung_StopPumpWatchdog($hash);
 
     my $ibcEmpty = ReadingsVal($name, "ibcEmpty", "no");
 
@@ -2730,6 +2769,8 @@ sub Gartenbewaesserung_StopBarrelEmptyRefillPause {
         my $fillValve = AttrVal($name, "barrelFillValveDevice", "");
         Gartenbewaesserung_SwitchDevice($name, $fillValve, "off") if($fillValve ne "");
     }
+
+    Gartenbewaesserung_StopPumpWatchdog($hash);
 
     readingsSingleUpdate($hash, "barrelLevel", Gartenbewaesserung_GetBarrelLevelAfterRefill($hash, 50), 1);
 
@@ -3558,7 +3599,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
 <h3>Gartenbewaesserung</h3>
 <ul>
     <p>FHEM Modul für intelligente Gartenbewässerung mit bis zu 8 Ventilen, Regenwasserfass und IBC-Container.</p>
-    <p><b>Version: 1.0.22</b></p>
+    <p><b>Version: 1.0.23</b></p>
 
     <h4>Features</h4>
     <ul>
@@ -3586,6 +3627,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
 
     <h4>Versionshistorie</h4>
     <ul>
+        <li><b>1.0.23</b> (2026-05-24): Fix: Pumpen-Watchdog wird bei Bewässerungs-/Kreis-Pausen gestoppt und beim Resume mit voller Laufzeit neu gestartet; konsistentes Watchdog-Handling in barrelEmpty-Refill-Pausen</li>
         <li><b>1.0.22</b> (2026-05-24): Fix: <code>barrelEmpty:no</code> stoppt einen laufenden Fass-Refill nicht mehr vorzeitig; während aktivem Refill wird das Event nur geloggt</li>
         <li><b>1.0.21</b> (2026-05-19): Neu: Pumpen-Laufzeit-Watchdog (<code>pumpMaxRuntime</code>) mit Not-Aus, Reading <code>pumpOverrunAlert</code> und manuellem Reset per <code>set resetPumpOverrunAlert</code></li>
         <li><b>1.0.19</b> (2026-05-10): barrelEmpty:no startet jetzt erst eine Befüllpause; Resume erst nach barrelFull oder Pause-Timer; barrelLevel=100 nur bei echtem barrelFull</li>
