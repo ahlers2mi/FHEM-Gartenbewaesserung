@@ -177,8 +177,9 @@ sub Gartenbewaesserung_Define {
         readingsSingleUpdate($hash, "pumpOverrunAlert", "no", 1);
     }
 
-    # Read initial sensor values
-    InternalTimer(gettimeofday() + 2, sub {
+    # Read initial sensor values - immediate attempt + retry after 5 seconds
+    Gartenbewaesserung_UpdateSensorReadings($hash);
+    InternalTimer(gettimeofday() + 5, sub {
         Gartenbewaesserung_UpdateSensorReadings($hash);
     }, $hash);
 
@@ -215,6 +216,7 @@ sub Gartenbewaesserung_Set {
                "startIBCtoBarrel:noArg stopIBCtoBarrel:noArg " .
                "startValve:1,2,3,4,5,6,7,8 stopValve:noArg " .
                "resetPumpOverrunAlert:noArg " .
+               "refreshSensors:noArg " .
                "validate:noArg";
 
     if($cmd eq "start") {
@@ -251,6 +253,10 @@ sub Gartenbewaesserung_Set {
     elsif($cmd eq "resetPumpOverrunAlert") {
         readingsSingleUpdate($hash, "pumpOverrunAlert", "no", 1);
         return undef;
+    }
+    elsif($cmd eq "refreshSensors") {
+        Gartenbewaesserung_UpdateSensorReadings($hash);
+        return "Sensor readings updated";
     }
     elsif($cmd eq "validate") {
         return Gartenbewaesserung_ValidateConfig($hash);
@@ -454,6 +460,18 @@ sub Gartenbewaesserung_Notify {
                         Gartenbewaesserung_StopIBCFill($hash);
                     }
                 }
+            }
+        }
+
+        # Moisture sensor - live update
+        my $moistureSensorDef = AttrVal($name, "moistureSensorDevice", "");
+        if($moistureSensorDef ne "") {
+            my ($moistureDev, $moistureReading) = Gartenbewaesserung_ParseDevice($moistureSensorDef);
+            $moistureReading = AttrVal($name, "moistureSensorReading", "moisture") if($moistureReading eq "");
+            if($devName eq $moistureDev && $event =~ /^$moistureReading:\s*(.+)$/) {
+                my $value = $1;
+                readingsSingleUpdate($hash, "soilMoisture", $value, 1);
+                Log3 $name, 4, "$name: Soil moisture updated (event): $value";
             }
         }
     }
