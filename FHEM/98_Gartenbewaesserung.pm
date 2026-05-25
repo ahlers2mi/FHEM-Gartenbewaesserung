@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.24 - 2026-05-25
+#     Version 1.0.25 - 2026-05-25
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,9 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.25 - 2026-05-25  Neu: Attribut barrelFillTimeout (Minuten, 0=aus) - Watchdog erkennt blockierte Fass-Befuellung
+#                      Neu: Reading barrelFillTimeoutAlert (yes/no) - wird gesetzt wenn barrelFull nicht rechtzeitig kommt
+#                      Neu: Alert wird automatisch zurueckgesetzt bei barrelFull:yes oder raining:yes
 # 1.0.24 - 2026-05-25  Fix: Pumpen-Watchdog wird auch im manuellen Ventilmodus (set valve N) gestartet
 #                      Fix: StopCurrentValve stoppt den Watchdog, damit kein verwaister PumpOverrun-Timer feuert
 # 1.0.23 - 2026-05-24  Fix: Pumpen-Watchdog wird bei Bewässerungs-/Kreis-Pausen korrekt gestoppt und beim Resume neu gestartet
@@ -107,6 +110,7 @@ sub Gartenbewaesserung_Initialize {
         "rainCheckInterval:slider,1,1,30 " .
         "pumpStartDelay:slider,-30,1,30 " .
         "pumpMaxRuntime:slider,0,1,240 " .
+        "barrelFillTimeout:slider,0,1,120 " .
         "activeValves:textField " .
         "weekdaysOnly:0,1 " .
         "manualMode:0,1 " .
@@ -128,7 +132,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.24';
+    $hash->{VERSION}    = '1.0.25';
 
     my $name = $a[0];
 
@@ -145,6 +149,7 @@ sub Gartenbewaesserung_Define {
     readingsBulkUpdate($hash, "pauseActive", "no");
     readingsBulkUpdate($hash, "pauseTimeRemaining", "-");
     readingsBulkUpdate($hash, "barrelEmpty", "no");
+    readingsBulkUpdate($hash, "barrelFillTimeoutAlert", "no");
     readingsEndUpdate($hash, 1);
 
     # Set default attributes
@@ -448,6 +453,10 @@ sub Gartenbewaesserung_Notify {
                 my $activeValue = AttrVal($name, "rainSensorActiveValue", "");
                 if(Gartenbewaesserung_CheckSensorActive($name, $event, $rainReading, $activeValue)) {
                     readingsSingleUpdate($hash, "raining", "yes", 1);
+                    if(ReadingsVal($name, "barrelFillTimeoutAlert", "no") ne "no") {
+                        readingsSingleUpdate($hash, "barrelFillTimeoutAlert", "no", 1);
+                        Log3 $name, 3, "$name: Rain detected, clearing barrelFillTimeoutAlert";
+                    }
                     Log3 $name, 4, "$name: Rain sensor active (event), triggering CheckRain immediately";
                     # Remove pending timer and run CheckRain right now
                     RemoveInternalTimer($hash, "Gartenbewaesserung_CheckRain");
@@ -1387,6 +1396,51 @@ sub Gartenbewaesserung_PumpOverrun {
 }
 
 ##############################################################################
+# Start barrel-fill timeout watchdog (detects IBC empty / broken water supply
+# when barrelFull sensor does not activate within configured time)
+##############################################################################
+sub Gartenbewaesserung_StartBarrelFillTimeout {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    RemoveInternalTimer($hash, "Gartenbewaesserung_BarrelFillTimeout");
+
+    my $timeout = AttrVal($name, "barrelFillTimeout", 0);
+    return if($timeout <= 0);
+
+    # Watchdog only useful if a barrelFull sensor exists to reset it
+    return if(AttrVal($name, "barrelFullSensorDevice", "") eq "");
+
+    InternalTimer(gettimeofday() + ($timeout * 60), "Gartenbewaesserung_BarrelFillTimeout", $hash);
+    Log3 $name, 4, "$name: Barrel-fill timeout watchdog started ($timeout min)";
+}
+
+##############################################################################
+# Stop barrel-fill timeout watchdog
+##############################################################################
+sub Gartenbewaesserung_StopBarrelFillTimeout {
+    my ($hash) = @_;
+    RemoveInternalTimer($hash, "Gartenbewaesserung_BarrelFillTimeout");
+}
+
+##############################################################################
+# Barrel-fill timeout handler: barrelFull did not trigger within timeout
+##############################################################################
+sub Gartenbewaesserung_BarrelFillTimeout {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+    my $timeout = AttrVal($name, "barrelFillTimeout", 0);
+
+    # If barrel is already full in the meantime, skip
+    if(ReadingsVal($name, "barrelFull", "no") eq "yes") {
+        return;
+    }
+
+    readingsSingleUpdate($hash, "barrelFillTimeoutAlert", "yes", 1);
+    Log3 $name, 1, "$name: WARNUNG - Fass-Befuellung dauert seit $timeout Minuten an, barrelFull-Sensor reagiert nicht (IBC moeglicherweise leer oder Wasserzufuhr gestoert)";
+}
+
+##############################################################################
 # Start single circuit with full logic (for external control like greenhouse)
 ##############################################################################
 sub Gartenbewaesserung_StartCircuit {
@@ -1467,6 +1521,7 @@ sub Gartenbewaesserung_FillBarrelForCircuit {
 
     Gartenbewaesserung_SwitchDevice($name, $fillValve, "on");
     $hash->{HELPER}{barrelFilling} = 1;
+    Gartenbewaesserung_StartBarrelFillTimeout($hash);
 
     my $duration = AttrVal($name, "barrelFillDuration", 10);
 
@@ -1494,6 +1549,7 @@ sub Gartenbewaesserung_StopBarrelFillForCircuit {
     }
 
     $hash->{HELPER}{barrelFilling} = 0;
+    Gartenbewaesserung_StopBarrelFillTimeout($hash);
     readingsSingleUpdate($hash, "barrelLevel", Gartenbewaesserung_GetBarrelLevelAfterRefill($hash, 50), 1);
 
     Gartenbewaesserung_ClearEndTime($hash);
@@ -1673,6 +1729,7 @@ sub Gartenbewaesserung_StartCircuitPause {
 
     Gartenbewaesserung_ClearEndTime($hash);
     Gartenbewaesserung_SetPauseEndTime($hash, $pauseDuration);
+    Gartenbewaesserung_StartBarrelFillTimeout($hash);
 
     if(defined($hash->{HELPER}{valveRemainingTime}) && $hash->{HELPER}{valveRemainingTime} > 0) {
         my $rem = $hash->{HELPER}{valveRemainingTime};
@@ -1780,6 +1837,8 @@ sub Gartenbewaesserung_EndCircuitPause {
     delete $hash->{HELPER}{pauseSource};
     delete $hash->{HELPER}{pauseStartTime};
     delete $hash->{HELPER}{pauseEndTimer};
+
+    Gartenbewaesserung_StopBarrelFillTimeout($hash);
 
     readingsSingleUpdate($hash, "barrelLevel", Gartenbewaesserung_GetBarrelLevelAfterRefill($hash, 50), 1);
     Gartenbewaesserung_ClearPauseTime($hash);
@@ -1958,6 +2017,7 @@ sub Gartenbewaesserung_StartWateringPause {
     # Clear valve end time, set pause end time
     Gartenbewaesserung_ClearEndTime($hash);
     Gartenbewaesserung_SetPauseEndTime($hash, $pauseDuration);
+    Gartenbewaesserung_StartBarrelFillTimeout($hash);
 
     if(defined($hash->{HELPER}{valveRemainingTime}) && $hash->{HELPER}{valveRemainingTime} > 0) {
         my $rem = $hash->{HELPER}{valveRemainingTime};
@@ -2064,6 +2124,8 @@ sub Gartenbewaesserung_EndWateringPause {
     delete $hash->{HELPER}{pauseSource};
     delete $hash->{HELPER}{pauseStartTime};
     delete $hash->{HELPER}{pauseEndTimer};
+
+    Gartenbewaesserung_StopBarrelFillTimeout($hash);
 
     # Reset barrel level
     readingsSingleUpdate($hash, "barrelLevel", Gartenbewaesserung_GetBarrelLevelAfterRefill($hash, 50), 1);
@@ -2323,6 +2385,7 @@ sub Gartenbewaesserung_FillBarrel {
 
     Gartenbewaesserung_SwitchDevice($name, $fillValve, "on");
     $hash->{HELPER}{barrelFilling} = 1;
+    Gartenbewaesserung_StartBarrelFillTimeout($hash);
 
     my $duration = AttrVal($name, "barrelFillDuration", 10);
 
@@ -2350,6 +2413,7 @@ sub Gartenbewaesserung_StopBarrelFill {
     }
 
     $hash->{HELPER}{barrelFilling} = 0;
+    Gartenbewaesserung_StopBarrelFillTimeout($hash);
     readingsSingleUpdate($hash, "barrelLevel", Gartenbewaesserung_GetBarrelLevelAfterRefill($hash, 50), 1);
 
     Gartenbewaesserung_ClearEndTime($hash);
@@ -2372,6 +2436,12 @@ sub Gartenbewaesserung_CheckBarrelFull {
     my $name = $hash->{NAME};
 
     Log3 $name, 3, "$name: Barrel full detected";
+
+    # Stop fill-timeout watchdog and clear any pending alert
+    Gartenbewaesserung_StopBarrelFillTimeout($hash);
+    if(ReadingsVal($name, "barrelFillTimeoutAlert", "no") ne "no") {
+        readingsSingleUpdate($hash, "barrelFillTimeoutAlert", "no", 1);
+    }
 
     # If IBC→Barrel transfer is active, stop the transfer and do NOT pump back
     if($hash->{HELPER}{ibcToBarrelActive}) {
@@ -2728,6 +2798,7 @@ sub Gartenbewaesserung_StartBarrelEmptyRefillPause {
     $hash->{HELPER}{barrelEmptyRefillPause} = 1;
 
     Gartenbewaesserung_StopPumpWatchdog($hash);
+    Gartenbewaesserung_StartBarrelFillTimeout($hash);
 
     my $ibcEmpty = ReadingsVal($name, "ibcEmpty", "no");
 
@@ -2791,6 +2862,7 @@ sub Gartenbewaesserung_StopBarrelEmptyRefillPause {
     }
 
     Gartenbewaesserung_StopPumpWatchdog($hash);
+    Gartenbewaesserung_StopBarrelFillTimeout($hash);
 
     readingsSingleUpdate($hash, "barrelLevel", Gartenbewaesserung_GetBarrelLevelAfterRefill($hash, 50), 1);
 
@@ -3047,6 +3119,7 @@ sub Gartenbewaesserung_StopAll {
     my $preserveBarrelEmptyResume = (defined($opts) && ref($opts) eq "HASH" && $opts->{preserveBarrelEmptyResume}) ? 1 : 0;
 
     Gartenbewaesserung_StopPumpWatchdog($hash);
+    Gartenbewaesserung_StopBarrelFillTimeout($hash);
     RemoveInternalTimer($hash);
 
     # Close all valves
@@ -3621,7 +3694,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
 <h3>Gartenbewaesserung</h3>
 <ul>
     <p>FHEM Modul für intelligente Gartenbewässerung mit bis zu 8 Ventilen, Regenwasserfass und IBC-Container.</p>
-    <p><b>Version: 1.0.24</b></p>
+    <p><b>Version: 1.0.25</b></p>
 
     <h4>Features</h4>
     <ul>
@@ -3649,6 +3722,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
 
     <h4>Versionshistorie</h4>
     <ul>
+        <li><b>1.0.25</b> (2026-05-25): Neu: Attribut <code>barrelFillTimeout</code> – Watchdog für Fass-Befüllung. Schlägt nicht der <code>barrelFullSensorDevice</code> innerhalb der konfigurierten Minuten an, wird Reading <code>barrelFillTimeoutAlert</code> auf <code>yes</code> gesetzt (Hinweis auf leeren IBC bzw. gestörte Wasserzufuhr). Reset bei <code>barrelFull:yes</code> oder <code>raining:yes</code>.</li>
         <li><b>1.0.24</b> (2026-05-25): Fix: Pumpen-Watchdog wird auch im manuellen Ventilmodus (<code>set valve N</code>) gestartet; <code>StopCurrentValve</code> stoppt den Watchdog, damit kein verwaister <code>PumpOverrun</code>-Timer feuert</li>
         <li><b>1.0.23</b> (2026-05-24): Fix: Pumpen-Watchdog wird bei Bewässerungs-/Kreis-Pausen gestoppt und beim Resume mit voller Laufzeit neu gestartet; konsistentes Watchdog-Handling in barrelEmpty-Refill-Pausen</li>
         <li><b>1.0.22</b> (2026-05-24): Fix: <code>barrelEmpty:no</code> stoppt einen laufenden Fass-Refill nicht mehr vorzeitig; während aktivem Refill wird das Event nur geloggt</li>
@@ -3854,6 +3928,18 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Bei Überschreitung wird die Pumpe per Not-Aus gestoppt und
             <code>pumpOverrunAlert</code> auf <code>yes</code> gesetzt.
         </li>
+        <li><a id="Gartenbewaesserung-attr-barrelFillTimeout"></a>
+            <b>barrelFillTimeout</b><br>
+            Typ: Slider (0–120 Minuten). Standardwert: 0 Minuten.<br>
+            Watchdog für die Fass-Befüllung: Wird das Befüllventil
+            (<code>barrelFillValveDevice</code> oder <code>ibcToBarrelValveDevice</code>)
+            geöffnet, aber der <code>barrelFullSensorDevice</code> meldet innerhalb der
+            konfigurierten Minuten kein <code>full</code>, dann wird Reading
+            <code>barrelFillTimeoutAlert</code> auf <code>yes</code> gesetzt.
+            Typischer Indikator: IBC leer oder Wasserzufuhr unterbrochen.
+            0 = deaktiviert. Voraussetzung: <code>barrelFullSensorDevice</code> ist konfiguriert.
+            Reset des Alerts bei <code>barrelFull:yes</code> oder <code>raining:yes</code>.
+        </li>
 
         <p><b>Zeitplan-Attribute</b></p>
         <li><a id="Gartenbewaesserung-attr-startTime1"></a>
@@ -3956,6 +4042,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
     <h4>Readings</h4>
     <ul>
         <li><b>pumpOverrunAlert</b> - <code>yes</code>/<code>no</code>; wird auf <code>yes</code> gesetzt, wenn die Pumpe wegen überschrittener <code>pumpMaxRuntime</code> abgeschaltet wurde.</li>
+        <li><b>barrelFillTimeoutAlert</b> - <code>yes</code>/<code>no</code>; wird auf <code>yes</code> gesetzt, wenn das Befüllventil länger als <code>barrelFillTimeout</code> Minuten offen war, ohne dass <code>barrelFull</code> auf <code>yes</code> ging (IBC vermutlich leer oder Wasserzufuhr gestört). Reset automatisch bei <code>barrelFull:yes</code> oder <code>raining:yes</code>.</li>
     </ul>
 
 </ul>
