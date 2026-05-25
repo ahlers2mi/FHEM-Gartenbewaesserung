@@ -3154,6 +3154,7 @@ sub Gartenbewaesserung_StartSingleValve {
     my $pumpDevice = AttrVal($name, "pumpDevice", "");
     if($pumpDevice ne "") {
         Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+        Gartenbewaesserung_StartPumpWatchdog($hash);
     }
 
     Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
@@ -3190,6 +3191,7 @@ sub Gartenbewaesserung_StopCurrentValve {
         Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "off");
     }
 
+    Gartenbewaesserung_StopPumpWatchdog($hash);
     Gartenbewaesserung_ClearEndTime($hash);
 
     readingsBeginUpdate($hash);
