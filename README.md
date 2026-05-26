@@ -67,6 +67,7 @@ Hauswasseranschluss
 | Sensor | Attribut | Funktion |
 |---|---|---|
 | Fass-voll | `barrelFullSensorDevice` | Stoppt Fass-Befüllung vorzeitig |
+| Fass-leer | `barrelEmptySensorDevice` | Pumpe-Not-Aus bei leerem Fass, startet automatischen Refill |
 | IBC-voll | `ibcFullSensorDevice` | Stoppt IBC-Befüllung |
 | IBC-leer | `ibcEmptySensorDevice` | Entscheidet ob Hauswasser statt IBC genutzt wird |
 | Regensensor | `rainSensorDevice` | Startet IBC-Befüllung bei Dauerregen |
@@ -158,10 +159,14 @@ get Garten validate
 |---|---|---|
 | `barrelFillValveDevice` | Ventil am Hauswasseranschluss zum Auffüllen des Fasses | – |
 | `barrelFullSensorDevice` | Schwimmerschalter / Füllstandssensor am Fass | – |
+| `barrelEmptySensorDevice` | Sensor „Fass leer": Pumpe-Not-Aus, automatischer Refill aus IBC oder Hauswasser | – |
 | `barrelFillDuration` | Maximale Befüllzeit des Fasses in Minuten (1–60) | 10 |
 | `barrelFillThreshold` | Schwellwert (%) unter dem das Fass vor der Bewässerung aufgefüllt wird | 30 |
+| `barrelFillTimeout` | Watchdog-Zeit in Minuten: Schlägt `barrelFullSensorDevice` innerhalb dieser Zeit nicht an, wird `barrelFillTimeoutAlert` gesetzt (0 = deaktiviert) | 0 |
 | `barrelFullSensorActiveValue` | Eigener Wert für „Fass voll" (z. B. `ON`), sonst automatisch erkannt | – |
 | `barrelFullSensorInactiveValue` | Eigener Wert für „Fass nicht voll" | – |
+| `barrelEmptySensorActiveValue` | Eigener Wert für „Fass leer" | – |
+| `barrelEmptySensorInactiveValue` | Eigener Wert für „Fass nicht leer" | – |
 
 ### IBC-Container
 
@@ -237,6 +242,7 @@ get Garten validate
 | `set <name> startValve <1-8>` | Öffnet ein einzelnes Ventil manuell (ohne Zeitbegrenzung, ohne Automatik). |
 | `set <name> stopValve` | Schließt das aktuell geöffnete Ventil. |
 | `set <name> resetPumpOverrunAlert` | Setzt das Reading `pumpOverrunAlert` manuell auf `no`. |
+| `set <name> refreshSensors` | Liest alle konfigurierten Sensor-Readings sofort neu ein und aktualisiert die Readings (z. B. nach Neustart oder Gerätetausch). |
 | `set <name> validate` | Prüft die komplette Konfiguration und gibt Fehler, Warnungen und Informationen aus. |
 
 ---
@@ -267,7 +273,9 @@ get Garten validate
 | `ibcToBarrelActive` | `yes` / `no` — IBC→Fass-Transfer aktiv? |
 | `pumpOverrunAlert` | `yes` / `no` — Pumpe wurde wegen überschrittener `pumpMaxRuntime` not-abgeschaltet |
 | `barrelFull` | `yes` / `no` / `not configured` |
+| `barrelEmpty` | `yes` / `no` / `not configured` — Fass-leer-Status; `yes` sperrt die Pumpe |
 | `barrelLevel` | Simulierter Füllstand in % (wird durch Bewässerung reduziert, durch Pause zurückgesetzt) |
+| `barrelFillTimeoutAlert` | `yes` / `no` — Befüllventil war länger als `barrelFillTimeout` Minuten offen ohne `barrelFull:yes` (IBC vermutlich leer oder Wasserzufuhr gestört). Reset automatisch bei `barrelFull:yes` oder `raining:yes`. |
 | `ibcFull` | `yes` / `no` / `not configured` |
 | `ibcEmpty` | `yes` / `no` / `not configured` |
 | `raining` | `yes` / `no` / `not configured` |
@@ -389,13 +397,16 @@ attr Garten activeValves 1,2,3,4,5,6,7
 # --- Pumpe und Timing ---
 attr Garten pumpDevice            Pumpe_Relais
 attr Garten pumpStartDelay        3
+attr Garten pumpMaxRuntime        60
 attr Garten ibcToBarrelPumpDevice IBC_Pumpe_Relais
 
 # --- Fass ---
 attr Garten barrelFillValveDevice  Hauswasser_Ventil
 attr Garten barrelFullSensorDevice Fass_Sensor:state
+attr Garten barrelEmptySensorDevice Fass_Leer_Sensor:state
 attr Garten barrelFillDuration     10
 attr Garten barrelFillThreshold    25
+attr Garten barrelFillTimeout      30
 
 # --- IBC-Container ---
 attr Garten ibcFillValveDevice      IBC_Einlass_Ventil
@@ -433,6 +444,10 @@ get Garten validate
 
 | Version | Datum | Änderungen |
 |---|---|---|
+| **1.0.25** | 2026-05-25 | Neu: Attribut `barrelFillTimeout` — Watchdog für Fass-Befüllung. Schlägt `barrelFullSensorDevice` nicht innerhalb der konfigurierten Minuten an, wird `barrelFillTimeoutAlert` auf `yes` gesetzt (IBC leer oder Wasserzufuhr gestört). Reset automatisch bei `barrelFull:yes` oder `raining:yes`. |
+| **1.0.24** | 2026-05-25 | Fix: Pumpen-Watchdog wird auch im manuellen Ventilmodus (`set startValve N`) gestartet. `stopValve` stoppt den Watchdog, damit kein verwaister `PumpOverrun`-Timer feuert. |
+| **1.0.23** | 2026-05-24 | Fix: Pumpen-Watchdog wird bei Bewässerungs-/Kreis-Pausen korrekt gestoppt und beim Resume mit voller Laufzeit neu gestartet. Konsistentes Watchdog-Handling in `barrelEmpty`-Refill-Pausen. |
+| **1.0.22** | 2026-05-24 | Fix: `barrelEmpty:no` stoppt einen laufenden Fass-Refill nicht mehr vorzeitig. Während aktivem Refill wird das Event nur geloggt. |
 | **1.0.21** | 2026-05-19 | Neu: Pumpen-Laufzeit-Watchdog `pumpMaxRuntime` (1–240, 0=aus), Not-Aus bei Überlauf, Reading `pumpOverrunAlert`, manueller Reset per `set resetPumpOverrunAlert`. |
 | **1.0.18** | 2026-05-10 | Fix: Nach `barrelEmpty`-Stop wird unterbrochene Bewässerung/`startCircuit` nach erfolgreichem Refill automatisch fortgesetzt (inkl. Restlaufzeit und Position im Zyklus). |
 | **1.0.14** | 2026-05-02 | Fix: `manualCircuit`-Flag — `startCircuit` wird nicht mehr durch Regen-Logik oder Scheduler unterbrochen. Fix: `CheckBarrelFull` stoppt IBC→Fass-Transfer korrekt statt zurückzupumpen. Fix: `startIBCFill` blockiert Befüllung während aktivem IBC→Fass-Transfer. |
