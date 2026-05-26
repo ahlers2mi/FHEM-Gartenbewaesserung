@@ -3758,6 +3758,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>startValve &lt;1-8&gt;</b> - Startet ein einzelnes Ventil manuell (ohne Automatik)</li>
         <li><b>stopValve</b> - Stoppt das aktuell laufende Ventil</li>
         <li><b>resetPumpOverrunAlert</b> - Setzt das Reading <code>pumpOverrunAlert</code> manuell auf <code>no</code> zurück</li>
+        <li><b>refreshSensors</b> - Liest alle konfigurierten Sensor-Readings sofort neu ein und aktualisiert die Readings (z. B. nach Neustart oder Gerätetausch)</li>
         <li><b>validate</b> - Prüft die komplette Konfiguration und zeigt Fehler, Warnungen und Infos an</li>
     </ul>
 
@@ -3848,6 +3849,18 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             wird dies im Log gemeldet und der State bleibt bei <code>stopped - barrel empty</code>.<br>
             Optionale Sensor-Wert-Attribute: <code>barrelEmptySensorActiveValue</code>,
             <code>barrelEmptySensorInactiveValue</code>.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-barrelEmptySensorActiveValue"></a>
+            <b>barrelEmptySensorActiveValue</b><br>
+            Typ: textField. Standardwert: automatisch.<br>
+            Wert des Fass-leer-Sensors wenn Fass leer ist. Leer = automatische Erkennung
+            (on/1/true/yes/closed/active).
+        </li>
+        <li><a id="Gartenbewaesserung-attr-barrelEmptySensorInactiveValue"></a>
+            <b>barrelEmptySensorInactiveValue</b><br>
+            Typ: textField. Standardwert: automatisch.<br>
+            Wert des Fass-leer-Sensors wenn Fass nicht leer ist. Leer = automatische Erkennung
+            (off/0/false/no/open/inactive/dry).
         </li>
         <li><a id="Gartenbewaesserung-attr-rainSensorDevice"></a>
             <b>rainSensorDevice</b><br>
