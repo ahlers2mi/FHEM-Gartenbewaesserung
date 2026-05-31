@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.27 - 2026-05-31
+#     Version 1.0.28 - 2026-05-31
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,10 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.28 - 2026-05-31  Fix: Pumpen-Watchdog wird beim Ausschalten der Pumpe in SwitchDevice zuverlaessig gestoppt
+#                      (vorher abhaengig vom noch nicht aktualisierten Geraete-Reading) - behebt falschen
+#                      pumpOverrunAlert nach FinishWatering/FinishCircuit und waehrend FillBarrel
+#                      Neu: StartIBCFill verweigert Befuellung bei leerem Fass (kein Pumpen-Trockenlauf)
 # 1.0.27 - 2026-05-31  Fix: Pumpen-Watchdog wird beim Fass-leer-Not-Aus (HandleBarrelEmpty) explizit gestoppt -
 #                      verhindert falschen pumpOverrunAlert durch verwaisten Timer nach gestoppter IBC-Befuellung
 # 1.0.26 - 2026-05-31  Fix: Kein automatisches Fass-Nachfuellen mehr, wenn das Fass durch die IBC-Befuellung
@@ -136,7 +140,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.27';
+    $hash->{VERSION}    = '1.0.28';
 
     my $name = $a[0];
 
@@ -1348,10 +1352,14 @@ sub Gartenbewaesserung_SwitchDevice {
             Gartenbewaesserung_StartPumpWatchdog($defs{$name});
         }
         else {
-            if(!Gartenbewaesserung_IsDeviceOn($name, $pumpDevice) &&
-               !Gartenbewaesserung_IsDeviceOn($name, $ibcToBarrelPump)) {
-                Gartenbewaesserung_StopPumpWatchdog($defs{$name});
-            }
+            # Stop the watchdog whenever a pump is switched off. The main pump
+            # (barrel->garden / barrel->IBC) and the IBC->barrel pump never run at
+            # the same time, so switching either off means no pump is running.
+            # NOTE: we must NOT gate this on IsDeviceOn() - right after the MQTT
+            # "off" command the device reading is still stale ("on"), which would
+            # leave a stray PumpOverrun timer running and fire a false
+            # pumpOverrunAlert minutes later (e.g. after FinishWatering).
+            Gartenbewaesserung_StopPumpWatchdog($defs{$name});
         }
     }
 }
@@ -3324,6 +3332,15 @@ sub Gartenbewaesserung_StartIBCFill {
         return;
     }
 
+    # Don't pump from an empty barrel (would dry-run the pump). The sensor-based
+    # triggers already require barrelFull, but the time-based fallback and the
+    # manual command could otherwise start filling with an empty barrel.
+    if(ReadingsVal($name, "barrelEmpty", "no") eq "yes") {
+        Log3 $name, 3, "$name: Cannot fill IBC - barrel is empty";
+        return "Cannot fill IBC - barrel is empty" if($manual);
+        return;
+    }
+
     my $ibcValve = AttrVal($name, "ibcFillValveDevice", "");
     if($ibcValve eq "") {
         return "No IBC fill valve configured" if($manual);
@@ -3712,7 +3729,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
 <h3>Gartenbewaesserung</h3>
 <ul>
     <p>FHEM Modul für intelligente Gartenbewässerung mit bis zu 8 Ventilen, Regenwasserfass und IBC-Container.</p>
-    <p><b>Version: 1.0.27</b></p>
+    <p><b>Version: 1.0.28</b></p>
 
     <h4>Features</h4>
     <ul>
@@ -3740,6 +3757,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
 
     <h4>Versionshistorie</h4>
     <ul>
+        <li><b>1.0.28</b> (2026-05-31): Fix: Pumpen-Watchdog wird beim Ausschalten der Pumpe in <code>SwitchDevice</code> zuverlässig gestoppt (vorher abhängig vom noch nicht aktualisierten Geräte-Reading). Behebt falschen <code>pumpOverrunAlert</code> nach Abschluss einer Bewässerung (<code>FinishWatering</code>/<code>FinishCircuit</code>) und während der Fass-Befüllung mitten im Zyklus. Neu: <code>StartIBCFill</code> verweigert die Befüllung bei leerem Fass (kein Pumpen-Trockenlauf).</li>
         <li><b>1.0.27</b> (2026-05-31): Fix: Pumpen-Watchdog wird beim Fass-leer-Not-Aus (<code>HandleBarrelEmpty</code>) explizit gestoppt. Andernfalls blieb nach gestoppter IBC-Befüllung ein verwaister Watchdog-Timer aktiv und löste Minuten später einen falschen <code>pumpOverrunAlert</code> aus, obwohl die Pumpe längst aus war.</li>
         <li><b>1.0.26</b> (2026-05-31): Fix: Kein automatisches Fass-Nachfüllen mehr, wenn das Fass durch die IBC-Befüllung geleert wurde. Bisher wurde direkt nach der IBC-Befüllung das Fass wieder aufgefüllt (aus dem IBC zurückgepumpt oder per Hauswasser) – das führte zu einem Pendeln Fass&lt;-&gt;IBC. Das Fass füllt sich nun von selbst über den Regen wieder auf; die IBC-Befüllung setzt erst fort, wenn der Fass-voll-Sensor erneut anschlägt.</li>
         <li><b>1.0.25</b> (2026-05-25): Neu: Attribut <code>barrelFillTimeout</code> – Watchdog für Fass-Befüllung. Schlägt nicht der <code>barrelFullSensorDevice</code> innerhalb der konfigurierten Minuten an, wird Reading <code>barrelFillTimeoutAlert</code> auf <code>yes</code> gesetzt (Hinweis auf leeren IBC bzw. gestörte Wasserzufuhr). Reset bei <code>barrelFull:yes</code> oder <code>raining:yes</code>.</li>
