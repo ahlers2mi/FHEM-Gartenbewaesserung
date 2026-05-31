@@ -444,6 +444,7 @@ get Garten validate
 
 | Version | Datum | Änderungen |
 |---|---|---|
+| **1.0.26** | 2026-05-31 | Fix: Kein automatisches Fass-Nachfüllen mehr, wenn das Fass durch die IBC-Befüllung leergelaufen ist. Bisher startete direkt nach der IBC-Befüllung das Auffüllen der Regentonne (Rückpumpen aus dem IBC bzw. Hauswasser) — ein Pendeln Fass↔IBC. Die Regentonne füllt sich jetzt von selbst über den Regen; die IBC-Befüllung setzt erst fort, wenn der Fass-voll-Sensor wieder anschlägt. |
 | **1.0.25** | 2026-05-25 | Neu: Attribut `barrelFillTimeout` — Watchdog für Fass-Befüllung. Schlägt `barrelFullSensorDevice` nicht innerhalb der konfigurierten Minuten an, wird `barrelFillTimeoutAlert` auf `yes` gesetzt (IBC leer oder Wasserzufuhr gestört). Reset automatisch bei `barrelFull:yes` oder `raining:yes`. |
 | **1.0.24** | 2026-05-25 | Fix: Pumpen-Watchdog wird auch im manuellen Ventilmodus (`set startValve N`) gestartet. `stopValve` stoppt den Watchdog, damit kein verwaister `PumpOverrun`-Timer feuert. |
 | **1.0.23** | 2026-05-24 | Fix: Pumpen-Watchdog wird bei Bewässerungs-/Kreis-Pausen korrekt gestoppt und beim Resume mit voller Laufzeit neu gestartet. Konsistentes Watchdog-Handling in `barrelEmpty`-Refill-Pausen. |

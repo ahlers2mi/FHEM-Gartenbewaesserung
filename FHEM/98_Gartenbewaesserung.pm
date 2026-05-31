@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.25 - 2026-05-25
+#     Version 1.0.26 - 2026-05-31
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,8 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.26 - 2026-05-31  Fix: Kein automatisches Fass-Nachfuellen mehr, wenn das Fass durch die IBC-Befuellung
+#                      geleert wurde - verhindert Pendeln Fass<->IBC (Wasser wurde sofort zurueckgepumpt)
 # 1.0.25 - 2026-05-25  Neu: Attribut barrelFillTimeout (Minuten, 0=aus) - Watchdog erkennt blockierte Fass-Befuellung
 #                      Neu: Reading barrelFillTimeoutAlert (yes/no) - wird gesetzt wenn barrelFull nicht rechtzeitig kommt
 #                      Neu: Alert wird automatisch zurueckgesetzt bei barrelFull:yes oder raining:yes
@@ -132,7 +134,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.25';
+    $hash->{VERSION}    = '1.0.26';
 
     my $name = $a[0];
 
@@ -2908,10 +2910,18 @@ sub Gartenbewaesserung_HandleBarrelEmpty {
         Log3 $name, 3, "$name: Pump switched off (barrel empty)";
     }
 
-    # Stop IBC filling if active (pump was running barrel→IBC and emptied the barrel)
+    # Stop IBC filling if active (pump was running barrel→IBC and emptied the barrel).
+    # In this case we must NOT auto-refill the barrel: the barrel ran empty because
+    # we deliberately pumped its (rain)water into the IBC. Refilling from the IBC
+    # would immediately pump the water back (barrel<->IBC oscillation), and topping
+    # up from city water right after rain wastes water. The barrel refills from rain
+    # on its own; CheckRain resumes IBC filling once barrelFull reports full again.
     if($hash->{HELPER}{ibcFilling}) {
-        Log3 $name, 3, "$name: Stopping IBC fill before barrel empty refill (barrel was emptied during IBC fill)";
+        Log3 $name, 3, "$name: Stopping IBC fill (barrel was emptied during IBC fill)";
         Gartenbewaesserung_StopIBCFill($hash);
+        Log3 $name, 3, "$name: Barrel emptied by IBC fill - skipping automatic refill (avoids barrel<->IBC oscillation)";
+        readingsSingleUpdate($hash, "state", "idle", 1);
+        return;
     }
 
     # If watering or circuit mode is active, stop all operations
@@ -3694,7 +3704,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
 <h3>Gartenbewaesserung</h3>
 <ul>
     <p>FHEM Modul für intelligente Gartenbewässerung mit bis zu 8 Ventilen, Regenwasserfass und IBC-Container.</p>
-    <p><b>Version: 1.0.25</b></p>
+    <p><b>Version: 1.0.26</b></p>
 
     <h4>Features</h4>
     <ul>
@@ -3722,6 +3732,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
 
     <h4>Versionshistorie</h4>
     <ul>
+        <li><b>1.0.26</b> (2026-05-31): Fix: Kein automatisches Fass-Nachfüllen mehr, wenn das Fass durch die IBC-Befüllung geleert wurde. Bisher wurde direkt nach der IBC-Befüllung das Fass wieder aufgefüllt (aus dem IBC zurückgepumpt oder per Hauswasser) – das führte zu einem Pendeln Fass&lt;-&gt;IBC. Das Fass füllt sich nun von selbst über den Regen wieder auf; die IBC-Befüllung setzt erst fort, wenn der Fass-voll-Sensor erneut anschlägt.</li>
         <li><b>1.0.25</b> (2026-05-25): Neu: Attribut <code>barrelFillTimeout</code> – Watchdog für Fass-Befüllung. Schlägt nicht der <code>barrelFullSensorDevice</code> innerhalb der konfigurierten Minuten an, wird Reading <code>barrelFillTimeoutAlert</code> auf <code>yes</code> gesetzt (Hinweis auf leeren IBC bzw. gestörte Wasserzufuhr). Reset bei <code>barrelFull:yes</code> oder <code>raining:yes</code>.</li>
         <li><b>1.0.24</b> (2026-05-25): Fix: Pumpen-Watchdog wird auch im manuellen Ventilmodus (<code>set valve N</code>) gestartet; <code>StopCurrentValve</code> stoppt den Watchdog, damit kein verwaister <code>PumpOverrun</code>-Timer feuert</li>
         <li><b>1.0.23</b> (2026-05-24): Fix: Pumpen-Watchdog wird bei Bewässerungs-/Kreis-Pausen gestoppt und beim Resume mit voller Laufzeit neu gestartet; konsistentes Watchdog-Handling in barrelEmpty-Refill-Pausen</li>
