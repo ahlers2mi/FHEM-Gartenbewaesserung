@@ -12,11 +12,14 @@
 ##############################################################################
 #
 # Versionshistorie:
-# 1.0.29 - 2026-06-04  Fix: Bewaesserungs-/Circuit-Start bei leerem Fass stoesst jetzt automatisch das Nachfuellen
-#                      aus dem IBC (bzw. Hauswasser) an, statt nur abzubrechen. Bisher wurde der Refill nur beim
-#                      Flankenwechsel des Fass-leer-Sensors gestartet; blieb barrelEmpty dauerhaft 'yes', haengte das
-#                      System trotz vorhandenem IBC-Wasser dauerhaft in 'stopped - barrel empty'. Die unterbrochene
-#                      Operation wird nach dem Refill ueber die bestehende Resume-Logik fortgesetzt.
+# 1.0.29 - 2026-06-04  Fix: Wird tatsaechlich bewaessert (RunCircuit / OpenValve), stoesst ein leeres Fass jetzt
+#                      automatisch das Nachfuellen aus dem IBC (bzw. Hauswasser) an, statt nur abzubrechen. Bisher
+#                      wurde der Refill nur beim Flankenwechsel des Fass-leer-Sensors gestartet; blieb barrelEmpty
+#                      dauerhaft 'yes', haengte das System trotz vorhandenem IBC-Wasser dauerhaft in
+#                      'stopped - barrel empty'. Die unterbrochene Operation wird nach dem Refill ueber die bestehende
+#                      Resume-Logik fortgesetzt. Nur-bei-Bedarf: StartWatering fuellt NICHT vor dem Feuchte-Check nach
+#                      (kein Nachfuellen, wenn der Boden ohnehin feucht genug ist), und die regengesteuerte
+#                      IBC-Befuellung loest weiterhin kein Fass-Nachfuellen aus (Oszillationsschutz bleibt erhalten).
 # 1.0.28 - 2026-05-31  Fix: Pumpen-Watchdog wird beim Ausschalten der Pumpe in SwitchDevice zuverlaessig gestoppt
 #                      (vorher abhaengig vom noch nicht aktualisierten Geraete-Reading) - behebt falschen
 #                      pumpOverrunAlert nach FinishWatering/FinishCircuit und waehrend FillBarrel
@@ -1913,13 +1916,6 @@ sub Gartenbewaesserung_StartWatering {
     my $name = $hash->{NAME};
 
     return "Watering disabled" if(IsDisabled($name));
-
-    # Check if barrel is empty - skip watering, but try to refill the barrel first
-    if(ReadingsVal($name, "barrelEmpty", "no") eq "yes") {
-        Log3 $name, 3, "$name: Watering skipped - barrel is empty";
-        Gartenbewaesserung_TriggerBarrelRefillIfPossible($hash);
-        return "Barrel is empty - watering cannot be started";
-    }
 
     # Check moisture if sensor configured
     my $moistureSensorDef = AttrVal($name, "moistureSensorDevice", "");
