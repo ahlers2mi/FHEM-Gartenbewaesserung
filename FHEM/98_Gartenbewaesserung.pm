@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.28 - 2026-05-31
+#     Version 1.0.29 - 2026-06-04
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,11 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.29 - 2026-06-04  Fix: Bewaesserungs-/Circuit-Start bei leerem Fass stoesst jetzt automatisch das Nachfuellen
+#                      aus dem IBC (bzw. Hauswasser) an, statt nur abzubrechen. Bisher wurde der Refill nur beim
+#                      Flankenwechsel des Fass-leer-Sensors gestartet; blieb barrelEmpty dauerhaft 'yes', haengte das
+#                      System trotz vorhandenem IBC-Wasser dauerhaft in 'stopped - barrel empty'. Die unterbrochene
+#                      Operation wird nach dem Refill ueber die bestehende Resume-Logik fortgesetzt.
 # 1.0.28 - 2026-05-31  Fix: Pumpen-Watchdog wird beim Ausschalten der Pumpe in SwitchDevice zuverlaessig gestoppt
 #                      (vorher abhaengig vom noch nicht aktualisierten Geraete-Reading) - behebt falschen
 #                      pumpOverrunAlert nach FinishWatering/FinishCircuit und waehrend FillBarrel
@@ -140,7 +145,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.28';
+    $hash->{VERSION}    = '1.0.29';
 
     my $name = $a[0];
 
@@ -1594,10 +1599,11 @@ sub Gartenbewaesserung_RunCircuit {
     # Make sure IBC valve is closed
     Gartenbewaesserung_StopIBCFill($hash);
 
-    # Check if barrel is empty - do not run pump
+    # Check if barrel is empty - do not run pump, but try to refill it first
     if(ReadingsVal($name, "barrelEmpty", "no") eq "yes") {
         Log3 $name, 3, "$name: Cannot start circuit $circuitNum - barrel is empty";
-        readingsSingleUpdate($hash, "state", "stopped - barrel empty", 1);
+        my $refilling = Gartenbewaesserung_TriggerBarrelRefillIfPossible($hash);
+        readingsSingleUpdate($hash, "state", "stopped - barrel empty", 1) if(!$refilling);
         return;
     }
 
@@ -1908,9 +1914,10 @@ sub Gartenbewaesserung_StartWatering {
 
     return "Watering disabled" if(IsDisabled($name));
 
-    # Check if barrel is empty
+    # Check if barrel is empty - skip watering, but try to refill the barrel first
     if(ReadingsVal($name, "barrelEmpty", "no") eq "yes") {
         Log3 $name, 3, "$name: Watering skipped - barrel is empty";
+        Gartenbewaesserung_TriggerBarrelRefillIfPossible($hash);
         return "Barrel is empty - watering cannot be started";
     }
 
@@ -2244,10 +2251,11 @@ sub Gartenbewaesserung_OpenValve {
     # Make sure IBC valve is closed during watering
     Gartenbewaesserung_StopIBCFill($hash);
 
-    # Check if barrel is empty - do not run pump
+    # Check if barrel is empty - do not run pump, but try to refill it first
     if(ReadingsVal($name, "barrelEmpty", "no") eq "yes") {
         Log3 $name, 3, "$name: Cannot open valve $valveNum - barrel is empty";
-        readingsSingleUpdate($hash, "state", "stopped - barrel empty", 1);
+        my $refilling = Gartenbewaesserung_TriggerBarrelRefillIfPossible($hash);
+        readingsSingleUpdate($hash, "state", "stopped - barrel empty", 1) if(!$refilling);
         return;
     }
 
@@ -2899,6 +2907,28 @@ sub Gartenbewaesserung_EndBarrelEmptyRefillPause {
     if($hash->{HELPER}{barrelEmptyResumePending}) {
         Gartenbewaesserung_ResumeAfterBarrelEmpty($hash);
     }
+}
+
+##############################################################################
+# Trigger an automatic barrel refill when a watering/circuit request hits an
+# empty barrel. Without this, such a request would only abort (return) and the
+# barrel would never be refilled until the barrel-empty sensor toggles again -
+# i.e. the system could stay stuck in "stopped - barrel empty" indefinitely
+# even though the IBC still has water. Reuses HandleBarrelEmpty, which saves the
+# resume context and continues the interrupted operation once the barrel is full.
+# Returns 1 if a refill was (or already is) running, 0 otherwise.
+##############################################################################
+sub Gartenbewaesserung_TriggerBarrelRefillIfPossible {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    # A refill is already running - let it finish, do not restart it.
+    return 1 if($hash->{HELPER}{barrelEmptyRefilling});
+
+    Log3 $name, 3, "$name: Barrel empty on watering request - triggering automatic refill";
+    Gartenbewaesserung_HandleBarrelEmpty($hash);
+
+    return $hash->{HELPER}{barrelEmptyRefilling} ? 1 : 0;
 }
 
 ##############################################################################
