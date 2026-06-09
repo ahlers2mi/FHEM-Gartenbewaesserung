@@ -15,9 +15,10 @@
 # 1.0.30 - 2026-06-09  Neu: Loop-Breaker gegen endloses Nachfuell<->Leerlauf-Pendeln. Laeuft das Fass trotz
 #                      wiederholtem Nachfuellen binnen Sekunden wieder leer (z.B. IBC leer und keine Hauswasser-
 #                      Reserve), bricht das Modul nach barrelEmptyMaxRefillAttempts Versuchen (Default 3) ab,
-#                      State 'stopped - no water'. Automatischer Neustart sobald wieder Wasser da ist:
-#                      barrelFull, ibcEmpty:no (IBC hat Wasser) oder Regen. Neues Attribut barrelEmptyMaxRefillAttempts
-#                      (0 = aus = altes Verhalten).
+#                      State 'stopped - no water'. Automatischer Neustart sobald wieder Wasser gemeldet wird:
+#                      barrelFull (massgebliches Signal) oder ibcEmpty:no (IBC hat Wasser). Regen allein zaehlt
+#                      bewusst nicht (Nieselregen fuellt das Fass nicht; fuellt Regen es, meldet das der Fass-voll-
+#                      Sensor). Neues Attribut barrelEmptyMaxRefillAttempts (0 = aus = altes Verhalten).
 # 1.0.29 - 2026-06-04  Fix: Wird tatsaechlich bewaessert (RunCircuit / OpenValve), stoesst ein leeres Fass jetzt
 #                      automatisch das Nachfuellen aus dem IBC (bzw. Hauswasser) an, statt nur abzubrechen. Bisher
 #                      wurde der Refill nur beim Flankenwechsel des Fass-leer-Sensors gestartet; blieb barrelEmpty
@@ -485,8 +486,6 @@ sub Gartenbewaesserung_Notify {
                         Log3 $name, 3, "$name: Rain detected, clearing barrelFillTimeoutAlert";
                     }
                     Log3 $name, 4, "$name: Rain sensor active (event), triggering CheckRain immediately";
-                    # Rain will refill the barrel/IBC -> recover from a no-water abort if active
-                    Gartenbewaesserung_RecoverFromNoWater($hash, 0);
                     # Remove pending timer and run CheckRain right now
                     RemoveInternalTimer($hash, "Gartenbewaesserung_CheckRain");
                     Gartenbewaesserung_CheckRain($hash);
@@ -2990,8 +2989,10 @@ sub Gartenbewaesserung_AbortNoWater {
 }
 
 ##############################################################################
-# Recover from a no-water abort once a water source reports water again
-# (barrel full, IBC no longer empty, or rain). Resumes the saved operation.
+# Recover from a no-water abort once a water source reports water again:
+# barrel full (the authoritative signal when barrelFullSensorDevice exists) or
+# IBC no longer empty. Rain alone is NOT used - light drizzle does not actually
+# refill the barrel; if rain fills it, the barrel-full sensor reports it anyway.
 # No-op unless a no-water abort is currently active.
 ##############################################################################
 sub Gartenbewaesserung_RecoverFromNoWater {
@@ -4154,8 +4155,10 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             bricht das Modul nach so vielen erfolglosen Versuchen ab und geht in den State
             <code>stopped - no water</code> (statt Pumpe/Ventile endlos zu takten).
             Automatischer Neustart der unterbrochenen Bewässerung, sobald wieder Wasser gemeldet wird:
-            <code>barrelFull:yes</code>, <code>ibcEmpty:no</code> (IBC hat wieder Wasser) oder
-            <code>raining:yes</code>. 0 = deaktiviert (altes Verhalten, endlose Versuche).
+            <code>barrelFull:yes</code> (maßgebliches Signal bei konfiguriertem
+            <code>barrelFullSensorDevice</code>) oder <code>ibcEmpty:no</code> (IBC hat wieder Wasser).
+            Regen allein zählt bewusst nicht — Nieselregen füllt das Fass nicht; füllt Regen es, meldet
+            das ohnehin der Fass-voll-Sensor. 0 = deaktiviert (altes Verhalten, endlose Versuche).
         </li>
 
         <p><b>Zeitplan-Attribute</b></p>
