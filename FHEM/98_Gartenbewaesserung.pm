@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.29 - 2026-06-04
+#     Version 1.0.30 - 2026-06-09
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,12 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.30 - 2026-06-09  Neu: Loop-Breaker gegen endloses Nachfuell<->Leerlauf-Pendeln. Laeuft das Fass trotz
+#                      wiederholtem Nachfuellen binnen Sekunden wieder leer (z.B. IBC leer und keine Hauswasser-
+#                      Reserve), bricht das Modul nach barrelEmptyMaxRefillAttempts Versuchen (Default 3) ab,
+#                      State 'stopped - no water'. Automatischer Neustart sobald wieder Wasser da ist:
+#                      barrelFull, ibcEmpty:no (IBC hat Wasser) oder Regen. Neues Attribut barrelEmptyMaxRefillAttempts
+#                      (0 = aus = altes Verhalten).
 # 1.0.29 - 2026-06-04  Fix: Wird tatsaechlich bewaessert (RunCircuit / OpenValve), stoesst ein leeres Fass jetzt
 #                      automatisch das Nachfuellen aus dem IBC (bzw. Hauswasser) an, statt nur abzubrechen. Bisher
 #                      wurde der Refill nur beim Flankenwechsel des Fass-leer-Sensors gestartet; blieb barrelEmpty
@@ -127,6 +133,7 @@ sub Gartenbewaesserung_Initialize {
         "pumpStartDelay:slider,-30,1,30 " .
         "pumpMaxRuntime:slider,0,1,240 " .
         "barrelFillTimeout:slider,0,1,120 " .
+        "barrelEmptyMaxRefillAttempts:slider,0,1,10 " .
         "activeValves:textField " .
         "weekdaysOnly:0,1 " .
         "manualMode:0,1 " .
@@ -148,7 +155,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.29';
+    $hash->{VERSION}    = '1.0.30';
 
     my $name = $a[0];
 
@@ -385,6 +392,8 @@ sub Gartenbewaesserung_Notify {
                         Gartenbewaesserung_StopBarrelEmptyRefillPause($hash);
                         Gartenbewaesserung_ResumeAfterBarrelEmpty($hash);
                     }
+                    # Recover from a no-water abort: the barrel is physically full again
+                    Gartenbewaesserung_RecoverFromNoWater($hash, 1);
                 }
                 elsif(Gartenbewaesserung_CheckSensorInactive($name, $event, $barrelReading,
                       AttrVal($name, "barrelFullSensorInactiveValue", ""))) {
@@ -424,6 +433,8 @@ sub Gartenbewaesserung_Notify {
                 elsif(Gartenbewaesserung_CheckSensorInactive($name, $event, $ibcEmptyReading,
                       AttrVal($name, "ibcEmptySensorInactiveValue", ""))) {
                     readingsSingleUpdate($hash, "ibcEmpty", "no", 1);
+                    # IBC has water again -> recover from a no-water abort if active
+                    Gartenbewaesserung_RecoverFromNoWater($hash, 0);
                 }
             }
         }
@@ -447,7 +458,7 @@ sub Gartenbewaesserung_Notify {
                         Log3 $name, 3, "$name: barrelEmpty inactive during refill - letting timer/sensor finish the refill";
                         readingsSingleUpdate($hash, "barrelEmpty", "no", 1);
                     }
-                    elsif($resumePending) {
+                    elsif($resumePending && !$hash->{HELPER}{noWaterAbort}) {
                         Log3 $name, 3, "$name: Barrel no longer empty, starting refill pause before resuming";
                         readingsSingleUpdate($hash, "barrelEmpty", "no", 1);
                         Gartenbewaesserung_StartBarrelEmptyRefillPause($hash);
@@ -474,6 +485,8 @@ sub Gartenbewaesserung_Notify {
                         Log3 $name, 3, "$name: Rain detected, clearing barrelFillTimeoutAlert";
                     }
                     Log3 $name, 4, "$name: Rain sensor active (event), triggering CheckRain immediately";
+                    # Rain will refill the barrel/IBC -> recover from a no-water abort if active
+                    Gartenbewaesserung_RecoverFromNoWater($hash, 0);
                     # Remove pending timer and run CheckRain right now
                     RemoveInternalTimer($hash, "Gartenbewaesserung_CheckRain");
                     Gartenbewaesserung_CheckRain($hash);
@@ -1492,6 +1505,11 @@ sub Gartenbewaesserung_StartCircuit {
     $hash->{HELPER}{circuitStartTime} = time();  # Track start time for pauses
     delete $hash->{HELPER}{valveRemainingTime};  # Clear any leftover remaining time
 
+    # Fresh run -> reset the no-water loop-breaker state
+    $hash->{HELPER}{barrelEmptyRefillAttempts} = 0;
+    delete $hash->{HELPER}{lastWateringStart};
+    delete $hash->{HELPER}{noWaterAbort};
+
     # Make absolutely sure IBC fill is stopped
     Gartenbewaesserung_StopIBCFill($hash);
 
@@ -1606,9 +1624,13 @@ sub Gartenbewaesserung_RunCircuit {
     if(ReadingsVal($name, "barrelEmpty", "no") eq "yes") {
         Log3 $name, 3, "$name: Cannot start circuit $circuitNum - barrel is empty";
         my $refilling = Gartenbewaesserung_TriggerBarrelRefillIfPossible($hash);
-        readingsSingleUpdate($hash, "state", "stopped - barrel empty", 1) if(!$refilling);
+        readingsSingleUpdate($hash, "state", "stopped - barrel empty", 1)
+            if(!$refilling && !$hash->{HELPER}{noWaterAbort});
         return;
     }
+
+    # Mark the start of actual watering (used by the no-water loop-breaker)
+    $hash->{HELPER}{lastWateringStart} = time();
 
     # Check if pause is needed DURING this circuit run
     my $pauseInterval = AttrVal($name, "wateringPauseInterval", 8);
@@ -1896,6 +1918,11 @@ sub Gartenbewaesserung_FinishCircuit {
     delete $hash->{HELPER}{lastPauseEnd};
     delete $hash->{HELPER}{valveRemainingTime};
 
+    # Circuit completed normally -> reset the no-water loop-breaker state
+    $hash->{HELPER}{barrelEmptyRefillAttempts} = 0;
+    delete $hash->{HELPER}{lastWateringStart};
+    delete $hash->{HELPER}{noWaterAbort};
+
     Gartenbewaesserung_ClearEndTime($hash);
 
     readingsBeginUpdate($hash);
@@ -1954,6 +1981,11 @@ sub Gartenbewaesserung_StartWatering {
     $hash->{HELPER}{watering} = 1;
     $hash->{HELPER}{wateringStartTime} = time();  # Track start time for pauses
     delete $hash->{HELPER}{valveRemainingTime};   # Clear any leftover remaining time
+
+    # Fresh run -> reset the no-water loop-breaker state
+    $hash->{HELPER}{barrelEmptyRefillAttempts} = 0;
+    delete $hash->{HELPER}{lastWateringStart};
+    delete $hash->{HELPER}{noWaterAbort};
 
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "pumpOverrunAlert", "no");
@@ -2251,9 +2283,13 @@ sub Gartenbewaesserung_OpenValve {
     if(ReadingsVal($name, "barrelEmpty", "no") eq "yes") {
         Log3 $name, 3, "$name: Cannot open valve $valveNum - barrel is empty";
         my $refilling = Gartenbewaesserung_TriggerBarrelRefillIfPossible($hash);
-        readingsSingleUpdate($hash, "state", "stopped - barrel empty", 1) if(!$refilling);
+        readingsSingleUpdate($hash, "state", "stopped - barrel empty", 1)
+            if(!$refilling && !$hash->{HELPER}{noWaterAbort});
         return;
     }
+
+    # Mark the start of actual watering (used by the no-water loop-breaker)
+    $hash->{HELPER}{lastWateringStart} = time();
 
     # Check if pause is needed DURING this valve
     my $pauseInterval = AttrVal($name, "wateringPauseInterval", 8);
@@ -2928,6 +2964,66 @@ sub Gartenbewaesserung_TriggerBarrelRefillIfPossible {
 }
 
 ##############################################################################
+# Abort watering/circuit when the barrel cannot be refilled (no water source).
+# Stops everything, keeps the resume context, and waits for water to return
+# (handled by RecoverFromNoWater). Prevents endless refill<->drain cycling.
+##############################################################################
+sub Gartenbewaesserung_AbortNoWater {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    Log3 $name, 1, "$name: WARNUNG - Fass bleibt trotz wiederholtem Nachfuellen leer " .
+        "(IBC leer oder Wasserzufuhr gestoert). Bewaesserung abgebrochen, warte auf Wasser.";
+
+    # Remember what we were doing so we can auto-resume once water returns
+    Gartenbewaesserung_SaveBarrelEmptyResumeContext($hash);
+
+    Gartenbewaesserung_StopAll($hash, { preserveBarrelEmptyResume => 1 });
+
+    $hash->{HELPER}{noWaterAbort} = 1;
+
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, "state", "stopped - no water");
+    readingsBulkUpdate($hash, "phase", "waiting for water");
+    readingsBulkUpdate($hash, "barrelFillTimeoutAlert", "yes");
+    readingsEndUpdate($hash, 1);
+}
+
+##############################################################################
+# Recover from a no-water abort once a water source reports water again
+# (barrel full, IBC no longer empty, or rain). Resumes the saved operation.
+# No-op unless a no-water abort is currently active.
+##############################################################################
+sub Gartenbewaesserung_RecoverFromNoWater {
+    my ($hash, $barrelFull) = @_;
+    my $name = $hash->{NAME};
+
+    return if(!$hash->{HELPER}{noWaterAbort});
+
+    Log3 $name, 3, "$name: Water source available again - clearing no-water abort";
+    delete $hash->{HELPER}{noWaterAbort};
+    $hash->{HELPER}{barrelEmptyRefillAttempts} = 0;
+    delete $hash->{HELPER}{lastWateringStart};
+
+    if(ReadingsVal($name, "barrelFillTimeoutAlert", "no") ne "no") {
+        readingsSingleUpdate($hash, "barrelFillTimeoutAlert", "no", 1);
+    }
+
+    return if(!$hash->{HELPER}{barrelEmptyResumePending});
+
+    if($barrelFull || ReadingsVal($name, "barrelEmpty", "no") ne "yes") {
+        # Barrel already holds water -> resume the interrupted operation directly
+        readingsSingleUpdate($hash, "barrelEmpty", "no", 1) if($barrelFull);
+        Gartenbewaesserung_ResumeAfterBarrelEmpty($hash);
+    }
+    else {
+        # Source has water but barrel is still empty -> start one refill,
+        # which resumes the operation once the barrel is full again
+        Gartenbewaesserung_HandleBarrelEmpty($hash);
+    }
+}
+
+##############################################################################
 # Handle barrel empty: stop pump and all active watering immediately
 ##############################################################################
 sub Gartenbewaesserung_HandleBarrelEmpty {
@@ -2964,6 +3060,32 @@ sub Gartenbewaesserung_HandleBarrelEmpty {
         Log3 $name, 3, "$name: Barrel emptied by IBC fill - skipping automatic refill (avoids barrel<->IBC oscillation)";
         readingsSingleUpdate($hash, "state", "idle", 1);
         return;
+    }
+
+    # Loop-breaker: if the barrel keeps running empty within seconds of resuming,
+    # the configured water source cannot actually refill it (e.g. IBC empty and no
+    # mains fallback). Abort after a few unproductive attempts instead of cycling
+    # the pump forever; auto-recovers once a water source reports water again.
+    my $maxAttempts = AttrVal($name, "barrelEmptyMaxRefillAttempts", 3);
+    if($maxAttempts > 0 && ($hash->{HELPER}{watering} || $hash->{HELPER}{circuitMode})) {
+        my $unproductive = (defined($hash->{HELPER}{lastWateringStart})
+            && (time() - $hash->{HELPER}{lastWateringStart}) < 60) ? 1 : 0;
+
+        if($unproductive) {
+            $hash->{HELPER}{barrelEmptyRefillAttempts} =
+                ($hash->{HELPER}{barrelEmptyRefillAttempts} || 0) + 1;
+            Log3 $name, 3, "$name: Barrel ran empty again within seconds of resuming " .
+                "(attempt $hash->{HELPER}{barrelEmptyRefillAttempts}/$maxAttempts)";
+        }
+        else {
+            # Barrel held water long enough for real watering -> refills are working
+            $hash->{HELPER}{barrelEmptyRefillAttempts} = 0;
+        }
+
+        if($hash->{HELPER}{barrelEmptyRefillAttempts} >= $maxAttempts) {
+            Gartenbewaesserung_AbortNoWater($hash);
+            return;
+        }
     }
 
     # If watering or circuit mode is active, stop all operations
@@ -3147,6 +3269,11 @@ sub Gartenbewaesserung_FinishWatering {
     delete $hash->{HELPER}{valveRemainingTime};
     delete $hash->{HELPER}{pausedValve};
     delete $hash->{HELPER}{valveCloseTimer};
+
+    # Cycle completed normally -> reset the no-water loop-breaker state
+    $hash->{HELPER}{barrelEmptyRefillAttempts} = 0;
+    delete $hash->{HELPER}{lastWateringStart};
+    delete $hash->{HELPER}{noWaterAbort};
 
     Gartenbewaesserung_ClearEndTime($hash);
     Gartenbewaesserung_ClearPauseTime($hash);
@@ -4016,6 +4143,19 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Typischer Indikator: IBC leer oder Wasserzufuhr unterbrochen.
             0 = deaktiviert. Voraussetzung: <code>barrelFullSensorDevice</code> ist konfiguriert.
             Reset des Alerts bei <code>barrelFull:yes</code> oder <code>raining:yes</code>.
+        </li>
+
+        <li><a id="Gartenbewaesserung-attr-barrelEmptyMaxRefillAttempts"></a>
+            <b>barrelEmptyMaxRefillAttempts</b><br>
+            Typ: Slider (0–10). Standardwert: 3.<br>
+            Loop-Breaker gegen endloses Nachfüll&lt;-&gt;Leerlauf-Pendeln: Läuft das Fass während
+            einer Bewässerung trotz wiederholtem Nachfüllen binnen Sekunden immer wieder leer
+            (typisch: IBC leer und keine Hauswasser-Reserve über <code>barrelFillValveDevice</code>),
+            bricht das Modul nach so vielen erfolglosen Versuchen ab und geht in den State
+            <code>stopped - no water</code> (statt Pumpe/Ventile endlos zu takten).
+            Automatischer Neustart der unterbrochenen Bewässerung, sobald wieder Wasser gemeldet wird:
+            <code>barrelFull:yes</code>, <code>ibcEmpty:no</code> (IBC hat wieder Wasser) oder
+            <code>raining:yes</code>. 0 = deaktiviert (altes Verhalten, endlose Versuche).
         </li>
 
         <p><b>Zeitplan-Attribute</b></p>
