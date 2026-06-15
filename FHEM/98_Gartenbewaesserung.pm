@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.31 - 2026-06-09
+#     Version 1.0.32 - 2026-06-15
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,11 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.32 - 2026-06-15  Fix: Reading 'ibcToBarrelActive' blieb beim automatischen Fass-Nachfuellen aus dem IBC
+#                      (HandleBarrelEmpty -> Quelle 'ibc') auf 'no' haengen, obwohl der IBC->Fass-Transfer lief -
+#                      nur das interne HELPER-Flag wurde gesetzt. Jetzt wird das Reading korrekt auf 'yes' gesetzt.
+#                      Fix: StopAll setzt 'ibcToBarrelActive' wieder auf 'no' zurueck (sonst blieb es nach einem
+#                      Not-Stop waehrend des Transfers auf 'yes' haengen).
 # 1.0.31 - 2026-06-09  Neu: Attribut rainSkipsWatering (0/1) - bei Regen wird der geplante Bewaesserungszyklus
 #                      (StartWatering / activeValves) uebersprungen; unabhaengige Kreise via startCircuit
 #                      (z.B. ueberdachtes Gewaechshaus) bleiben unberuehrt. Neu: Kreis-Namen ueber Attribute
@@ -164,7 +169,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.31';
+    $hash->{VERSION}    = '1.0.32';
 
     my $name = $a[0];
 
@@ -3206,7 +3211,10 @@ sub Gartenbewaesserung_HandleBarrelEmpty {
                 Gartenbewaesserung_StopBarrelEmptyRefill($hash);
             }, $hash);
 
-            readingsSingleUpdate($hash, "state", "stopped - barrel empty - refilling", 1);
+            readingsBeginUpdate($hash);
+            readingsBulkUpdate($hash, "ibcToBarrelActive", "yes");
+            readingsBulkUpdate($hash, "state", "stopped - barrel empty - refilling");
+            readingsEndUpdate($hash, 1);
             Log3 $name, 4, "$name: IBC to barrel transfer started for barrel empty refill ($duration min)";
         }
         else {
@@ -3425,6 +3433,7 @@ sub Gartenbewaesserung_StopAll {
     readingsBulkUpdate($hash, "currentValve", "none");
     readingsBulkUpdate($hash, "currentValveName", "none");
     readingsBulkUpdate($hash, "pauseActive", "no");
+    readingsBulkUpdate($hash, "ibcToBarrelActive", "no");
     readingsEndUpdate($hash, 1);
 
     Log3 $name, 3, "$name: All operations stopped";
