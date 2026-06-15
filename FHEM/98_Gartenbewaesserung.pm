@@ -15,8 +15,8 @@
 # 1.0.32 - 2026-06-15  Fix: Reading 'ibcToBarrelActive' blieb beim automatischen Fass-Nachfuellen aus dem IBC
 #                      (HandleBarrelEmpty -> Quelle 'ibc') auf 'no' haengen, obwohl der IBC->Fass-Transfer lief -
 #                      nur das interne HELPER-Flag wurde gesetzt. Jetzt wird das Reading korrekt auf 'yes' gesetzt.
-#                      Fix: StopAll setzt 'ibcToBarrelActive' wieder auf 'no' zurueck (sonst blieb es nach einem
-#                      Not-Stop waehrend des Transfers auf 'yes' haengen).
+#                      Fix: StopAll setzt 'ibcToBarrelActive' und 'ibcFilling' wieder auf 'no' zurueck (sonst blieben
+#                      diese Readings nach einem Not-Stop waehrend Transfer/IBC-Befuellung auf 'yes' haengen).
 # 1.0.31 - 2026-06-09  Neu: Attribut rainSkipsWatering (0/1) - bei Regen wird der geplante Bewaesserungszyklus
 #                      (StartWatering / activeValves) uebersprungen; unabhaengige Kreise via startCircuit
 #                      (z.B. ueberdachtes Gewaechshaus) bleiben unberuehrt. Neu: Kreis-Namen ueber Attribute
@@ -3434,6 +3434,7 @@ sub Gartenbewaesserung_StopAll {
     readingsBulkUpdate($hash, "currentValveName", "none");
     readingsBulkUpdate($hash, "pauseActive", "no");
     readingsBulkUpdate($hash, "ibcToBarrelActive", "no");
+    readingsBulkUpdate($hash, "ibcFilling", "no");
     readingsEndUpdate($hash, 1);
 
     Log3 $name, 3, "$name: All operations stopped";
