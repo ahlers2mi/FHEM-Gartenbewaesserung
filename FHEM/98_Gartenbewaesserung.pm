@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.32 - 2026-06-15
+#     Version 1.0.33 - 2026-07-26
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,17 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.33 - 2026-07-26  Neu: Regenmengen-Integration (mm) ueber eine Wetterstation mit Regenmesser.
+#                      Neues Attribut rainAmountDevice (Device:Reading, z.B. MQTT2_xxx:dailyrain_mm) plus
+#                      rainAmountReading und rainAmountWindow (gleitendes Fenster in Stunden, Default 24).
+#                      Das Modul summiert die Regenmenge selbst gleitend auf (reset-fest gegen den taeglichen
+#                      Nullstellen der Station) -> Reading rainAmount_mm. Neu: rainSkipsWateringAmount (mm) -
+#                      ist im Fenster mind. so viel Regen gefallen, wird der geplante Zyklus uebersprungen
+#                      (state 'skipped - enough rain'). Neu: Regenwasser-Sammel-Ueberwachung -
+#                      rainCollectionCheckAmount (mm) + rainCollectionCheckDelay (min): faellt so viel Regen,
+#                      ohne dass Fass/IBC eine Fuellstands-Reaktion zeigen, wird Reading rainCollectionAlert
+#                      auf yes gesetzt (Hinweis auf verstopften Zulauf/Dachrinne/Filter). Readings
+#                      rainAmount_mm, rainSinceFill_mm, rainCollectionAlert.
 # 1.0.32 - 2026-06-15  Fix: Reading 'ibcToBarrelActive' blieb beim automatischen Fass-Nachfuellen aus dem IBC
 #                      (HandleBarrelEmpty -> Quelle 'ibc') auf 'no' haengen, obwohl der IBC->Fass-Transfer lief -
 #                      nur das interne HELPER-Flag wurde gesetzt. Jetzt wird das Reading korrekt auf 'yes' gesetzt.
@@ -143,6 +154,12 @@ sub Gartenbewaesserung_Initialize {
         "startTime1:textField startTime2:textField startTime3:textField " .
         "rainDurationForIBC:slider,5,5,180 " .
         "rainCheckInterval:slider,1,1,30 " .
+        "rainAmountDevice:textField " .
+        "rainAmountReading:textField " .
+        "rainAmountWindow:slider,1,1,72 " .
+        "rainSkipsWateringAmount:slider,0,0.5,50 " .
+        "rainCollectionCheckAmount:slider,0,0.5,50 " .
+        "rainCollectionCheckDelay:slider,5,5,720 " .
         "pumpStartDelay:slider,-30,1,30 " .
         "pumpMaxRuntime:slider,0,1,240 " .
         "barrelFillTimeout:slider,0,1,120 " .
@@ -169,7 +186,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.32';
+    $hash->{VERSION}    = '1.0.33';
 
     my $name = $a[0];
 
@@ -188,6 +205,9 @@ sub Gartenbewaesserung_Define {
     readingsBulkUpdate($hash, "pauseTimeRemaining", "-");
     readingsBulkUpdate($hash, "barrelEmpty", "no");
     readingsBulkUpdate($hash, "barrelFillTimeoutAlert", "no");
+    readingsBulkUpdate($hash, "rainAmount_mm", "0") if(ReadingsVal($name, "rainAmount_mm", "") eq "");
+    readingsBulkUpdate($hash, "rainSinceFill_mm", "0") if(ReadingsVal($name, "rainSinceFill_mm", "") eq "");
+    readingsBulkUpdate($hash, "rainCollectionAlert", "no") if(ReadingsVal($name, "rainCollectionAlert", "") eq "");
     readingsEndUpdate($hash, 1);
 
     # Set default attributes
@@ -206,6 +226,7 @@ sub Gartenbewaesserung_Define {
     $attr{$name}{moistureThreshold} = 40 if(!defined($attr{$name}{moistureThreshold}));
     $attr{$name}{rainDurationForIBC} = 30 if(!defined($attr{$name}{rainDurationForIBC}));
     $attr{$name}{rainCheckInterval} = 5 if(!defined($attr{$name}{rainCheckInterval}));
+    $attr{$name}{rainAmountWindow} = 24 if(!defined($attr{$name}{rainAmountWindow}));
     $attr{$name}{pumpStartDelay} = 3 if(!defined($attr{$name}{pumpStartDelay}));
     $attr{$name}{pumpMaxRuntime} = 0 if(!defined($attr{$name}{pumpMaxRuntime}));
     $attr{$name}{wateringPauseInterval} = 8 if(!defined($attr{$name}{wateringPauseInterval}));
@@ -224,8 +245,10 @@ sub Gartenbewaesserung_Define {
 
     # Read initial sensor values - immediate attempt + retry after 5 seconds
     Gartenbewaesserung_UpdateSensorReadings($hash);
+    Gartenbewaesserung_UpdateRainAmount($hash);
     InternalTimer(gettimeofday() + 5, sub {
         Gartenbewaesserung_UpdateSensorReadings($hash);
+        Gartenbewaesserung_UpdateRainAmount($hash);
     }, $hash);
 
     # Start timer for scheduled watering
@@ -409,6 +432,13 @@ sub Gartenbewaesserung_Notify {
                     }
                     # Recover from a no-water abort: the barrel is physically full again
                     Gartenbewaesserung_RecoverFromNoWater($hash, 1);
+                    # Barrel gained water from rain (not from an IBC->barrel transfer or house-water
+                    # fill) -> the rainwater collection is working
+                    if(ReadingsVal($name, "raining", "no") eq "yes"
+                       && ReadingsVal($name, "ibcToBarrelActive", "no") eq "no"
+                       && ReadingsVal($name, "ibcFilling", "no") eq "no") {
+                        Gartenbewaesserung_RainCollectionSeenFill($hash, "barrelFull (rain)");
+                    }
                 }
                 elsif(Gartenbewaesserung_CheckSensorInactive($name, $event, $barrelReading,
                       AttrVal($name, "barrelFullSensorInactiveValue", ""))) {
@@ -427,6 +457,8 @@ sub Gartenbewaesserung_Notify {
                 if(Gartenbewaesserung_CheckSensorActive($name, $event, $ibcReading, $activeValue)) {
                     readingsSingleUpdate($hash, "ibcFull", "yes", 1);
                     Gartenbewaesserung_CheckIBCFull($hash);
+                    # IBC reported full -> water is being collected
+                    Gartenbewaesserung_RainCollectionSeenFill($hash, "ibcFull");
                 }
                 elsif(Gartenbewaesserung_CheckSensorInactive($name, $event, $ibcReading,
                       AttrVal($name, "ibcFullSensorInactiveValue", ""))) {
@@ -450,6 +482,8 @@ sub Gartenbewaesserung_Notify {
                     readingsSingleUpdate($hash, "ibcEmpty", "no", 1);
                     # IBC has water again -> recover from a no-water abort if active
                     Gartenbewaesserung_RecoverFromNoWater($hash, 0);
+                    # IBC gained water (no longer empty) -> the rainwater collection is working
+                    Gartenbewaesserung_RainCollectionSeenFill($hash, "ibcEmpty:no");
                 }
             }
         }
@@ -525,6 +559,16 @@ sub Gartenbewaesserung_Notify {
                 my $value = $1;
                 readingsSingleUpdate($hash, "soilMoisture", $value, 1);
                 Log3 $name, 4, "$name: Soil moisture updated (event): $value";
+            }
+        }
+
+        # Rain amount (mm) sensor - accumulate rolling window + collection check
+        my $rainAmountDef = AttrVal($name, "rainAmountDevice", "");
+        if($rainAmountDef ne "") {
+            my ($raDev, $raReading) = Gartenbewaesserung_ParseDevice($rainAmountDef);
+            $raReading = AttrVal($name, "rainAmountReading", "dailyrain_mm") if($raReading eq "");
+            if($devName eq $raDev && $event =~ /^$raReading:\s*(.+)$/) {
+                Gartenbewaesserung_UpdateRainAmount($hash);
             }
         }
     }
@@ -745,6 +789,9 @@ sub Gartenbewaesserung_UpdateSensorReadings {
     }
 
     readingsEndUpdate($hash, 1);
+
+    # Refresh rolling rain amount (separate readings transaction)
+    Gartenbewaesserung_UpdateRainAmount($hash);
 }
 
 ##############################################################################
@@ -1990,6 +2037,20 @@ sub Gartenbewaesserung_StartWatering {
         Log3 $name, 3, "$name: Watering skipped - currently raining (rainSkipsWatering)";
         readingsSingleUpdate($hash, "state", "skipped - raining", 1);
         return "Skipped - raining";
+    }
+
+    # Skip the scheduled cycle if enough rain fell within the rolling window (optional).
+    # Uses the accumulated rain amount (mm) from a weather station rain gauge.
+    my $skipAmount = AttrVal($name, "rainSkipsWateringAmount", 0);
+    if($skipAmount > 0 && AttrVal($name, "rainAmountDevice", "") ne "") {
+        Gartenbewaesserung_UpdateRainAmount($hash);   # make sure the value is current
+        my $rainAmount = ReadingsVal($name, "rainAmount_mm", 0);
+        my $windowH = AttrVal($name, "rainAmountWindow", 24);
+        if($rainAmount >= $skipAmount) {
+            Log3 $name, 3, "$name: Watering skipped - ${rainAmount} mm rain in last ${windowH}h (>= ${skipAmount} mm)";
+            readingsSingleUpdate($hash, "state", "skipped - enough rain (${rainAmount} mm)", 1);
+            return "Skipped - enough rain";
+        }
     }
 
     # Check moisture if sensor configured
@@ -3766,6 +3827,161 @@ sub Gartenbewaesserung_StopIBCtoBarrel {
 }
 
 ##############################################################################
+# Rain amount (mm): maintain a rolling-window sum from a weather station rain
+# gauge and feed the rainwater-collection watchdog.
+#
+# The source reading (e.g. dailyrain_mm) is cumulative but resets periodically
+# (midnight / per event). We therefore derive our own monotonic accumulator by
+# adding positive deltas and treating any decrease as a reset (current value =
+# new rain). A small timestamped buffer of accumulator samples lets us subtract
+# the value from "window hours ago" to get the rolling sum.
+##############################################################################
+sub Gartenbewaesserung_UpdateRainAmount {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    my $dev = AttrVal($name, "rainAmountDevice", "");
+    return if($dev eq "");
+
+    my ($rdev, $rreading) = Gartenbewaesserung_ParseDevice($dev);
+    $rreading = AttrVal($name, "rainAmountReading", "dailyrain_mm") if($rreading eq "");
+    return if($rdev eq "" || !defined($defs{$rdev}));
+
+    my $raw = ReadingsVal($rdev, $rreading, "");
+    return if($raw !~ /^-?\d+(?:\.\d+)?$/);   # not a number (yet)
+
+    my $now = time();
+
+    # Derive monotonic accumulator from the (resettable) source reading
+    my $lastRaw = ReadingsVal($name, ".rainLastRaw", "");
+    my $accum   = ReadingsVal($name, ".rainAccum", 0);
+    $accum = 0 if($accum !~ /^-?\d+(?:\.\d+)?$/);
+
+    my $delta = 0;
+    if($lastRaw =~ /^-?\d+(?:\.\d+)?$/) {
+        $delta = ($raw >= $lastRaw) ? ($raw - $lastRaw) : $raw;   # decrease = source reset
+    }
+    # else: first observation -> only establish the baseline (delta stays 0)
+    $accum += $delta;
+
+    # Rolling-window buffer: "epoch:accum,epoch:accum,..."
+    my $windowH = AttrVal($name, "rainAmountWindow", 24);
+    my $cutoff  = $now - $windowH * 3600;
+    my @buf = grep { /^\d+:/ } split(/,/, ReadingsVal($name, ".rainBuffer", ""));
+
+    # Keep the newest sample older than the cutoff (as window baseline) plus all newer ones
+    my ($baseline, @kept);
+    foreach my $s (@buf) {
+        my ($t) = split(/:/, $s);
+        if($t < $cutoff) { $baseline = $s; }
+        else             { push @kept, $s; }
+    }
+    unshift @kept, $baseline if(defined $baseline);
+
+    # Append the current sample, throttled to at most one every 10 minutes
+    my $lastT = @kept ? (split(/:/, $kept[-1]))[0] : 0;
+    push @kept, "$now:$accum" if(!@kept || $now - $lastT >= 600);
+
+    # Window sum = accumulator now - accumulator at start of window
+    my $a0 = @kept ? (split(/:/, $kept[0]))[1] : $accum;
+    my $windowSum = $accum - $a0;
+    $windowSum = 0 if($windowSum < 0);
+
+    # Rain since the tanks last showed a fill response (collection watchdog)
+    my $sinceFill = ReadingsVal($name, "rainSinceFill_mm", 0);
+    $sinceFill = 0 if($sinceFill !~ /^-?\d+(?:\.\d+)?$/);
+    $sinceFill += $delta;
+
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, ".rainLastRaw", $raw);
+    readingsBulkUpdate($hash, ".rainAccum", sprintf("%.2f", $accum));
+    readingsBulkUpdate($hash, ".rainBuffer", join(",", @kept));
+    readingsBulkUpdate($hash, "rainAmount_mm", sprintf("%.2f", $windowSum));
+    readingsBulkUpdate($hash, "rainSinceFill_mm", sprintf("%.2f", $sinceFill));
+    readingsEndUpdate($hash, 1);
+
+    Log3 $name, 5, "$name: rain amount update raw=$raw delta=$delta accum=$accum "
+        . "window(${windowH}h)=$windowSum sinceFill=$sinceFill";
+
+    # Arm the collection watchdog only when fresh rain actually fell
+    Gartenbewaesserung_CheckRainCollection($hash) if($delta > 0);
+}
+
+##############################################################################
+# Rainwater-collection watchdog: if enough rain falls without the barrel/IBC
+# ever showing a fill response, something is wrong with the collection path
+# (gutter, downpipe, diverter, filter). Arms a one-shot verification timer.
+##############################################################################
+sub Gartenbewaesserung_CheckRainCollection {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    my $checkAmount = AttrVal($name, "rainCollectionCheckAmount", 0);
+    return if($checkAmount <= 0);                 # feature disabled
+    return if($hash->{HELPER}{rainCollectionArmed});
+
+    my $sinceFill = ReadingsVal($name, "rainSinceFill_mm", 0);
+    return if($sinceFill < $checkAmount);
+
+    # If the IBC is already full there is no headroom to catch more -> not a fault
+    return if(ReadingsVal($name, "ibcFull", "no") eq "yes");
+
+    $hash->{HELPER}{rainCollectionArmed} = 1;
+    my $delay = AttrVal($name, "rainCollectionCheckDelay", 120) * 60;
+    RemoveInternalTimer($hash, "Gartenbewaesserung_RainCollectionTimeout");
+    InternalTimer(gettimeofday() + $delay, "Gartenbewaesserung_RainCollectionTimeout", $hash);
+    Log3 $name, 4, "$name: rain collection check armed (${sinceFill} mm since last fill), "
+        . "verifying in " . int($delay / 60) . " min";
+}
+
+##############################################################################
+# Verification timer for the collection watchdog. A fill response would have
+# reset rainSinceFill_mm to 0 in the meantime; if it did not, raise the alert.
+##############################################################################
+sub Gartenbewaesserung_RainCollectionTimeout {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    RemoveInternalTimer($hash, "Gartenbewaesserung_RainCollectionTimeout");
+    delete $hash->{HELPER}{rainCollectionArmed};
+
+    my $checkAmount = AttrVal($name, "rainCollectionCheckAmount", 0);
+    return if($checkAmount <= 0);
+
+    my $sinceFill = ReadingsVal($name, "rainSinceFill_mm", 0);
+    if($sinceFill >= $checkAmount && ReadingsVal($name, "ibcFull", "no") ne "yes") {
+        readingsSingleUpdate($hash, "rainCollectionAlert", "yes", 1);
+        Log3 $name, 2, "$name: rain collection ALERT - ${sinceFill} mm rain but no barrel/IBC "
+            . "fill response - check gutter/downpipe/diverter/filter";
+    }
+    else {
+        Log3 $name, 4, "$name: rain collection check passed (sinceFill=${sinceFill} mm)";
+    }
+}
+
+##############################################################################
+# Called when the tanks show that water arrived (barrel/IBC fill response).
+# Resets the collection accumulator and clears the alert.
+##############################################################################
+sub Gartenbewaesserung_RainCollectionSeenFill {
+    my ($hash, $source) = @_;
+    my $name = $hash->{NAME};
+
+    return if(AttrVal($name, "rainCollectionCheckAmount", 0) <= 0);
+
+    delete $hash->{HELPER}{rainCollectionArmed};
+    RemoveInternalTimer($hash, "Gartenbewaesserung_RainCollectionTimeout");
+
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, "rainSinceFill_mm", "0");
+    readingsBulkUpdate($hash, "rainCollectionAlert", "no")
+        if(ReadingsVal($name, "rainCollectionAlert", "no") ne "no");
+    readingsEndUpdate($hash, 1);
+
+    Log3 $name, 4, "$name: fill response seen ($source) - rain collection OK, rainSinceFill reset";
+}
+
+##############################################################################
 # Check for rain and IBC filling opportunity
 ##############################################################################
 sub Gartenbewaesserung_CheckRain {
@@ -3775,6 +3991,9 @@ sub Gartenbewaesserung_CheckRain {
     RemoveInternalTimer($hash, "Gartenbewaesserung_CheckRain");
 
     return if(IsDisabled($name));
+
+    # Keep the rolling rain amount fresh even without sensor events (window slides)
+    Gartenbewaesserung_UpdateRainAmount($hash);
 
     # Do not interrupt a manually started circuit
     if($hash->{HELPER}{manualCircuit}) {
@@ -3896,6 +4115,12 @@ sub Gartenbewaesserung_GetStatus {
     $status .= "Raining: " . ReadingsVal($name, "raining", "not configured") . "\n";
     $status .= "Rain Since: " . ReadingsVal($name, "rainDetectedSince", "never") . "\n";
     $status .= "Soil Moisture: " . ReadingsVal($name, "soilMoisture", "not configured") . "\n";
+    if(AttrVal($name, "rainAmountDevice", "") ne "") {
+        $status .= "Rain Amount (" . AttrVal($name, "rainAmountWindow", 24) . "h): "
+                 . ReadingsVal($name, "rainAmount_mm", "0") . " mm\n";
+        $status .= "Rain Since Fill: " . ReadingsVal($name, "rainSinceFill_mm", "0") . " mm\n";
+        $status .= "Rain Collection Alert: " . ReadingsVal($name, "rainCollectionAlert", "no") . "\n";
+    }
     $status .= "Last Watering: " . ReadingsVal($name, "lastWatering", "never") . "\n";
     $status .= "Last Circuit: " . ReadingsVal($name, "lastCircuitWatering", "never") . "\n";
 
@@ -3916,6 +4141,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         barrelFullSensorDevice barrelEmptySensorDevice
         ibcFullSensorDevice ibcEmptySensorDevice
         rainSensorDevice moistureSensorDevice
+        rainAmountDevice
     );
     
     foreach my $attr (@sensorAttrs) {
@@ -4186,6 +4412,48 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Typ: Slider (1–30 Minuten). Standardwert: 5 Minuten.<br>
             Polling-Intervall des Regen-Check-Timers (Fallback wenn NotifyFn nicht greift).
         </li>
+        <li><a id="Gartenbewaesserung-attr-rainAmountDevice"></a>
+            <b>rainAmountDevice</b><br>
+            Typ: Text (<code>Device:Reading</code>). Regenmenge in mm von einer Wetterstation
+            mit Regenmesser, z.&nbsp;B. <code>MQTT2_B0CBD8D5566F:dailyrain_mm</code>. Der Wert darf
+            periodisch zurückgesetzt werden (Tages-/Ereigniszähler) – das Modul bildet daraus einen
+            eigenen, reset-festen Summenwert. Grundlage für <code>rainSkipsWateringAmount</code> und
+            die Sammel-Überwachung (<code>rainCollectionCheckAmount</code>).
+        </li>
+        <li><a id="Gartenbewaesserung-attr-rainAmountReading"></a>
+            <b>rainAmountReading</b><br>
+            Typ: Text. Reading-Name, falls in <code>rainAmountDevice</code> kein <code>:Reading</code>
+            angegeben ist. Standardwert: <code>dailyrain_mm</code>.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-rainAmountWindow"></a>
+            <b>rainAmountWindow</b><br>
+            Typ: Slider (1–72 Stunden). Standardwert: 24 Stunden.<br>
+            Gleitendes Zeitfenster, über das die Regenmenge (<code>rainAmount_mm</code>) summiert wird.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-rainSkipsWateringAmount"></a>
+            <b>rainSkipsWateringAmount</b><br>
+            Typ: Slider (0–50 mm, Schritt 0.5). Standardwert: 0 (deaktiviert).<br>
+            Ist im Fenster <code>rainAmountWindow</code> mindestens so viel Regen gefallen, wird der
+            geplante Bewässerungszyklus (<code>StartWatering</code>/<code>activeValves</code>)
+            übersprungen (<code>state</code> = <code>skipped - enough rain</code>). Unabhängige Kreise
+            über <code>startCircuit</code> (z.&nbsp;B. Gewächshaus) sind nicht betroffen.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-rainCollectionCheckAmount"></a>
+            <b>rainCollectionCheckAmount</b><br>
+            Typ: Slider (0–50 mm, Schritt 0.5). Standardwert: 0 (deaktiviert).<br>
+            Überwachung der Regenwasser-Sammlung: Fällt so viel Regen, ohne dass Fass oder IBC eine
+            Füllstands-Reaktion zeigen (<code>barrelFull:yes</code> bei Regen, <code>ibcFull:yes</code>
+            oder <code>ibcEmpty:no</code>), wird <code>rainCollectionAlert</code> auf <code>yes</code>
+            gesetzt (Hinweis auf verstopften Zulauf/Dachrinne/Filter). Ist der IBC bereits voll,
+            wird kein Alarm ausgelöst.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-rainCollectionCheckDelay"></a>
+            <b>rainCollectionCheckDelay</b><br>
+            Typ: Slider (5–720 Minuten). Standardwert: 120 Minuten.<br>
+            Wartezeit nach Erreichen von <code>rainCollectionCheckAmount</code>, bevor der Alarm
+            gesetzt wird – zeigt sich in dieser Zeit eine Füllstands-Reaktion, gilt die Sammlung
+            als in Ordnung.
+        </li>
         <li><a id="Gartenbewaesserung-attr-pumpStartDelay"></a>
             <b>pumpStartDelay</b><br>
             Typ: Slider (-30 bis +30 Sekunden). Standardwert: 3 Sekunden.<br>
@@ -4352,7 +4620,10 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>barrelFillTimeoutAlert</b> - <code>yes</code>/<code>no</code>; wird auf <code>yes</code> gesetzt, wenn das Befüllventil länger als <code>barrelFillTimeout</code> Minuten offen war, ohne dass <code>barrelFull</code> auf <code>yes</code> ging (IBC vermutlich leer oder Wasserzufuhr gestört). Reset automatisch bei <code>barrelFull:yes</code> oder <code>raining:yes</code>.</li>
         <li><b>currentValve</b> - Aktuell aktives Ventil (1–8) oder <code>none</code>.</li>
         <li><b>currentValveName</b> - Klartext-Name des aktuell aktiven Kreises (aus <code>valveNName</code>) oder <code>none</code>.</li>
-        <li><b>state</b> - u.a. <code>stopped - no water</code>, wenn das Fass trotz wiederholtem Nachfüllen leer bleibt (siehe <code>barrelEmptyMaxRefillAttempts</code>); <code>skipped - raining</code> bei <code>rainSkipsWatering</code>.</li>
+        <li><b>state</b> - u.a. <code>stopped - no water</code>, wenn das Fass trotz wiederholtem Nachfüllen leer bleibt (siehe <code>barrelEmptyMaxRefillAttempts</code>); <code>skipped - raining</code> bei <code>rainSkipsWatering</code>; <code>skipped - enough rain (X mm)</code> bei <code>rainSkipsWateringAmount</code>.</li>
+        <li><b>rainAmount_mm</b> - Aufsummierte Regenmenge (mm) im gleitenden Fenster <code>rainAmountWindow</code> (aus <code>rainAmountDevice</code>, reset-fest berechnet).</li>
+        <li><b>rainSinceFill_mm</b> - Regenmenge (mm) seit der letzten erkannten Füllstands-Reaktion von Fass/IBC. Grundlage der Sammel-Überwachung; wird bei einer Füllstands-Reaktion auf 0 zurückgesetzt.</li>
+        <li><b>rainCollectionAlert</b> - <code>yes</code>/<code>no</code>; <code>yes</code>, wenn mindestens <code>rainCollectionCheckAmount</code> mm Regen fiel, ohne dass Fass/IBC innerhalb von <code>rainCollectionCheckDelay</code> Minuten Wasser meldeten (Zulauf/Dachrinne/Filter prüfen). Reset automatisch bei der nächsten Füllstands-Reaktion.</li>
     </ul>
 
 </ul>
