@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.33 - 2026-07-26
+#     Version 1.0.35 - 2026-08-13
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,24 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.35 - 2026-08-13  Fix: pumpStartDelay-Reihenfolge jetzt auch in ALLEN pumpengestuetzten Fuell-/
+#                      Transfer-Pfaden respektiert: StartIBCFill, StartIBCtoBarrel, der IBC-Zweig der
+#                      Bewaesserungs- und der Kreis-Pause (StartWateringPause/StartCircuitPause), die
+#                      Fass-leer-Nachfuellpause (StartBarrelEmptyRefillPause) und der Fass-leer-Not-
+#                      Refill (HandleBarrelEmpty). Diese starteten bisher IMMER die Pumpe zuerst und
+#                      oeffneten das Ventil erst abs(pumpStartDelay) Sekunden spaeter (Vorzeichen
+#                      ignoriert) - die Pumpe lief in dem Fenster gegen ein geschlossenes Ventil.
+#                      Jetzt gilt ueberall: positiv = Pumpe zuerst, negativ/0 = Ventil zuerst.
+#                      Zusaetzlich abgesichert: wird die Aktion im Delay-Fenster gestoppt, schaltet
+#                      der Timer das zweite Geraet nicht mehr nachtraeglich ein.
+# 1.0.34 - 2026-08-13  Fix: pumpStartDelay wurde nicht in allen Pfaden respektiert - die Pumpe lief
+#                      teils VOR dem Ventil, obwohl das Ventil zuerst oeffnen sollte. (1) Der
+#                      Gleichzeitig-Zweig (Delay 0, bzw. wenn eine kurze Restlaufzeit den Delay intern
+#                      auf 0 kuerzte) schaltete erst die Pumpe, dann das Ventil - jetzt Ventil zuerst.
+#                      (2) 'set startValve N' (StartSingleValve) ignorierte pumpStartDelay komplett und
+#                      startete immer die Pumpe zuerst - respektiert jetzt dieselbe Reihenfolge wie
+#                      OpenValve (positiv = Pumpe zuerst, negativ/0 = Ventil zuerst). Damit laeuft die
+#                      Pumpe nie mehr gegen ein geschlossenes Ventil an.
 # 1.0.33 - 2026-07-26  Neu: Regenmengen-Integration (mm) ueber eine Wetterstation mit Regenmesser.
 #                      Neues Attribut rainAmountDevice (Device:Reading, z.B. MQTT2_xxx:dailyrain_mm) plus
 #                      rainAmountReading und rainAmountWindow (gleitendes Fenster in Stunden, Default 24).
@@ -186,7 +204,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.33';
+    $hash->{VERSION}    = '1.0.35';
 
     my $name = $a[0];
 
@@ -1771,10 +1789,11 @@ sub Gartenbewaesserung_RunCircuit {
             }, $hash);
         }
         else {
-            # Zero delay: Simultaneous
-            Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+            # Zero delay: open valve FIRST, then pump (valve must lead so the
+            # pump never runs against a closed valve)
             Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
-            Log3 $name, 4, "$name: Pump and valve started simultaneously";
+            Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+            Log3 $name, 4, "$name: Circuit $circuitNum valve opened, then pump (no delay)";
         }
     }
     else {
@@ -1893,16 +1912,27 @@ sub Gartenbewaesserung_StartCircuitPause {
         my $ibcToBarrelValve = AttrVal($name, "ibcToBarrelValveDevice", "");
 
         if($ibcToBarrelPump ne "") {
-            Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "on");
-
+            # Ordering follows pumpStartDelay (positive = pump first, negative/zero
+            # = valve first); bail out if the pause ended during the delay window.
             my $delay = AttrVal($name, "pumpStartDelay", 3);
-            $delay = abs($delay);
-
-            InternalTimer(gettimeofday() + $delay, sub {
-                if($ibcToBarrelValve ne "") {
-                    Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on");
-                }
-            }, $hash);
+            if($delay > 0) {
+                Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "on");
+                InternalTimer(gettimeofday() + $delay, sub {
+                    return if(!$hash->{HELPER}{pauseActive});
+                    Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on") if($ibcToBarrelValve ne "");
+                }, $hash);
+            }
+            elsif($delay < 0) {
+                Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on") if($ibcToBarrelValve ne "");
+                InternalTimer(gettimeofday() + abs($delay), sub {
+                    return if(!$hash->{HELPER}{pauseActive});
+                    Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "on");
+                }, $hash);
+            }
+            else {
+                Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on") if($ibcToBarrelValve ne "");
+                Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "on");
+            }
         }
         else {
             if($ibcToBarrelValve ne "") {
@@ -2208,19 +2238,33 @@ sub Gartenbewaesserung_StartWateringPause {
         my $ibcToBarrelValve = AttrVal($name, "ibcToBarrelValveDevice", "");
 
         if($ibcToBarrelPump ne "") {
-            # Use pump
-            Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "on");
-            Log3 $name, 4, "$name: Started IBC to barrel pump";
-
+            # Ordering follows pumpStartDelay: positive = pump first, negative/zero
+            # = valve first so the pump never runs against a closed valve. The
+            # delayed callbacks bail out if the pause has meanwhile ended.
             my $delay = AttrVal($name, "pumpStartDelay", 3);
-            $delay = abs($delay);  # Use absolute value for pause pumping
-
-            InternalTimer(gettimeofday() + $delay, sub {
-                if($ibcToBarrelValve ne "") {
-                    Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on");
-                    Log3 $name, 4, "$name: Opened IBC to barrel valve";
-                }
-            }, $hash);
+            if($delay > 0) {
+                Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "on");
+                Log3 $name, 4, "$name: Started IBC to barrel pump";
+                InternalTimer(gettimeofday() + $delay, sub {
+                    return if(!$hash->{HELPER}{pauseActive});
+                    Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on") if($ibcToBarrelValve ne "");
+                    Log3 $name, 4, "$name: Opened IBC to barrel valve after pump delay";
+                }, $hash);
+            }
+            elsif($delay < 0) {
+                Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on") if($ibcToBarrelValve ne "");
+                Log3 $name, 4, "$name: Opened IBC to barrel valve (negative delay)";
+                InternalTimer(gettimeofday() + abs($delay), sub {
+                    return if(!$hash->{HELPER}{pauseActive});
+                    Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "on");
+                    Log3 $name, 4, "$name: Started IBC to barrel pump after valve";
+                }, $hash);
+            }
+            else {
+                Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on") if($ibcToBarrelValve ne "");
+                Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "on");
+                Log3 $name, 4, "$name: Opened IBC to barrel valve, then pump (no delay)";
+            }
         }
         else {
             # Gravity feed
@@ -2456,10 +2500,11 @@ sub Gartenbewaesserung_OpenValve {
             }, $hash);
         }
         else {
-            # Zero delay: Simultaneous
-            Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+            # Zero delay: open valve FIRST, then pump (valve must lead so the
+            # pump never runs against a closed valve)
             Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
-            Log3 $name, 4, "$name: Pump and valve $valveNum started simultaneously";
+            Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+            Log3 $name, 4, "$name: Valve $valveNum opened, then pump (no delay)";
         }
     }
     else {
@@ -2974,13 +3019,27 @@ sub Gartenbewaesserung_StartBarrelEmptyRefillPause {
         my $ibcToBarrelValve = AttrVal($name, "ibcToBarrelValveDevice", "");
 
         if($ibcToBarrelPump ne "") {
-            Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "on");
-            my $delay = abs(AttrVal($name, "pumpStartDelay", 3));
-            InternalTimer(gettimeofday() + $delay, sub {
-                if($hash->{HELPER}{barrelEmptyRefillPause} && $ibcToBarrelValve ne "") {
-                    Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on");
-                }
-            }, $hash);
+            # Ordering follows pumpStartDelay (positive = pump first, negative/zero
+            # = valve first); bail out if the refill pause ended during the delay.
+            my $delay = AttrVal($name, "pumpStartDelay", 3);
+            if($delay > 0) {
+                Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "on");
+                InternalTimer(gettimeofday() + $delay, sub {
+                    return if(!$hash->{HELPER}{barrelEmptyRefillPause});
+                    Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on") if($ibcToBarrelValve ne "");
+                }, $hash);
+            }
+            elsif($delay < 0) {
+                Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on") if($ibcToBarrelValve ne "");
+                InternalTimer(gettimeofday() + abs($delay), sub {
+                    return if(!$hash->{HELPER}{barrelEmptyRefillPause});
+                    Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "on");
+                }, $hash);
+            }
+            else {
+                Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on") if($ibcToBarrelValve ne "");
+                Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "on");
+            }
         }
         elsif($ibcToBarrelValve ne "") {
             Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on");
@@ -3251,16 +3310,32 @@ sub Gartenbewaesserung_HandleBarrelEmpty {
             $hash->{HELPER}{ibcToBarrelActive} = 1;
 
             if($ibcToBarrelPump ne "") {
-                Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "on");
-                Log3 $name, 4, "$name: Started IBC to barrel pump (barrel empty refill)";
-
+                # Ordering follows pumpStartDelay (positive = pump first, negative/zero
+                # = valve first); bail out if the refill was stopped during the delay.
                 my $delay = AttrVal($name, "pumpStartDelay", 3);
-                $delay = abs($delay);
-
-                InternalTimer(gettimeofday() + $delay, sub {
+                if($delay > 0) {
+                    Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "on");
+                    Log3 $name, 4, "$name: Started IBC to barrel pump (barrel empty refill)";
+                    InternalTimer(gettimeofday() + $delay, sub {
+                        return if(!$hash->{HELPER}{barrelEmptyRefilling});
+                        Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on");
+                        Log3 $name, 4, "$name: Opened IBC to barrel valve (barrel empty refill)";
+                    }, $hash);
+                }
+                elsif($delay < 0) {
                     Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on");
-                    Log3 $name, 4, "$name: Opened IBC to barrel valve (barrel empty refill)";
-                }, $hash);
+                    Log3 $name, 4, "$name: Opened IBC to barrel valve (barrel empty refill, negative delay)";
+                    InternalTimer(gettimeofday() + abs($delay), sub {
+                        return if(!$hash->{HELPER}{barrelEmptyRefilling});
+                        Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "on");
+                        Log3 $name, 4, "$name: Started IBC to barrel pump after valve (barrel empty refill)";
+                    }, $hash);
+                }
+                else {
+                    Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on");
+                    Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "on");
+                    Log3 $name, 4, "$name: Opened IBC to barrel valve, then pump (barrel empty refill, no delay)";
+                }
             }
             else {
                 Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on");
@@ -3528,23 +3603,52 @@ sub Gartenbewaesserung_StartSingleValve {
         return "Barrel is empty - pump cannot be started";
     }
 
-    # Start pump
-    my $pumpDevice = AttrVal($name, "pumpDevice", "");
-    if($pumpDevice ne "") {
-        Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
-        Gartenbewaesserung_StartPumpWatchdog($hash);
-    }
-
-    Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
-
     my $valveLabel = Gartenbewaesserung_CircuitLabel($hash, $valveNum);
 
+    # Mark current valve first so the delayed callbacks below can validate it
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "state", "manual");
     readingsBulkUpdate($hash, "phase", "manual watering");
     readingsBulkUpdate($hash, "currentValve", $valveNum);
     readingsBulkUpdate($hash, "currentValveName", Gartenbewaesserung_ValveName($hash, $valveNum));
     readingsEndUpdate($hash, 1);
+
+    # Start pump/valve honoring pumpStartDelay (same ordering rules as OpenValve):
+    # positive = pump first, then valve; negative/zero = valve first, then pump
+    my $pumpDevice = AttrVal($name, "pumpDevice", "");
+    my $delay = AttrVal($name, "pumpStartDelay", 3);
+
+    if($pumpDevice ne "") {
+        if($delay > 0) {
+            # Positive delay: pump FIRST, valve after delay
+            Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+            Gartenbewaesserung_StartPumpWatchdog($hash);
+            InternalTimer(gettimeofday() + $delay, sub {
+                return if(ReadingsVal($name, "currentValve", "none") ne $valveNum);
+                Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
+                Log3 $name, 4, "$name: Manual valve $valveNum opened after pump delay";
+            }, $hash);
+        }
+        elsif($delay < 0) {
+            # Negative delay: valve FIRST, pump after |delay|
+            Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
+            InternalTimer(gettimeofday() + abs($delay), sub {
+                return if(ReadingsVal($name, "currentValve", "none") ne $valveNum);
+                Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+                Gartenbewaesserung_StartPumpWatchdog($hash);
+                Log3 $name, 4, "$name: Manual pump started after valve (negative delay)";
+            }, $hash);
+        }
+        else {
+            # Zero delay: valve FIRST, then pump
+            Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
+            Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+            Gartenbewaesserung_StartPumpWatchdog($hash);
+        }
+    }
+    else {
+        Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
+    }
 
     Log3 $name, 3, "$name: Manual valve $valveLabel started";
 
@@ -3628,38 +3732,50 @@ sub Gartenbewaesserung_StartIBCFill {
         return;
     }
 
-    # Start pump to move water from barrel to IBC
+    # Start pump to move water from barrel to IBC.
+    # Ordering follows pumpStartDelay: positive = pump first (build pressure),
+    # negative/zero = valve first so the pump never runs against a closed valve.
     my $pumpDevice = AttrVal($name, "pumpDevice", "");
+
+    # Mark as filling immediately so StopIBCFill can always tear both devices
+    # down - even if the fill is stopped during the pump/valve delay window.
+    $hash->{HELPER}{ibcFilling} = 1;
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, "ibcFilling", "yes");
+    readingsBulkUpdate($hash, "ibcFillStarted", TimeNow());
+    readingsEndUpdate($hash, 1);
+
     if($pumpDevice ne "") {
-        Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
-        Log3 $name, 4, "$name: Pump started for IBC filling";
-
-        # Wait for pump, then open valve
         my $delay = AttrVal($name, "pumpStartDelay", 3);
-        $delay = abs($delay);  # Use absolute value
-
-        InternalTimer(gettimeofday() + $delay, sub {
+        if($delay > 0) {
+            # Pump first, then valve after delay
+            Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+            Log3 $name, 4, "$name: Pump started for IBC filling";
+            InternalTimer(gettimeofday() + $delay, sub {
+                return if(!$hash->{HELPER}{ibcFilling});   # stopped during delay
+                Gartenbewaesserung_SwitchDevice($name, $ibcValve, "on");
+                Log3 $name, 3, "$name: IBC filling started (from barrel, pump then valve)";
+            }, $hash);
+        }
+        elsif($delay < 0) {
+            # Valve first, then pump after |delay|
             Gartenbewaesserung_SwitchDevice($name, $ibcValve, "on");
-            $hash->{HELPER}{ibcFilling} = 1;
-
-            readingsBeginUpdate($hash);
-            readingsBulkUpdate($hash, "ibcFilling", "yes");
-            readingsBulkUpdate($hash, "ibcFillStarted", TimeNow());
-            readingsEndUpdate($hash, 1);
-
-            Log3 $name, 3, "$name: IBC filling started (from barrel with pump)";
-        }, $hash);
+            InternalTimer(gettimeofday() + abs($delay), sub {
+                return if(!$hash->{HELPER}{ibcFilling});   # stopped during delay
+                Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+                Log3 $name, 3, "$name: IBC filling started (valve first, then pump)";
+            }, $hash);
+        }
+        else {
+            # Zero: valve first, then pump (no delay)
+            Gartenbewaesserung_SwitchDevice($name, $ibcValve, "on");
+            Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+            Log3 $name, 3, "$name: IBC filling started (from barrel, valve then pump)";
+        }
     }
     else {
         # No pump - just open valve (gravity feed from rain)
         Gartenbewaesserung_SwitchDevice($name, $ibcValve, "on");
-        $hash->{HELPER}{ibcFilling} = 1;
-
-        readingsBeginUpdate($hash);
-        readingsBulkUpdate($hash, "ibcFilling", "yes");
-        readingsBulkUpdate($hash, "ibcFillStarted", TimeNow());
-        readingsEndUpdate($hash, 1);
-
         Log3 $name, 3, "$name: IBC filling started (gravity feed)";
     }
 
@@ -3735,34 +3851,54 @@ sub Gartenbewaesserung_StartIBCtoBarrel {
     my $duration = AttrVal($name, "ibcToBarrelDuration", 15);
 
     if($ibcToBarrelPump ne "") {
-        # Use pump for IBC to barrel transfer
-        Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "on");
-        Log3 $name, 4, "$name: IBC to barrel pump started";
-
-        # Wait for pump, then open valve
+        # Use pump for IBC to barrel transfer. Ordering follows pumpStartDelay:
+        # positive = pump first (build pressure), negative/zero = valve first so
+        # the pump never runs against a closed valve.
         my $delay = AttrVal($name, "pumpStartDelay", 3);
-        $delay = abs($delay);  # Use absolute value
 
-        InternalTimer(gettimeofday() + $delay, sub {
-            Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on");
-            $hash->{HELPER}{ibcToBarrelActive} = 1;
+        # Mark active up front so StopIBCtoBarrel can always tear both devices down
+        $hash->{HELPER}{ibcToBarrelActive} = 1;
+        readingsBeginUpdate($hash);
+        readingsBulkUpdate($hash, "ibcToBarrelActive", "yes");
+        readingsBulkUpdate($hash, "state", "ibc to barrel");
+        readingsBulkUpdate($hash, "phase", "transferring water from IBC (pump)");
+        readingsEndUpdate($hash, 1);
 
-            # Set end time
+        # Flow starts once both pump and valve are on -> anchor runtime/auto-stop there
+        my $startFlow = sub {
             Gartenbewaesserung_SetEndTime($hash, $duration);
-
-            readingsBeginUpdate($hash);
-            readingsBulkUpdate($hash, "ibcToBarrelActive", "yes");
-            readingsBulkUpdate($hash, "state", "ibc to barrel");
-            readingsBulkUpdate($hash, "phase", "transferring water from IBC (pump)");
-            readingsEndUpdate($hash, 1);
-
             Log3 $name, 3, "$name: IBC to barrel transfer started with pump for $duration minutes";
-
-            # Schedule auto-stop
             InternalTimer(gettimeofday() + ($duration * 60), sub {
                 Gartenbewaesserung_StopIBCtoBarrel($hash);
             }, $hash);
-        }, $hash);
+        };
+
+        if($delay > 0) {
+            # Pump first, then valve after delay
+            Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "on");
+            Log3 $name, 4, "$name: IBC to barrel pump started";
+            InternalTimer(gettimeofday() + $delay, sub {
+                return if(!$hash->{HELPER}{ibcToBarrelActive});   # stopped during delay
+                Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on");
+                $startFlow->();
+            }, $hash);
+        }
+        elsif($delay < 0) {
+            # Valve first, then pump after |delay|
+            Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on");
+            Log3 $name, 4, "$name: IBC to barrel valve opened (negative delay)";
+            InternalTimer(gettimeofday() + abs($delay), sub {
+                return if(!$hash->{HELPER}{ibcToBarrelActive});   # stopped during delay
+                Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "on");
+                $startFlow->();
+            }, $hash);
+        }
+        else {
+            # Zero: valve first, then pump (no delay)
+            Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on");
+            Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelPump, "on");
+            $startFlow->();
+        }
     }
     else {
         # Gravity feed - no pump needed
@@ -4458,8 +4594,14 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             <b>pumpStartDelay</b><br>
             Typ: Slider (-30 bis +30 Sekunden). Standardwert: 3 Sekunden.<br>
             Startverzögerung zwischen Pumpe und Ventil.
-            Positiv: Pumpe startet X Sekunden VOR dem Ventil.
+            Positiv: Pumpe startet X Sekunden VOR dem Ventil (Druckaufbau).
             Negativ: Ventil öffnet X Sekunden VOR der Pumpe (Druckentlastung).
+            0: Ventil öffnet unmittelbar VOR der Pumpe (kein Verzug).
+            Gilt für alle Startpfade – zeitgesteuerte Bewässerung, <code>startCircuit</code>,
+            <code>startValve</code> sowie die pumpengestützten Füll-/Transfer-Vorgänge
+            (IBC-Befüllung, IBC→Fass, Nachfüllpause). Nur bei positivem Wert läuft die Pumpe vor dem
+            Ventil an; bei 0 oder negativem Wert öffnet immer zuerst das Ventil, damit die Pumpe nie
+            gegen ein geschlossenes Ventil arbeitet.
         </li>
         <li><a id="Gartenbewaesserung-attr-pumpMaxRuntime"></a>
             <b>pumpMaxRuntime</b><br>
