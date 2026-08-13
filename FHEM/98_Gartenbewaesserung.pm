@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.33 - 2026-07-26
+#     Version 1.0.34 - 2026-08-13
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,14 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.34 - 2026-08-13  Fix: pumpStartDelay wurde nicht in allen Pfaden respektiert - die Pumpe lief
+#                      teils VOR dem Ventil, obwohl das Ventil zuerst oeffnen sollte. (1) Der
+#                      Gleichzeitig-Zweig (Delay 0, bzw. wenn eine kurze Restlaufzeit den Delay intern
+#                      auf 0 kuerzte) schaltete erst die Pumpe, dann das Ventil - jetzt Ventil zuerst.
+#                      (2) 'set startValve N' (StartSingleValve) ignorierte pumpStartDelay komplett und
+#                      startete immer die Pumpe zuerst - respektiert jetzt dieselbe Reihenfolge wie
+#                      OpenValve (positiv = Pumpe zuerst, negativ/0 = Ventil zuerst). Damit laeuft die
+#                      Pumpe nie mehr gegen ein geschlossenes Ventil an.
 # 1.0.33 - 2026-07-26  Neu: Regenmengen-Integration (mm) ueber eine Wetterstation mit Regenmesser.
 #                      Neues Attribut rainAmountDevice (Device:Reading, z.B. MQTT2_xxx:dailyrain_mm) plus
 #                      rainAmountReading und rainAmountWindow (gleitendes Fenster in Stunden, Default 24).
@@ -186,7 +194,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.33';
+    $hash->{VERSION}    = '1.0.34';
 
     my $name = $a[0];
 
@@ -1771,10 +1779,11 @@ sub Gartenbewaesserung_RunCircuit {
             }, $hash);
         }
         else {
-            # Zero delay: Simultaneous
-            Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+            # Zero delay: open valve FIRST, then pump (valve must lead so the
+            # pump never runs against a closed valve)
             Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
-            Log3 $name, 4, "$name: Pump and valve started simultaneously";
+            Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+            Log3 $name, 4, "$name: Circuit $circuitNum valve opened, then pump (no delay)";
         }
     }
     else {
@@ -2456,10 +2465,11 @@ sub Gartenbewaesserung_OpenValve {
             }, $hash);
         }
         else {
-            # Zero delay: Simultaneous
-            Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+            # Zero delay: open valve FIRST, then pump (valve must lead so the
+            # pump never runs against a closed valve)
             Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
-            Log3 $name, 4, "$name: Pump and valve $valveNum started simultaneously";
+            Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+            Log3 $name, 4, "$name: Valve $valveNum opened, then pump (no delay)";
         }
     }
     else {
@@ -3528,23 +3538,52 @@ sub Gartenbewaesserung_StartSingleValve {
         return "Barrel is empty - pump cannot be started";
     }
 
-    # Start pump
-    my $pumpDevice = AttrVal($name, "pumpDevice", "");
-    if($pumpDevice ne "") {
-        Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
-        Gartenbewaesserung_StartPumpWatchdog($hash);
-    }
-
-    Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
-
     my $valveLabel = Gartenbewaesserung_CircuitLabel($hash, $valveNum);
 
+    # Mark current valve first so the delayed callbacks below can validate it
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "state", "manual");
     readingsBulkUpdate($hash, "phase", "manual watering");
     readingsBulkUpdate($hash, "currentValve", $valveNum);
     readingsBulkUpdate($hash, "currentValveName", Gartenbewaesserung_ValveName($hash, $valveNum));
     readingsEndUpdate($hash, 1);
+
+    # Start pump/valve honoring pumpStartDelay (same ordering rules as OpenValve):
+    # positive = pump first, then valve; negative/zero = valve first, then pump
+    my $pumpDevice = AttrVal($name, "pumpDevice", "");
+    my $delay = AttrVal($name, "pumpStartDelay", 3);
+
+    if($pumpDevice ne "") {
+        if($delay > 0) {
+            # Positive delay: pump FIRST, valve after delay
+            Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+            Gartenbewaesserung_StartPumpWatchdog($hash);
+            InternalTimer(gettimeofday() + $delay, sub {
+                return if(ReadingsVal($name, "currentValve", "none") ne $valveNum);
+                Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
+                Log3 $name, 4, "$name: Manual valve $valveNum opened after pump delay";
+            }, $hash);
+        }
+        elsif($delay < 0) {
+            # Negative delay: valve FIRST, pump after |delay|
+            Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
+            InternalTimer(gettimeofday() + abs($delay), sub {
+                return if(ReadingsVal($name, "currentValve", "none") ne $valveNum);
+                Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+                Gartenbewaesserung_StartPumpWatchdog($hash);
+                Log3 $name, 4, "$name: Manual pump started after valve (negative delay)";
+            }, $hash);
+        }
+        else {
+            # Zero delay: valve FIRST, then pump
+            Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
+            Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "on");
+            Gartenbewaesserung_StartPumpWatchdog($hash);
+        }
+    }
+    else {
+        Gartenbewaesserung_SwitchDevice($name, $valveDevice, "on");
+    }
 
     Log3 $name, 3, "$name: Manual valve $valveLabel started";
 
@@ -4458,8 +4497,13 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             <b>pumpStartDelay</b><br>
             Typ: Slider (-30 bis +30 Sekunden). Standardwert: 3 Sekunden.<br>
             Startverzögerung zwischen Pumpe und Ventil.
-            Positiv: Pumpe startet X Sekunden VOR dem Ventil.
+            Positiv: Pumpe startet X Sekunden VOR dem Ventil (Druckaufbau).
             Negativ: Ventil öffnet X Sekunden VOR der Pumpe (Druckentlastung).
+            0: Ventil öffnet unmittelbar VOR der Pumpe (kein Verzug).
+            Gilt für alle Startpfade – zeitgesteuerte Bewässerung, <code>startCircuit</code>
+            und <code>startValve</code>. Nur bei positivem Wert läuft die Pumpe vor dem Ventil an;
+            bei 0 oder negativem Wert öffnet immer zuerst das Ventil, damit die Pumpe nie gegen ein
+            geschlossenes Ventil arbeitet.
         </li>
         <li><a id="Gartenbewaesserung-attr-pumpMaxRuntime"></a>
             <b>pumpMaxRuntime</b><br>
