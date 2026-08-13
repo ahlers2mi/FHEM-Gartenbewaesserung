@@ -41,6 +41,8 @@ Das Modul ist so ausgelegt, dass es **Regenwasser bevorzugt** und nur dann auf H
 
 ## Systemübersicht
 
+![Anlagenschema: Dachrinne, IBC, Fass, Pumpe und Magnetventile](docs/anlagenschema.svg)
+
 ```
 Hauswasseranschluss
         │
