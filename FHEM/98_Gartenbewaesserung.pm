@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.35 - 2026-08-13
+#     Version 1.0.36 - 2026-08-16
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,22 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.36 - 2026-08-16  Fix: rainAmount_mm blieb dauerhaft 0.00, egal wie viel Regen fiel. Ursache: in
+#                      Installationen, die Time::HiRes' time() nach main:: importieren, liefert time()
+#                      eine Kommazahl. Die Zeitstempel im Puffer .rainBuffer bekamen dadurch einen
+#                      Nachkommateil, den der Filter /^\d+:/ nicht akzeptierte - der Puffer wurde bei
+#                      jedem Aufruf verworfen und neu angelegt, die Fenstersumme damit immer
+#                      accum - accum = 0. Jetzt werden ganzzahlige Zeitstempel geschrieben und
+#                      bestehende Puffer mit Nachkommateil weiterhin gelesen.
+#                      Fix: Readings mit Historie (rainDetectedSince, rainAmount_mm, rainSinceFill_mm,
+#                      rainCollectionAlert) wurden bei JEDEM FHEM-Neustart geleert. DefFn laeuft vor
+#                      dem Einlesen der Statefile, die dortige Initialisierung ueberschrieb also die
+#                      wiederhergestellten Werte. Diese Readings werden in Define nicht mehr gesetzt;
+#                      alle Leser nutzen ohnehin einen ReadingsVal-Default.
+#                      Neu: Ist der Fensterpuffer leer (neues Geraet oder Neustart ohne aktuelle
+#                      Statefile), wird er aus dem Tageszaehler (dailyrain_mm) mit einem Basispunkt um
+#                      Mitternacht vorbelegt - rainAmount_mm zeigt dann sofort wieder den Regen des
+#                      laufenden Tages statt 0.
 # 1.0.35 - 2026-08-13  Fix: pumpStartDelay-Reihenfolge jetzt auch in ALLEN pumpengestuetzten Fuell-/
 #                      Transfer-Pfaden respektiert: StartIBCFill, StartIBCtoBarrel, der IBC-Zweig der
 #                      Bewaesserungs- und der Kreis-Pause (StartWateringPause/StartCircuitPause), die
@@ -204,7 +220,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.35';
+    $hash->{VERSION}    = '1.0.36';
 
     my $name = $a[0];
 
@@ -217,16 +233,18 @@ sub Gartenbewaesserung_Define {
     readingsBulkUpdate($hash, "cycleProgress", "0/0");
     readingsBulkUpdate($hash, "ibcFilling", "no");
     readingsBulkUpdate($hash, "ibcToBarrelActive", "no");
-    readingsBulkUpdate($hash, "rainDetectedSince", "never");
     readingsBulkUpdate($hash, "remainingTime", "-");
     readingsBulkUpdate($hash, "pauseActive", "no");
     readingsBulkUpdate($hash, "pauseTimeRemaining", "-");
     readingsBulkUpdate($hash, "barrelEmpty", "no");
     readingsBulkUpdate($hash, "barrelFillTimeoutAlert", "no");
-    readingsBulkUpdate($hash, "rainAmount_mm", "0") if(ReadingsVal($name, "rainAmount_mm", "") eq "");
-    readingsBulkUpdate($hash, "rainSinceFill_mm", "0") if(ReadingsVal($name, "rainSinceFill_mm", "") eq "");
-    readingsBulkUpdate($hash, "rainCollectionAlert", "no") if(ReadingsVal($name, "rainCollectionAlert", "") eq "");
     readingsEndUpdate($hash, 1);
+
+    # NOTE: readings carrying history across restarts (rainDetectedSince,
+    # rainAmount_mm, rainSinceFill_mm, rainCollectionAlert) are deliberately NOT
+    # initialized here. DefFn runs before the statefile is applied, so writing them
+    # here overwrites the restored values on every FHEM restart. All readers use a
+    # ReadingsVal default instead, so a brand-new device behaves the same.
 
     # Set default attributes
     $attr{$name}{activeValves} = "1,2,3,4,5,6,7,8" if(!defined($attr{$name}{activeValves}));
@@ -3986,7 +4004,9 @@ sub Gartenbewaesserung_UpdateRainAmount {
     my $raw = ReadingsVal($rdev, $rreading, "");
     return if($raw !~ /^-?\d+(?:\.\d+)?$/);   # not a number (yet)
 
-    my $now = time();
+    # Integer seconds: some installations import Time::HiRes' time() into main::,
+    # which would put a fractional part into the buffer timestamps.
+    my $now = int(time());
 
     # Derive monotonic accumulator from the (resettable) source reading
     my $lastRaw = ReadingsVal($name, ".rainLastRaw", "");
@@ -4003,7 +4023,8 @@ sub Gartenbewaesserung_UpdateRainAmount {
     # Rolling-window buffer: "epoch:accum,epoch:accum,..."
     my $windowH = AttrVal($name, "rainAmountWindow", 24);
     my $cutoff  = $now - $windowH * 3600;
-    my @buf = grep { /^\d+:/ } split(/,/, ReadingsVal($name, ".rainBuffer", ""));
+    # Accept fractional timestamps too - older buffers may contain them
+    my @buf = grep { /^\d+(?:\.\d+)?:/ } split(/,/, ReadingsVal($name, ".rainBuffer", ""));
 
     # Keep the newest sample older than the cutoff (as window baseline) plus all newer ones
     my ($baseline, @kept);
@@ -4013,6 +4034,17 @@ sub Gartenbewaesserung_UpdateRainAmount {
         else             { push @kept, $s; }
     }
     unshift @kept, $baseline if(defined $baseline);
+
+    # No usable history (fresh device, or a restart without a current statefile):
+    # seed a baseline at midnight so the window immediately reflects the rain that
+    # already fell today. Only valid for a daily counter, which resets at midnight.
+    if(!@kept && $rreading =~ /daily/i && $raw > 0) {
+        my @lt = localtime($now);
+        my $midnight = $now - ($lt[2] * 3600 + $lt[1] * 60 + $lt[0]);
+        $midnight = $cutoff if($midnight < $cutoff);
+        push @kept, int($midnight) . ":" . ($accum - $raw);
+        Log3 $name, 3, "$name: rain buffer empty - seeded window with today's rain ($raw mm)";
+    }
 
     # Append the current sample, throttled to at most one every 10 minutes
     my $lastT = @kept ? (split(/:/, $kept[-1]))[0] : 0;
