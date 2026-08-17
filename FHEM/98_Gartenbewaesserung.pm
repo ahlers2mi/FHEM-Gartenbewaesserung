@@ -19,10 +19,17 @@
 #                      Zaehler, waere Leitungswasser in den IBC gepumpt worden. An der realen Anlage
 #                      gut sichtbar: barrelFull-Ereignisse haeufen sich direkt nach den Giesszeiten.
 #                      Neu: An allen sechs Stellen, an denen das Modul Stadtwasser aufdreht, wird
-#                      rainSinceHarvest_mm auf 0 gesetzt (NoteMainsFill). Die naechste Ernte verlangt
-#                      damit neuen Regen. Wichtig: Ein rein MECHANISCHER Schwimmer in der
+#                      rainSinceHarvest_mm auf 0 gesetzt (NoteNonRainFill). Die naechste Ernte
+#                      verlangt damit neuen Regen. Wichtig: Ein rein MECHANISCHER Schwimmer in der
 #                      Hauswasserleitung bleibt fuer das Modul unsichtbar - haelt der das Fass bis zum
-#                      barrelFull-Sensor, greift dieser Schutz nicht.
+#                      barrelFull-Sensor, greift dieser Schutz nicht; der Schwimmer sollte darunter
+#                      abregeln.
+#                      Fix: Gleiches Problem beim IBC->Fass-Transfer. Fuellte der das Fass bis
+#                      barrelFull, stoppte CheckBarrelFull zwar den Transfer, der Ernte-Trigger im
+#                      NotifyFn lief danach aber trotzdem an (ibcToBarrelActive war da schon
+#                      zurueckgesetzt) - dasselbe Wasser waere sofort wieder hochgepumpt worden.
+#                      CheckBarrelFull verbraucht den Trigger jetzt ebenfalls, und der Notify-Trigger
+#                      schliesst einen laufenden Transfer zusaetzlich aus.
 # 1.0.39 - 2026-08-17  Fix: Der mit 1.0.38 eingefuehrte Mengen-Trigger fuer die IBC-Befuellung wurde
 #                      nicht verbraucht - er prueft rainAmount_mm, und der bleibt das ganze
 #                      rainAmountWindow (Default 24 h) ueber der Schwelle. Wurde das Fass nach dem
@@ -520,6 +527,7 @@ sub Gartenbewaesserung_Notify {
                     # Barrel full after (or during) rain and idle -> harvest into the IBC
                     if(Gartenbewaesserung_HarvestDue($hash) &&
                        !$hash->{HELPER}{ibcFilling} &&
+                       !$hash->{HELPER}{ibcToBarrelActive} &&
                        !$hash->{HELPER}{watering} &&
                         !$hash->{HELPER}{circuitMode}) {
                         Log3 $name, 3, "$name: Barrel full after rain ("
@@ -1740,7 +1748,7 @@ sub Gartenbewaesserung_FillBarrelForCircuit {
     }
 
     Gartenbewaesserung_SwitchDevice($name, $fillValve, "on");
-    Gartenbewaesserung_NoteMainsFill($hash);
+    Gartenbewaesserung_NoteNonRainFill($hash, "mains supply");
     $hash->{HELPER}{barrelFilling} = 1;
     Gartenbewaesserung_StartBarrelFillTimeout($hash);
 
@@ -1985,7 +1993,7 @@ sub Gartenbewaesserung_StartCircuitPause {
         my $fillValve = AttrVal($name, "barrelFillValveDevice", "");
         if($fillValve ne "") {
             Gartenbewaesserung_SwitchDevice($name, $fillValve, "on");
-            Gartenbewaesserung_NoteMainsFill($hash);
+            Gartenbewaesserung_NoteNonRainFill($hash, "mains supply");
             $hash->{HELPER}{pauseSource} = "water_supply";
         }
     }
@@ -2311,7 +2319,7 @@ sub Gartenbewaesserung_StartWateringPause {
         my $fillValve = AttrVal($name, "barrelFillValveDevice", "");
         if($fillValve ne "") {
             Gartenbewaesserung_SwitchDevice($name, $fillValve, "on");
-            Gartenbewaesserung_NoteMainsFill($hash);
+            Gartenbewaesserung_NoteNonRainFill($hash, "mains supply");
             $hash->{HELPER}{pauseSource} = "water_supply";
             Log3 $name, 4, "$name: Opened water supply valve (barrelFillValveDevice)";
         }
@@ -2680,7 +2688,7 @@ sub Gartenbewaesserung_FillBarrel {
     }
 
     Gartenbewaesserung_SwitchDevice($name, $fillValve, "on");
-    Gartenbewaesserung_NoteMainsFill($hash);
+    Gartenbewaesserung_NoteNonRainFill($hash, "mains supply");
     $hash->{HELPER}{barrelFilling} = 1;
     Gartenbewaesserung_StartBarrelFillTimeout($hash);
 
@@ -2743,6 +2751,9 @@ sub Gartenbewaesserung_CheckBarrelFull {
     # If IBC→Barrel transfer is active, stop the transfer and do NOT pump back
     if($hash->{HELPER}{ibcToBarrelActive}) {
         Log3 $name, 3, "$name: Barrel full during IBC-to-barrel transfer, stopping transfer";
+        # This water came from the IBC, not from the sky. Clear the harvest trigger,
+        # otherwise the caller would pump it straight back up once the transfer ends.
+        Gartenbewaesserung_NoteNonRainFill($hash, "IBC-to-barrel transfer");
         if($hash->{HELPER}{barrelEmptyRefilling}) {
             Gartenbewaesserung_StopBarrelEmptyRefill($hash);
         }
@@ -3139,7 +3150,7 @@ sub Gartenbewaesserung_StartBarrelEmptyRefillPause {
         my $fillValve = AttrVal($name, "barrelFillValveDevice", "");
         if($fillValve ne "") {
             Gartenbewaesserung_SwitchDevice($name, $fillValve, "on");
-            Gartenbewaesserung_NoteMainsFill($hash);
+            Gartenbewaesserung_NoteNonRainFill($hash, "mains supply");
         }
 
         $hash->{HELPER}{barrelEmptyRefillPauseSource} = "water_supply";
@@ -3370,7 +3381,7 @@ sub Gartenbewaesserung_HandleBarrelEmpty {
         if($fillValve ne "") {
             Log3 $name, 3, "$name: IBC empty, using water supply to refill barrel";
             Gartenbewaesserung_SwitchDevice($name, $fillValve, "on");
-            Gartenbewaesserung_NoteMainsFill($hash);
+            Gartenbewaesserung_NoteNonRainFill($hash, "mains supply");
             $hash->{HELPER}{barrelEmptyRefilling} = 1;
             $hash->{HELPER}{barrelEmptyRefillSource} = "water_supply";
             $hash->{HELPER}{barrelFilling} = 1;
@@ -4085,21 +4096,23 @@ sub Gartenbewaesserung_RainRecentEnough {
 }
 
 ##############################################################################
-# The barrel is being topped up from the mains supply. Whatever rain credit had
-# accumulated no longer identifies the barrel contents as rainwater, so drop it:
-# the next harvest must be earned by new rain. Without this a barrel refilled
-# from the mains during a watering pause would be pumped into the IBC as soon as
-# the cycle ends - putting tap water into the rainwater store.
+# The barrel was filled from something other than rain - either the mains supply
+# or a transfer back from the IBC. Whatever rain credit had accumulated no longer
+# identifies the barrel contents as freshly harvested rainwater, so drop it: the
+# next harvest must be earned by new rain.
+#
+# Without this the barrel would be pumped into the IBC as soon as the cycle ends
+# - putting tap water into the rainwater store, or in the IBC->barrel case
+# pumping the very same water straight back up (barrel<->IBC oscillation).
 ##############################################################################
-sub Gartenbewaesserung_NoteMainsFill {
-    my ($hash) = @_;
+sub Gartenbewaesserung_NoteNonRainFill {
+    my ($hash, $source) = @_;
     my $name = $hash->{NAME};
 
     return if(ReadingsVal($name, "rainSinceHarvest_mm", 0) <= 0);
 
     readingsSingleUpdate($hash, "rainSinceHarvest_mm", "0", 1);
-    Log3 $name, 4, "$name: barrel topped up from mains - harvest trigger cleared "
-        . "(no tap water into the IBC)";
+    Log3 $name, 4, "$name: barrel filled from $source - harvest trigger cleared";
 }
 
 ##############################################################################
