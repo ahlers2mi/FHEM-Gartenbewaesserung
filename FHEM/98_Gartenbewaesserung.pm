@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.38 - 2026-08-17
+#     Version 1.0.39 - 2026-08-17
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,16 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.39 - 2026-08-17  Fix: Der mit 1.0.38 eingefuehrte Mengen-Trigger fuer die IBC-Befuellung wurde
+#                      nicht verbraucht - er prueft rainAmount_mm, und der bleibt das ganze
+#                      rainAmountWindow (Default 24 h) ueber der Schwelle. Wurde das Fass nach dem
+#                      Umpumpen in einer Giesspause per Schwerkraft aus dem IBC wieder gefuellt,
+#                      meldete barrelFull erneut und dasselbe Wasser waere zurueck in den IBC gepumpt
+#                      worden (Fass<->IBC-Pendeln). Neu: Reading rainSinceHarvest_mm zaehlt den Regen
+#                      seit der letzten Befuellung und wird beim Start einer Befuellung auf 0 gesetzt.
+#                      Eine neue automatische Ernte verlangt damit immer NEUEN Regen. Eine bereits
+#                      laufende Befuellung und die Sammel-Ueberwachung bewerten weiterhin
+#                      rainAmount_mm, laufen also unveraendert weiter.
 # 1.0.38 - 2026-08-17  Neu: Attribut ibcFillRainAmount (mm, 0 = aus). Die IBC-Befuellung setzte bisher
 #                      voraus, dass es GENAU in dem Moment regnet, in dem der Fass-voll-Sensor
 #                      anschlaegt. In der Praxis wird das Fenster fast immer verfehlt, weil Dach und
@@ -242,7 +252,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.38';
+    $hash->{VERSION}    = '1.0.39';
 
     my $name = $a[0];
 
@@ -497,7 +507,7 @@ sub Gartenbewaesserung_Notify {
                     readingsSingleUpdate($hash, "barrelFull", "yes", 1);
                     Gartenbewaesserung_CheckBarrelFull($hash);
                     # Barrel full after (or during) rain and idle -> harvest into the IBC
-                    if(Gartenbewaesserung_RainRecentEnough($hash) &&
+                    if(Gartenbewaesserung_HarvestDue($hash) &&
                        !$hash->{HELPER}{ibcFilling} &&
                        !$hash->{HELPER}{watering} &&
                         !$hash->{HELPER}{circuitMode}) {
@@ -3805,6 +3815,10 @@ sub Gartenbewaesserung_StartIBCFill {
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "ibcFilling", "yes");
     readingsBulkUpdate($hash, "ibcFillStarted", TimeNow());
+    # Consume the harvest trigger: the next automatic harvest needs new rain.
+    # Without this the barrel could be refilled by gravity from the IBC during a
+    # watering pause and immediately pumped back up again.
+    readingsBulkUpdate($hash, "rainSinceHarvest_mm", "0");
     readingsEndUpdate($hash, 1);
 
     if($pumpDevice ne "") {
@@ -4054,6 +4068,30 @@ sub Gartenbewaesserung_RainRecentEnough {
 }
 
 ##############################################################################
+# Should a NEW harvest (barrel -> IBC) be started?
+#
+# Unlike RainRecentEnough this consumes its trigger: rainSinceHarvest_mm is
+# reset to 0 whenever a fill actually starts, so the next harvest requires
+# genuinely NEW rain. Without that the condition would still hold for the rest
+# of the rain window - and a barrel refilled by gravity from the IBC during a
+# watering pause would immediately be pumped back up (barrel<->IBC oscillation).
+##############################################################################
+sub Gartenbewaesserung_HarvestDue {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    return 0 if(!Gartenbewaesserung_RainRecentEnough($hash));
+
+    # Classic trigger: it is raining right now - no amount bookkeeping involved
+    return 1 if(ReadingsVal($name, "raining", "no") eq "yes");
+
+    my $minAmount = AttrVal($name, "ibcFillRainAmount", 0);
+    return 0 if($minAmount <= 0);
+
+    return (ReadingsVal($name, "rainSinceHarvest_mm", 0) >= $minAmount) ? 1 : 0;
+}
+
+##############################################################################
 # Rain amount (mm): maintain a rolling-window sum from a weather station rain
 # gauge and feed the rainwater-collection watchdog.
 #
@@ -4133,6 +4171,12 @@ sub Gartenbewaesserung_UpdateRainAmount {
     $sinceFill = 0 if($sinceFill !~ /^-?\d+(?:\.\d+)?$/);
     $sinceFill += $delta;
 
+    # Rain since the last harvest into the IBC. Consumed by StartIBCFill, so a
+    # new harvest always needs new rain (see HarvestDue).
+    my $sinceHarvest = ReadingsVal($name, "rainSinceHarvest_mm", 0);
+    $sinceHarvest = 0 if($sinceHarvest !~ /^-?\d+(?:\.\d+)?$/);
+    $sinceHarvest += $delta;
+
     # Harvest statistics: how much water the roof actually delivers.
     # 1 mm of rain on 1 m2 = 1 litre; the runoff coefficient accounts for wetting,
     # evaporation and first flush (DIN 1989-1: 0.8 for a tiled pitched roof).
@@ -4166,6 +4210,7 @@ sub Gartenbewaesserung_UpdateRainAmount {
     readingsBulkUpdate($hash, ".rainBuffer", join(",", @kept));
     readingsBulkUpdate($hash, "rainAmount_mm", sprintf("%.2f", $windowSum));
     readingsBulkUpdate($hash, "rainSinceFill_mm", sprintf("%.2f", $sinceFill));
+    readingsBulkUpdate($hash, "rainSinceHarvest_mm", sprintf("%.2f", $sinceHarvest));
     if($roofArea > 0) {
         readingsBulkUpdate($hash, ".harvestDay",   $day);
         readingsBulkUpdate($hash, ".harvestMonth", $month);
@@ -4343,8 +4388,8 @@ sub Gartenbewaesserung_CheckRain {
        && !$hash->{HELPER}{watering}
        && !$hash->{HELPER}{circuitMode}
        && !$hash->{HELPER}{ibcToBarrelActive}
-       && Gartenbewaesserung_RainRecentEnough($hash)) {
-        Log3 $name, 3, "$name: Barrel full and " . ReadingsVal($name, "rainAmount_mm", "?")
+       && Gartenbewaesserung_HarvestDue($hash)) {
+        Log3 $name, 3, "$name: Barrel full and " . ReadingsVal($name, "rainSinceHarvest_mm", "?")
             . " mm rain in window, starting IBC fill";
         Gartenbewaesserung_StartIBCFill($hash, 0);
     }
@@ -4762,8 +4807,8 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Befüllung nur, wenn es <b>genau in dem Moment regnet</b>, in dem der Fass-voll-Sensor
             anschlägt. Da Dach und Dachrinne nach Regenende nachlaufen, meldet das Fass oft erst
             deutlich später „voll" – das Zeitfenster wird dann verfehlt.<br>
-            Ist der Wert &gt; 0, genügt es, dass innerhalb von <code>rainAmountWindow</code>
-            mindestens so viele mm gefallen sind (Reading <code>rainAmount_mm</code>, setzt
+            Ist der Wert &gt; 0, genügt es, dass seit der letzten Befüllung mindestens so viele mm
+            gefallen sind (Reading <code>rainSinceHarvest_mm</code>, setzt
             <code>rainAmountDevice</code> voraus). Ein volles Fass wird dann auch nach dem Regen
             noch in den IBC übernommen, und eine laufende Befüllung wird bei Regenende nicht mehr
             abgebrochen – sie endet regulär bei <code>barrelEmpty</code>, <code>ibcFull</code> oder
@@ -4970,6 +5015,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>rainAmount_mm</b> - Aufsummierte Regenmenge (mm) im gleitenden Fenster <code>rainAmountWindow</code> (aus <code>rainAmountDevice</code>, reset-fest berechnet).</li>
         <li><b>rainSinceFill_mm</b> - Regenmenge (mm) seit der letzten erkannten Füllstands-Reaktion von Fass/IBC. Grundlage der Sammel-Überwachung; wird bei einer Füllstands-Reaktion auf 0 zurückgesetzt.</li>
         <li><b>rainCollectionAlert</b> - <code>yes</code>/<code>no</code>; <code>yes</code>, wenn mindestens <code>rainCollectionCheckAmount</code> mm Regen fiel, ohne dass Fass/IBC innerhalb von <code>rainCollectionCheckDelay</code> Minuten Wasser meldeten (Zulauf/Dachrinne/Filter prüfen). Reset automatisch bei der nächsten Füllstands-Reaktion.</li>
+        <li><b>rainSinceHarvest_mm</b> - Regenmenge (mm) seit der letzten IBC-Befuellung. Steuert zusammen mit <code>ibcFillRainAmount</code>, wann geerntet wird, und wird beim Start einer Befuellung auf 0 gesetzt - eine neue Ernte braucht daher immer neuen Regen.</li>
         <li><b>harvest_today_l</b> / <b>harvest_month_l</b> / <b>harvest_year_l</b> / <b>harvest_total_l</b> - Aufgefangene Regenwassermenge in Litern (heute, laufender Monat, laufendes Jahr, seit Inbetriebnahme). Berechnet als <code>Regenmenge (mm) × roofArea × runoffCoefficient</code>; nur aktiv, wenn <code>roofArea</code> gesetzt ist. Die Perioden-Zähler starten bei Tages-, Monats- bzw. Jahreswechsel automatisch neu, <code>harvest_total_l</code> läuft weiter. Zurücksetzen mit <code>set &lt;name&gt; resetHarvestStats</code>.<br>
             <i>Grenze:</i> Der Wert beziffert, was am Fallrohr ankommt. Was bei vollem Fass überläuft, kann nicht abgezogen werden – die tatsächlich gespeicherte Menge liegt also darunter.</li>
     </ul>
