@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.36 - 2026-08-16
+#     Version 1.0.37 - 2026-08-16
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,13 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.37 - 2026-08-16  Neu: Regenwasser-Ertragsstatistik. Mit den Attributen roofArea (Dachflaeche am
+#                      Fallrohr in m2) und runoffCoefficient (Abflussbeiwert, Default 0.8) rechnet das
+#                      Modul die gemessene Regenmenge in Liter um und fuehrt laufende Summen:
+#                      harvest_today_l, harvest_month_l, harvest_year_l und harvest_total_l. Die
+#                      Perioden-Zaehler laufen bei Tages-/Monats-/Jahreswechsel automatisch auf 0.
+#                      Neu: set resetHarvestStats setzt alle vier Summen zurueck. Rein additiv, die
+#                      Steuerlogik bleibt unveraendert; ohne roofArea passiert nichts.
 # 1.0.36 - 2026-08-16  Fix: rainAmount_mm blieb dauerhaft 0.00, egal wie viel Regen fiel. Ursache: in
 #                      Installationen, die Time::HiRes' time() nach main:: importieren, liefert time()
 #                      eine Kommazahl. Die Zeitstempel im Puffer .rainBuffer bekamen dadurch einen
@@ -194,6 +201,8 @@ sub Gartenbewaesserung_Initialize {
         "rainSkipsWateringAmount:slider,0,0.5,50 " .
         "rainCollectionCheckAmount:slider,0,0.5,50 " .
         "rainCollectionCheckDelay:slider,5,5,720 " .
+        "roofArea:textField " .
+        "runoffCoefficient:textField " .
         "pumpStartDelay:slider,-30,1,30 " .
         "pumpMaxRuntime:slider,0,1,240 " .
         "barrelFillTimeout:slider,0,1,120 " .
@@ -220,7 +229,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.36';
+    $hash->{VERSION}    = '1.0.37';
 
     my $name = $a[0];
 
@@ -320,6 +329,7 @@ sub Gartenbewaesserung_Set {
                "startIBCtoBarrel:noArg stopIBCtoBarrel:noArg " .
                "startValve:1,2,3,4,5,6,7,8 stopValve:noArg " .
                "resetPumpOverrunAlert:noArg " .
+               "resetHarvestStats:noArg " .
                "refreshSensors:noArg " .
                "validate:noArg";
 
@@ -356,6 +366,16 @@ sub Gartenbewaesserung_Set {
     }
     elsif($cmd eq "resetPumpOverrunAlert") {
         readingsSingleUpdate($hash, "pumpOverrunAlert", "no", 1);
+        return undef;
+    }
+    elsif($cmd eq "resetHarvestStats") {
+        readingsBeginUpdate($hash);
+        readingsBulkUpdate($hash, "harvest_today_l", "0.0");
+        readingsBulkUpdate($hash, "harvest_month_l", "0.0");
+        readingsBulkUpdate($hash, "harvest_year_l",  "0.0");
+        readingsBulkUpdate($hash, "harvest_total_l", "0.0");
+        readingsEndUpdate($hash, 1);
+        Log3 $name, 3, "$name: harvest statistics reset";
         return undef;
     }
     elsif($cmd eq "refreshSensors") {
@@ -412,6 +432,16 @@ sub Gartenbewaesserung_Attr {
 
     if($cmd eq "del" && $attrName eq "pumpMaxRuntime") {
         Gartenbewaesserung_StopPumpWatchdog($hash);
+    }
+
+    if($cmd eq "set" && $attrName eq "roofArea") {
+        return "roofArea must be a positive number (square metres)"
+            if($attrVal !~ /^\d+(?:\.\d+)?$/ || $attrVal <= 0);
+    }
+
+    if($cmd eq "set" && $attrName eq "runoffCoefficient") {
+        return "runoffCoefficient must be a number between 0 and 1 (e.g. 0.8)"
+            if($attrVal !~ /^\d*(?:\.\d+)?$/ || $attrVal <= 0 || $attrVal > 1);
     }
 
     # Update sensor readings when sensor attributes change
@@ -4060,12 +4090,48 @@ sub Gartenbewaesserung_UpdateRainAmount {
     $sinceFill = 0 if($sinceFill !~ /^-?\d+(?:\.\d+)?$/);
     $sinceFill += $delta;
 
+    # Harvest statistics: how much water the roof actually delivers.
+    # 1 mm of rain on 1 m2 = 1 litre; the runoff coefficient accounts for wetting,
+    # evaporation and first flush (DIN 1989-1: 0.8 for a tiled pitched roof).
+    # Note: this is what arrives at the downpipe - overflow at a full barrel is
+    # not (and cannot be) deducted here.
+    my $roofArea = AttrVal($name, "roofArea", 0);
+    my ($todayL, $monthL, $yearL, $totalL, $day, $month, $year);
+    if($roofArea > 0) {
+        my $liters = $delta * $roofArea * AttrVal($name, "runoffCoefficient", 0.8);
+
+        my @lt = localtime($now);
+        $day   = sprintf("%04d-%02d-%02d", $lt[5] + 1900, $lt[4] + 1, $lt[3]);
+        $month = substr($day, 0, 7);
+        $year  = substr($day, 0, 4);
+
+        # Period counters restart when the calendar period rolls over
+        $todayL = (ReadingsVal($name, ".harvestDay",   "") eq $day)   ? ReadingsVal($name, "harvest_today_l", 0) : 0;
+        $monthL = (ReadingsVal($name, ".harvestMonth", "") eq $month) ? ReadingsVal($name, "harvest_month_l", 0) : 0;
+        $yearL  = (ReadingsVal($name, ".harvestYear",  "") eq $year)  ? ReadingsVal($name, "harvest_year_l",  0) : 0;
+        $totalL = ReadingsVal($name, "harvest_total_l", 0);
+
+        foreach my $v (\$todayL, \$monthL, \$yearL, \$totalL) {
+            $$v = 0 if($$v !~ /^-?\d+(?:\.\d+)?$/);
+            $$v += $liters;
+        }
+    }
+
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, ".rainLastRaw", $raw);
     readingsBulkUpdate($hash, ".rainAccum", sprintf("%.2f", $accum));
     readingsBulkUpdate($hash, ".rainBuffer", join(",", @kept));
     readingsBulkUpdate($hash, "rainAmount_mm", sprintf("%.2f", $windowSum));
     readingsBulkUpdate($hash, "rainSinceFill_mm", sprintf("%.2f", $sinceFill));
+    if($roofArea > 0) {
+        readingsBulkUpdate($hash, ".harvestDay",   $day);
+        readingsBulkUpdate($hash, ".harvestMonth", $month);
+        readingsBulkUpdate($hash, ".harvestYear",  $year);
+        readingsBulkUpdate($hash, "harvest_today_l", sprintf("%.1f", $todayL));
+        readingsBulkUpdate($hash, "harvest_month_l", sprintf("%.1f", $monthL));
+        readingsBulkUpdate($hash, "harvest_year_l",  sprintf("%.1f", $yearL));
+        readingsBulkUpdate($hash, "harvest_total_l", sprintf("%.1f", $totalL));
+    }
     readingsEndUpdate($hash, 1);
 
     Log3 $name, 5, "$name: rain amount update raw=$raw delta=$delta accum=$accum "
@@ -4288,6 +4354,14 @@ sub Gartenbewaesserung_GetStatus {
                  . ReadingsVal($name, "rainAmount_mm", "0") . " mm\n";
         $status .= "Rain Since Fill: " . ReadingsVal($name, "rainSinceFill_mm", "0") . " mm\n";
         $status .= "Rain Collection Alert: " . ReadingsVal($name, "rainCollectionAlert", "no") . "\n";
+    }
+    if(AttrVal($name, "roofArea", 0) > 0) {
+        $status .= "\n--- Regenwasser-Ertrag (" . AttrVal($name, "roofArea", 0) . " m2, Beiwert "
+                 . AttrVal($name, "runoffCoefficient", 0.8) . ") ---\n";
+        $status .= "Heute:  " . ReadingsVal($name, "harvest_today_l", "0") . " l\n";
+        $status .= "Monat:  " . ReadingsVal($name, "harvest_month_l", "0") . " l\n";
+        $status .= "Jahr:   " . ReadingsVal($name, "harvest_year_l",  "0") . " l\n";
+        $status .= "Gesamt: " . ReadingsVal($name, "harvest_total_l", "0") . " l\n\n";
     }
     $status .= "Last Watering: " . ReadingsVal($name, "lastWatering", "never") . "\n";
     $status .= "Last Circuit: " . ReadingsVal($name, "lastCircuitWatering", "never") . "\n";
@@ -4615,6 +4689,21 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             gesetzt (Hinweis auf verstopften Zulauf/Dachrinne/Filter). Ist der IBC bereits voll,
             wird kein Alarm ausgelöst.
         </li>
+        <li><a id="Gartenbewaesserung-attr-roofArea"></a>
+            <b>roofArea</b><br>
+            Typ: Zahl (Quadratmeter). Ohne Vorgabe deaktiviert.<br>
+            Dachfläche, die über das Fallrohr in das Fass entwässert. Maßgeblich ist die
+            <b>waagerechte Projektion</b> (Länge der Dachrinne × waagerechter Abstand Traufe→First),
+            nicht die Schrägfläche – Regen fällt senkrecht, ein steileres Dach fängt daher nicht mehr
+            auf. Aktiviert die Ertragsstatistik (<code>harvest_*_l</code>).
+        </li>
+        <li><a id="Gartenbewaesserung-attr-runoffCoefficient"></a>
+            <b>runoffCoefficient</b><br>
+            Typ: Zahl zwischen 0 und 1. Standardwert: 0.8.<br>
+            Abflussbeiwert für die Ertragsberechnung – berücksichtigt Benetzung, Verdunstung und
+            Erstspülung. DIN 1989-1 nennt 0.8 für harte Bedachung (Ziegel); für Metall- oder
+            Glasdächer sind Werte bis 0.9 üblich.
+        </li>
         <li><a id="Gartenbewaesserung-attr-rainCollectionCheckDelay"></a>
             <b>rainCollectionCheckDelay</b><br>
             Typ: Slider (5–720 Minuten). Standardwert: 120 Minuten.<br>
@@ -4798,6 +4887,8 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>rainAmount_mm</b> - Aufsummierte Regenmenge (mm) im gleitenden Fenster <code>rainAmountWindow</code> (aus <code>rainAmountDevice</code>, reset-fest berechnet).</li>
         <li><b>rainSinceFill_mm</b> - Regenmenge (mm) seit der letzten erkannten Füllstands-Reaktion von Fass/IBC. Grundlage der Sammel-Überwachung; wird bei einer Füllstands-Reaktion auf 0 zurückgesetzt.</li>
         <li><b>rainCollectionAlert</b> - <code>yes</code>/<code>no</code>; <code>yes</code>, wenn mindestens <code>rainCollectionCheckAmount</code> mm Regen fiel, ohne dass Fass/IBC innerhalb von <code>rainCollectionCheckDelay</code> Minuten Wasser meldeten (Zulauf/Dachrinne/Filter prüfen). Reset automatisch bei der nächsten Füllstands-Reaktion.</li>
+        <li><b>harvest_today_l</b> / <b>harvest_month_l</b> / <b>harvest_year_l</b> / <b>harvest_total_l</b> - Aufgefangene Regenwassermenge in Litern (heute, laufender Monat, laufendes Jahr, seit Inbetriebnahme). Berechnet als <code>Regenmenge (mm) × roofArea × runoffCoefficient</code>; nur aktiv, wenn <code>roofArea</code> gesetzt ist. Die Perioden-Zähler starten bei Tages-, Monats- bzw. Jahreswechsel automatisch neu, <code>harvest_total_l</code> läuft weiter. Zurücksetzen mit <code>set &lt;name&gt; resetHarvestStats</code>.<br>
+            <i>Grenze:</i> Der Wert beziffert, was am Fallrohr ankommt. Was bei vollem Fass überläuft, kann nicht abgezogen werden – die tatsächlich gespeicherte Menge liegt also darunter.</li>
     </ul>
 
 </ul>
