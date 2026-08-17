@@ -4184,7 +4184,14 @@ sub Gartenbewaesserung_UpdateRainAmount {
     if($lastRaw =~ /^-?\d+(?:\.\d+)?$/) {
         $delta = ($raw >= $lastRaw) ? ($raw - $lastRaw) : $raw;   # decrease = source reset
     }
-    # else: first observation -> only establish the baseline (delta stays 0)
+    elsif($rreading =~ /daily/i) {
+        # First observation with no stored baseline - a fresh device, or readings
+        # that were deleted. A daily counter states the rain that already fell
+        # today, so count it instead of discarding it.
+        $delta = $raw;
+        Log3 $name, 3, "$name: no rain baseline stored - adopting today's counter ($raw mm)";
+    }
+    # else: first observation on a non-daily source -> only establish the baseline
     $accum += $delta;
 
     # Rolling-window buffer: "epoch:accum,epoch:accum,..."
