@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.39 - 2026-08-17
+#     Version 1.0.40 - 2026-08-17
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,17 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.40 - 2026-08-17  Fix: Stadtwasser-Befuellung setzt den Ernte-Trigger jetzt zurueck. Bisher deckte
+#                      der Schutz nur den Moment ab, in dem das Fuellventil offen war. Nach einer
+#                      Bewaesserung ist das Fass leer und wird in der Giesspause aus der
+#                      Hauswasserleitung nachgefuellt - meldete es danach 'voll' und lag noch Regen im
+#                      Zaehler, waere Leitungswasser in den IBC gepumpt worden. An der realen Anlage
+#                      gut sichtbar: barrelFull-Ereignisse haeufen sich direkt nach den Giesszeiten.
+#                      Neu: An allen sechs Stellen, an denen das Modul Stadtwasser aufdreht, wird
+#                      rainSinceHarvest_mm auf 0 gesetzt (NoteMainsFill). Die naechste Ernte verlangt
+#                      damit neuen Regen. Wichtig: Ein rein MECHANISCHER Schwimmer in der
+#                      Hauswasserleitung bleibt fuer das Modul unsichtbar - haelt der das Fass bis zum
+#                      barrelFull-Sensor, greift dieser Schutz nicht.
 # 1.0.39 - 2026-08-17  Fix: Der mit 1.0.38 eingefuehrte Mengen-Trigger fuer die IBC-Befuellung wurde
 #                      nicht verbraucht - er prueft rainAmount_mm, und der bleibt das ganze
 #                      rainAmountWindow (Default 24 h) ueber der Schwelle. Wurde das Fass nach dem
@@ -252,7 +263,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.39';
+    $hash->{VERSION}    = '1.0.40';
 
     my $name = $a[0];
 
@@ -1729,6 +1740,7 @@ sub Gartenbewaesserung_FillBarrelForCircuit {
     }
 
     Gartenbewaesserung_SwitchDevice($name, $fillValve, "on");
+    Gartenbewaesserung_NoteMainsFill($hash);
     $hash->{HELPER}{barrelFilling} = 1;
     Gartenbewaesserung_StartBarrelFillTimeout($hash);
 
@@ -1973,6 +1985,7 @@ sub Gartenbewaesserung_StartCircuitPause {
         my $fillValve = AttrVal($name, "barrelFillValveDevice", "");
         if($fillValve ne "") {
             Gartenbewaesserung_SwitchDevice($name, $fillValve, "on");
+            Gartenbewaesserung_NoteMainsFill($hash);
             $hash->{HELPER}{pauseSource} = "water_supply";
         }
     }
@@ -2298,6 +2311,7 @@ sub Gartenbewaesserung_StartWateringPause {
         my $fillValve = AttrVal($name, "barrelFillValveDevice", "");
         if($fillValve ne "") {
             Gartenbewaesserung_SwitchDevice($name, $fillValve, "on");
+            Gartenbewaesserung_NoteMainsFill($hash);
             $hash->{HELPER}{pauseSource} = "water_supply";
             Log3 $name, 4, "$name: Opened water supply valve (barrelFillValveDevice)";
         }
@@ -2666,6 +2680,7 @@ sub Gartenbewaesserung_FillBarrel {
     }
 
     Gartenbewaesserung_SwitchDevice($name, $fillValve, "on");
+    Gartenbewaesserung_NoteMainsFill($hash);
     $hash->{HELPER}{barrelFilling} = 1;
     Gartenbewaesserung_StartBarrelFillTimeout($hash);
 
@@ -3124,6 +3139,7 @@ sub Gartenbewaesserung_StartBarrelEmptyRefillPause {
         my $fillValve = AttrVal($name, "barrelFillValveDevice", "");
         if($fillValve ne "") {
             Gartenbewaesserung_SwitchDevice($name, $fillValve, "on");
+            Gartenbewaesserung_NoteMainsFill($hash);
         }
 
         $hash->{HELPER}{barrelEmptyRefillPauseSource} = "water_supply";
@@ -3354,6 +3370,7 @@ sub Gartenbewaesserung_HandleBarrelEmpty {
         if($fillValve ne "") {
             Log3 $name, 3, "$name: IBC empty, using water supply to refill barrel";
             Gartenbewaesserung_SwitchDevice($name, $fillValve, "on");
+            Gartenbewaesserung_NoteMainsFill($hash);
             $hash->{HELPER}{barrelEmptyRefilling} = 1;
             $hash->{HELPER}{barrelEmptyRefillSource} = "water_supply";
             $hash->{HELPER}{barrelFilling} = 1;
@@ -4065,6 +4082,24 @@ sub Gartenbewaesserung_RainRecentEnough {
     return 0 if(Gartenbewaesserung_IsDeviceOn($name, AttrVal($name, "barrelFillValveDevice", "")));
 
     return (ReadingsVal($name, "rainAmount_mm", 0) >= $minAmount) ? 1 : 0;
+}
+
+##############################################################################
+# The barrel is being topped up from the mains supply. Whatever rain credit had
+# accumulated no longer identifies the barrel contents as rainwater, so drop it:
+# the next harvest must be earned by new rain. Without this a barrel refilled
+# from the mains during a watering pause would be pumped into the IBC as soon as
+# the cycle ends - putting tap water into the rainwater store.
+##############################################################################
+sub Gartenbewaesserung_NoteMainsFill {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    return if(ReadingsVal($name, "rainSinceHarvest_mm", 0) <= 0);
+
+    readingsSingleUpdate($hash, "rainSinceHarvest_mm", "0", 1);
+    Log3 $name, 4, "$name: barrel topped up from mains - harvest trigger cleared "
+        . "(no tap water into the IBC)";
 }
 
 ##############################################################################
@@ -4813,9 +4848,14 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             noch in den IBC übernommen, und eine laufende Befüllung wird bei Regenende nicht mehr
             abgebrochen – sie endet regulär bei <code>barrelEmpty</code>, <code>ibcFull</code> oder
             Bewässerungsstart.<br>
-            <i>Schutz:</i> Wurde das Fass aus der Hauswasserleitung gefüllt (Refill-Quelle
-            <code>water_supply</code> oder <code>barrelFillValveDevice</code> offen), greift die
-            Mengen-Bedingung nicht – es wird also kein Leitungswasser in den IBC gepumpt.
+            <i>Schutz gegen Leitungswasser:</i> Sobald das Modul Stadtwasser aufdreht
+            (<code>barrelFillValveDevice</code>, z.&nbsp;B. in der Nachfüllpause bei leerem IBC), wird
+            <code>rainSinceHarvest_mm</code> auf 0 gesetzt – ein danach volles Fass löst also keine
+            Ernte aus, bis wieder Regen gefallen ist.<br>
+            <i>Grenze:</i> Ein rein <b>mechanischer</b> Schwimmer in der Hauswasserleitung ist für das
+            Modul unsichtbar. Hält dieser das Fass bis zum <code>barrelFullSensorDevice</code>, kann
+            das Modul Regen- und Leitungswasser nicht unterscheiden – in dem Fall sollte der Schwimmer
+            unterhalb des Fass-voll-Sensors abregeln.
         </li>
         <li><a id="Gartenbewaesserung-attr-roofArea"></a>
             <b>roofArea</b><br>
