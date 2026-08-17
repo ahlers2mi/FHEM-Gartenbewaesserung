@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.40 - 2026-08-17
+#     Version 1.0.41 - 2026-08-17
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,14 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.41 - 2026-08-17  Neu: Fehlt der gespeicherte Ausgangswert .rainLastRaw - frisches Geraet oder
+#                      geloeschte Readings -, war das Delta der ersten Messung 0. Die mit 1.0.36
+#                      ergaenzte Fenster-Vorbelegung rettete dabei rainAmount_mm, nicht aber die
+#                      Zaehler, die ueber das Delta laufen: harvest_*_l, rainSinceFill_mm und
+#                      rainSinceHarvest_mm. Bei einem Tageszaehler (dailyrain_mm) wird der aktuelle
+#                      Stand jetzt als bereits gefallener Regen uebernommen statt verworfen.
+#                      Doppelt gezaehlt wird nichts: Ist eine Basis vorhanden, greift wie bisher die
+#                      Delta-Rechnung.
 # 1.0.40 - 2026-08-17  Fix: Stadtwasser-Befuellung setzt den Ernte-Trigger jetzt zurueck. Bisher deckte
 #                      der Schutz nur den Moment ab, in dem das Fuellventil offen war. Nach einer
 #                      Bewaesserung ist das Fass leer und wird in der Giesspause aus der
@@ -270,7 +278,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.40';
+    $hash->{VERSION}    = '1.0.41';
 
     my $name = $a[0];
 
