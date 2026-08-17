@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.41 - 2026-08-17
+#     Version 1.0.42 - 2026-08-17
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,22 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.42 - 2026-08-17  Fix: Regen loescht barrelFillTimeoutAlert nicht mehr. Der Alarm besagt, dass
+#                      eine Fass-Befuellung nicht geklappt hat - Regen sagt darueber nichts aus.
+#                      Setups, die daraus einen IBC-leer-Zustand ableiten (Dummy per notify), bekamen
+#                      dadurch bei JEDEM Regenbeginn ein falsches 'Wasser vorhanden'. Der Alarm wird
+#                      dort geloescht, wo er hingehoert: wenn barrelFull tatsaechlich meldet.
+#                      Fix: RainCollectionSeenFill wird bei ibcEmpty nur noch auf der echten Flanke
+#                      yes->no ausgeloest. Ein Sensor oder Dummy, der seinen 'nicht leer'-Zustand
+#                      wiederholt, hat sonst die Sammel-Ueberwachung dauerhaft zurueckgesetzt - sie
+#                      konnte nie anschlagen.
+#                      Neu: Messgrundlage fuer eine spaetere IBC-Fuellstandsschaetzung. Je Lauf
+#                      Fass->IBC werden Dauer und Endgrund festgehalten (lastIbcFillDuration,
+#                      lastIbcFillEnd, lastIbcFillVolume_l). Laeuft ein Zyklus von vollem Fass bis
+#                      barrelEmpty durch, ist das bewegte Volumen bekannt (neues Attribut
+#                      barrelUsableVolume) - daraus lernt das Modul die aktuelle Foerderrate
+#                      (ibcFillFlow_lpm, gedaempft gemittelt). So wandert die Rate mit, wenn der
+#                      Filter zusetzt, statt in einem festen Attribut zu veralten.
 # 1.0.41 - 2026-08-17  Neu: Fehlt der gespeicherte Ausgangswert .rainLastRaw - frisches Geraet oder
 #                      geloeschte Readings -, war das Delta der ersten Messung 0. Die mit 1.0.36
 #                      ergaenzte Fenster-Vorbelegung rettete dabei rainAmount_mm, nicht aber die
@@ -251,6 +267,7 @@ sub Gartenbewaesserung_Initialize {
         "rainCollectionCheckDelay:slider,5,5,720 " .
         "ibcFillRainAmount:slider,0,0.1,20 " .
         "roofArea:textField " .
+        "barrelUsableVolume:textField " .
         "runoffCoefficient:textField " .
         "pumpStartDelay:slider,-30,1,30 " .
         "pumpMaxRuntime:slider,0,1,240 " .
@@ -278,7 +295,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.41';
+    $hash->{VERSION}    = '1.0.42';
 
     my $name = $a[0];
 
@@ -397,7 +414,7 @@ sub Gartenbewaesserung_Set {
         return Gartenbewaesserung_StartIBCFill($hash, 1);
     }
     elsif($cmd eq "stopIBCFill") {
-        return Gartenbewaesserung_StopIBCFill($hash);
+        return Gartenbewaesserung_StopIBCFill($hash, "manual");
     }
     elsif($cmd eq "startIBCtoBarrel") {
         return Gartenbewaesserung_StartIBCtoBarrel($hash);
@@ -596,11 +613,17 @@ sub Gartenbewaesserung_Notify {
                 }
                 elsif(Gartenbewaesserung_CheckSensorInactive($name, $event, $ibcEmptyReading,
                       AttrVal($name, "ibcEmptySensorInactiveValue", ""))) {
+                    # Only a real yes->no edge counts as a fill response. A sensor that
+                    # repeats its "not empty" state - or a dummy fed by an automation -
+                    # would otherwise reset the collection watchdog over and over.
+                    my $wasEmpty = (ReadingsVal($name, "ibcEmpty", "") eq "yes");
                     readingsSingleUpdate($hash, "ibcEmpty", "no", 1);
                     # IBC has water again -> recover from a no-water abort if active
                     Gartenbewaesserung_RecoverFromNoWater($hash, 0);
-                    # IBC gained water (no longer empty) -> the rainwater collection is working
-                    Gartenbewaesserung_RainCollectionSeenFill($hash, "ibcEmpty:no");
+                    if($wasEmpty) {
+                        # IBC gained water (no longer empty) -> rainwater collection works
+                        Gartenbewaesserung_RainCollectionSeenFill($hash, "ibcEmpty:no");
+                    }
                 }
             }
         }
@@ -646,10 +669,11 @@ sub Gartenbewaesserung_Notify {
                 my $activeValue = AttrVal($name, "rainSensorActiveValue", "");
                 if(Gartenbewaesserung_CheckSensorActive($name, $event, $rainReading, $activeValue)) {
                     readingsSingleUpdate($hash, "raining", "yes", 1);
-                    if(ReadingsVal($name, "barrelFillTimeoutAlert", "no") ne "no") {
-                        readingsSingleUpdate($hash, "barrelFillTimeoutAlert", "no", 1);
-                        Log3 $name, 3, "$name: Rain detected, clearing barrelFillTimeoutAlert";
-                    }
+                    # NOTE: rain does NOT clear barrelFillTimeoutAlert any more. The alert
+                    # states that a barrel fill did not succeed - rain says nothing about
+                    # that, and clearing it here produced a false "water is available"
+                    # signal for setups that derive an IBC-empty flag from the alert.
+                    # It is cleared where it belongs: when barrelFull actually reports.
                     Log3 $name, 4, "$name: Rain sensor active (event), triggering CheckRain immediately";
                     # Remove pending timer and run CheckRain right now
                     RemoveInternalTimer($hash, "Gartenbewaesserung_CheckRain");
@@ -661,7 +685,7 @@ sub Gartenbewaesserung_Notify {
                     delete $hash->{HELPER}{rainingSince};
                     Log3 $name, 4, "$name: Rain sensor inactive (event), stopping IBC fill if running";
                     if($hash->{HELPER}{ibcFilling}) {
-                        Gartenbewaesserung_StopIBCFill($hash);
+                        Gartenbewaesserung_StopIBCFill($hash, "watering");
                     }
                 }
             }
@@ -1707,7 +1731,7 @@ sub Gartenbewaesserung_StartCircuit {
     delete $hash->{HELPER}{noWaterAbort};
 
     # Make absolutely sure IBC fill is stopped
-    Gartenbewaesserung_StopIBCFill($hash);
+    Gartenbewaesserung_StopIBCFill($hash, "watering");
 
     my $circuitLabel = Gartenbewaesserung_CircuitLabel($hash, $circuitNum);
 
@@ -1817,7 +1841,7 @@ sub Gartenbewaesserung_RunCircuit {
     }
 
     # Make sure IBC valve is closed
-    Gartenbewaesserung_StopIBCFill($hash);
+    Gartenbewaesserung_StopIBCFill($hash, "watering");
 
     # Check if barrel is empty - do not run pump, but try to refill it first
     if(ReadingsVal($name, "barrelEmpty", "no") eq "yes") {
@@ -2532,7 +2556,7 @@ sub Gartenbewaesserung_OpenValve {
     }
 
     # Make sure IBC valve is closed during watering
-    Gartenbewaesserung_StopIBCFill($hash);
+    Gartenbewaesserung_StopIBCFill($hash, "watering");
 
     # Check if barrel is empty - do not run pump, but try to refill it first
     if(ReadingsVal($name, "barrelEmpty", "no") eq "yes") {
@@ -3339,7 +3363,7 @@ sub Gartenbewaesserung_HandleBarrelEmpty {
     # on its own; CheckRain resumes IBC filling once barrelFull reports full again.
     if($hash->{HELPER}{ibcFilling}) {
         Log3 $name, 3, "$name: Stopping IBC fill (barrel was emptied during IBC fill)";
-        Gartenbewaesserung_StopIBCFill($hash);
+        Gartenbewaesserung_StopIBCFill($hash, "barrelEmpty");
         Log3 $name, 3, "$name: Barrel emptied by IBC fill - skipping automatic refill (avoids barrel<->IBC oscillation)";
         readingsSingleUpdate($hash, "state", "idle", 1);
         return;
@@ -3703,7 +3727,7 @@ sub Gartenbewaesserung_StartSingleValve {
     }
 
     # Make sure IBC fill is stopped
-    Gartenbewaesserung_StopIBCFill($hash);
+    Gartenbewaesserung_StopIBCFill($hash, "watering");
     Gartenbewaesserung_StopIBCtoBarrel($hash);
 
     # Check if barrel is empty - do not run pump
@@ -3857,6 +3881,11 @@ sub Gartenbewaesserung_StartIBCFill {
     readingsBulkUpdate($hash, "rainSinceHarvest_mm", "0");
     readingsEndUpdate($hash, 1);
 
+    # Measurement: remember when this run began and whether it started from a full
+    # barrel. Only a full->empty run moves a known volume and can teach the rate.
+    $hash->{HELPER}{ibcFillStartTime} = int(time());
+    $hash->{HELPER}{ibcFillFromFull}  = (ReadingsVal($name, "barrelFull", "no") eq "yes") ? 1 : 0;
+
     if($pumpDevice ne "") {
         my $delay = AttrVal($name, "pumpStartDelay", 3);
         if($delay > 0) {
@@ -3895,13 +3924,66 @@ sub Gartenbewaesserung_StartIBCFill {
 }
 
 ##############################################################################
+# Measurement for the barrel -> IBC runs (groundwork for a level estimate).
+#
+# Records how long a run took and why it ended. A run that started with a full
+# barrel and ended on barrelEmpty moved a known volume - barrelUsableVolume -
+# so it also yields the current pump rate. Learning the rate this way keeps it
+# honest as the filter clogs, instead of trusting a fixed value in an attribute.
+##############################################################################
+sub Gartenbewaesserung_RecordIbcFillRun {
+    my ($hash, $reason) = @_;
+    my $name = $hash->{NAME};
+
+    my $start = $hash->{HELPER}{ibcFillStartTime};
+    my $fromFull = $hash->{HELPER}{ibcFillFromFull};
+    delete $hash->{HELPER}{ibcFillStartTime};
+    delete $hash->{HELPER}{ibcFillFromFull};
+    return if(!$start);
+
+    $reason = "unknown" if(!defined($reason) || $reason eq "");
+    my $minutes = (int(time()) - $start) / 60;
+    return if($minutes <= 0);
+
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, "lastIbcFillDuration", sprintf("%.1f", $minutes));
+    readingsBulkUpdate($hash, "lastIbcFillEnd", $reason);
+
+    # Complete run from a full barrel down to empty -> known volume, learn the rate
+    my $volume = AttrVal($name, "barrelUsableVolume", 0);
+    if($fromFull && $reason eq "barrelEmpty" && $volume > 0) {
+        my $rate = $volume / $minutes;
+        my $old  = ReadingsVal($name, "ibcFillFlow_lpm", 0);
+        $old = 0 if($old !~ /^\d+(?:\.\d+)?$/);
+        # Damped average so a single odd run does not dominate
+        my $new = ($old > 0) ? ($old * 0.7 + $rate * 0.3) : $rate;
+        readingsBulkUpdate($hash, "ibcFillFlow_lpm", sprintf("%.1f", $new));
+        readingsBulkUpdate($hash, "lastIbcFillVolume_l", sprintf("%.0f", $volume));
+        Log3 $name, 3, sprintf("%s: complete barrel->IBC run: %.0f l in %.1f min "
+            . "= %.1f l/min (learned rate now %.1f)", $name, $volume, $minutes, $rate, $new);
+    }
+    else {
+        # Partial run - estimate from the learned rate if we already have one
+        my $rate = ReadingsVal($name, "ibcFillFlow_lpm", 0);
+        $rate = 0 if($rate !~ /^\d+(?:\.\d+)?$/);
+        readingsBulkUpdate($hash, "lastIbcFillVolume_l",
+            $rate > 0 ? sprintf("%.0f", $rate * $minutes) : "unknown");
+        Log3 $name, 3, sprintf("%s: barrel->IBC run ended (%s) after %.1f min",
+            $name, $reason, $minutes);
+    }
+    readingsEndUpdate($hash, 1);
+}
+
+##############################################################################
 # Stop IBC filling
 ##############################################################################
 sub Gartenbewaesserung_StopIBCFill {
-    my ($hash) = @_;
+    my ($hash, $reason) = @_;
     my $name = $hash->{NAME};
 
     return if(!$hash->{HELPER}{ibcFilling});
+
+    Gartenbewaesserung_RecordIbcFillRun($hash, $reason);
 
     my $ibcValve = AttrVal($name, "ibcFillValveDevice", "");
     if($ibcValve ne "") {
@@ -3933,7 +4015,7 @@ sub Gartenbewaesserung_CheckIBCFull {
 
     if($hash->{HELPER}{ibcFilling}) {
         Log3 $name, 3, "$name: IBC full detected, stopping fill";
-        Gartenbewaesserung_StopIBCFill($hash);
+        Gartenbewaesserung_StopIBCFill($hash, "ibcFull");
     }
 }
 
@@ -3951,7 +4033,7 @@ sub Gartenbewaesserung_StartIBCtoBarrel {
     }
 
     # Make sure IBC fill is not running
-    Gartenbewaesserung_StopIBCFill($hash);
+    Gartenbewaesserung_StopIBCFill($hash, "ibcToBarrel");
 
     my $ibcToBarrelValve = AttrVal($name, "ibcToBarrelValveDevice", "");
     if($ibcToBarrelValve eq "") {
@@ -4435,7 +4517,7 @@ sub Gartenbewaesserung_CheckRain {
                             . "qualifies - continuing IBC fill";
                     }
                     else {
-                        Gartenbewaesserung_StopIBCFill($hash);
+                        Gartenbewaesserung_StopIBCFill($hash, "rainStopped");
                     }
                 }
             }
@@ -4536,6 +4618,13 @@ sub Gartenbewaesserung_GetStatus {
         $status .= "Monat:  " . ReadingsVal($name, "harvest_month_l", "0") . " l\n";
         $status .= "Jahr:   " . ReadingsVal($name, "harvest_year_l",  "0") . " l\n";
         $status .= "Gesamt: " . ReadingsVal($name, "harvest_total_l", "0") . " l\n\n";
+    }
+    if(ReadingsVal($name, "lastIbcFillDuration", "") ne "") {
+        $status .= "\n--- Letzte IBC-Befuellung ---\n";
+        $status .= "Dauer:     " . ReadingsVal($name, "lastIbcFillDuration", "-") . " min\n";
+        $status .= "Endgrund:  " . ReadingsVal($name, "lastIbcFillEnd", "-") . "\n";
+        $status .= "Volumen:   " . ReadingsVal($name, "lastIbcFillVolume_l", "-") . " l\n";
+        $status .= "Foerderrate (gelernt): " . ReadingsVal($name, "ibcFillFlow_lpm", "-") . " l/min\n\n";
     }
     $status .= "Last Watering: " . ReadingsVal($name, "lastWatering", "never") . "\n";
     $status .= "Last Circuit: " . ReadingsVal($name, "lastCircuitWatering", "never") . "\n";
@@ -4885,6 +4974,14 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             das Modul Regen- und Leitungswasser nicht unterscheiden – in dem Fall sollte der Schwimmer
             unterhalb des Fass-voll-Sensors abregeln.
         </li>
+        <li><a id="Gartenbewaesserung-attr-barrelUsableVolume"></a>
+            <b>barrelUsableVolume</b><br>
+            Typ: Zahl (Liter). Ohne Vorgabe deaktiviert.<br>
+            Nutzbares Fassvolumen zwischen Fass-voll- und Fass-leer-Sensor. Läuft eine Befüllung
+            Fass&nbsp;&rarr;&nbsp;IBC von einem vollen Fass bis <code>barrelEmpty</code> durch, ist
+            das bewegte Volumen damit bekannt; das Modul leitet daraus die aktuelle Förderrate ab
+            (<code>ibcFillFlow_lpm</code>). Grundlage für eine spätere Füllstandsschätzung.
+        </li>
         <li><a id="Gartenbewaesserung-attr-roofArea"></a>
             <b>roofArea</b><br>
             Typ: Zahl (Quadratmeter). Ohne Vorgabe deaktiviert.<br>
@@ -5084,6 +5181,8 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>rainSinceFill_mm</b> - Regenmenge (mm) seit der letzten erkannten Füllstands-Reaktion von Fass/IBC. Grundlage der Sammel-Überwachung; wird bei einer Füllstands-Reaktion auf 0 zurückgesetzt.</li>
         <li><b>rainCollectionAlert</b> - <code>yes</code>/<code>no</code>; <code>yes</code>, wenn mindestens <code>rainCollectionCheckAmount</code> mm Regen fiel, ohne dass Fass/IBC innerhalb von <code>rainCollectionCheckDelay</code> Minuten Wasser meldeten (Zulauf/Dachrinne/Filter prüfen). Reset automatisch bei der nächsten Füllstands-Reaktion.</li>
         <li><b>rainSinceHarvest_mm</b> - Regenmenge (mm) seit der letzten IBC-Befuellung. Steuert zusammen mit <code>ibcFillRainAmount</code>, wann geerntet wird, und wird beim Start einer Befuellung auf 0 gesetzt - eine neue Ernte braucht daher immer neuen Regen.</li>
+        <li><b>lastIbcFillDuration</b> / <b>lastIbcFillEnd</b> / <b>lastIbcFillVolume_l</b> - Dauer (Minuten), Endgrund (<code>barrelEmpty</code>, <code>ibcFull</code>, <code>watering</code>, <code>rainStopped</code>, <code>ibcToBarrel</code>, <code>manual</code>) und bewegtes Volumen der letzten Befüllung Fass&nbsp;&rarr;&nbsp;IBC.</li>
+        <li><b>ibcFillFlow_lpm</b> - Gelernte Förderrate in Litern pro Minute. Wird nur aus vollständigen Läufen (volles Fass bis <code>barrelEmpty</code>) fortgeschrieben und gedämpft gemittelt, sinkt also automatisch mit, wenn der Filter zusetzt. Setzt <code>barrelUsableVolume</code> voraus.</li>
         <li><b>harvest_today_l</b> / <b>harvest_month_l</b> / <b>harvest_year_l</b> / <b>harvest_total_l</b> - Aufgefangene Regenwassermenge in Litern (heute, laufender Monat, laufendes Jahr, seit Inbetriebnahme). Berechnet als <code>Regenmenge (mm) × roofArea × runoffCoefficient</code>; nur aktiv, wenn <code>roofArea</code> gesetzt ist. Die Perioden-Zähler starten bei Tages-, Monats- bzw. Jahreswechsel automatisch neu, <code>harvest_total_l</code> läuft weiter. Zurücksetzen mit <code>set &lt;name&gt; resetHarvestStats</code>.<br>
             <i>Grenze:</i> Der Wert beziffert, was am Fallrohr ankommt. Was bei vollem Fass überläuft, kann nicht abgezogen werden – die tatsächlich gespeicherte Menge liegt also darunter.</li>
     </ul>
