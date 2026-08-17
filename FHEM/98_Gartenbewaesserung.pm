@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.42 - 2026-08-17
+#     Version 1.0.43 - 2026-08-17
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,18 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.43 - 2026-08-17  Fix: Der mit 1.0.40 eingebaute Pendelschutz griff beim haeufigsten Fall nicht.
+#                      CheckBarrelFull hat zwei getrennte Zweige - einen fuer HELPER{ibcToBarrelActive}
+#                      (nur von StartIBCtoBarrel gesetzt) und einen fuer eine aktive Giesspause. Die
+#                      normale Schwerkraft-Nachspeisung in einer Pause laeuft ueber den zweiten Zweig
+#                      und setzt ibcToBarrelActive nie, sie merkt sich nur pauseSource. Der
+#                      Ernte-Trigger wurde dort also nicht verbraucht: Regen -> Bewaesserung leert das
+#                      Fass -> Pause fuellt es aus dem IBC -> nach dem Giessen wandert dasselbe Wasser
+#                      wieder hoch. NoteNonRainFill wird jetzt auch im Pausen-Zweig aufgerufen.
+#                      Neu: Messung der Gegenrichtung. Ein IBC->Fass-Lauf in einer Pause war bisher
+#                      voellig unsichtbar (ibcToBarrelActive blieb 'no'). Neue Readings
+#                      lastIbcToBarrelDuration und lastIbcToBarrelEnd halten Dauer und Endgrund fest -
+#                      die 'Raus'-Seite fuer eine spaetere Fuellstandsbilanz.
 # 1.0.42 - 2026-08-17  Fix: Regen loescht barrelFillTimeoutAlert nicht mehr. Der Alarm besagt, dass
 #                      eine Fass-Befuellung nicht geklappt hat - Regen sagt darueber nichts aus.
 #                      Setups, die daraus einen IBC-leer-Zustand ableiten (Dummy per notify), bekamen
@@ -295,7 +307,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.42';
+    $hash->{VERSION}    = '1.0.43';
 
     my $name = $a[0];
 
@@ -2066,6 +2078,7 @@ sub Gartenbewaesserung_StartCircuitPause {
         }
 
         $hash->{HELPER}{pauseSource} = "ibc";
+        Gartenbewaesserung_NoteIbcToBarrelStart($hash);
     }
 
     # Schedule pause end
@@ -2401,6 +2414,7 @@ sub Gartenbewaesserung_StartWateringPause {
         }
 
         $hash->{HELPER}{pauseSource} = "ibc";
+        Gartenbewaesserung_NoteIbcToBarrelStart($hash);
     }
 
     # Schedule pause end
@@ -2430,6 +2444,7 @@ sub Gartenbewaesserung_EndWateringPause {
         }
     }
     elsif($pauseSource eq "ibc") {
+        Gartenbewaesserung_NoteIbcToBarrelStop($hash, "pauseEnd");
         my $ibcToBarrelValve = AttrVal($name, "ibcToBarrelValveDevice", "");
         if($ibcToBarrelValve ne "") {
             Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "off");
@@ -2821,6 +2836,14 @@ sub Gartenbewaesserung_CheckBarrelFull {
             }
         }
         elsif($pauseSource eq "ibc") {
+            # The barrel was filled from the IBC, not by rain. Clear the harvest
+            # trigger - otherwise this water is pumped straight back up once the
+            # watering cycle ends. The ibcToBarrelActive branch above does not cover
+            # this path: a watering pause never sets that flag, it only records
+            # pauseSource.
+            Gartenbewaesserung_NoteNonRainFill($hash, "IBC-to-barrel (pause)");
+            Gartenbewaesserung_NoteIbcToBarrelStop($hash, "barrelFull");
+
             my $ibcToBarrelValve = AttrVal($name, "ibcToBarrelValveDevice", "");
             if($ibcToBarrelValve ne "") {
                 Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "off");
@@ -3176,6 +3199,7 @@ sub Gartenbewaesserung_StartBarrelEmptyRefillPause {
         }
 
         $hash->{HELPER}{barrelEmptyRefillPauseSource} = "ibc";
+        Gartenbewaesserung_NoteIbcToBarrelStart($hash);
         Log3 $name, 3, "$name: Refill pause: using IBC as source";
     }
     else {
@@ -3921,6 +3945,36 @@ sub Gartenbewaesserung_StartIBCFill {
     }
 
     return undef;
+}
+
+##############################################################################
+# Measurement for the IBC -> barrel direction (the "out" side of a later level
+# estimate). A watering pause feeds the barrel from the IBC by gravity without
+# ever setting ibcToBarrelActive, so these runs are invisible otherwise.
+##############################################################################
+sub Gartenbewaesserung_NoteIbcToBarrelStart {
+    my ($hash) = @_;
+    $hash->{HELPER}{ibcToBarrelStartTime} = int(time());
+}
+
+sub Gartenbewaesserung_NoteIbcToBarrelStop {
+    my ($hash, $reason) = @_;
+    my $name = $hash->{NAME};
+
+    my $start = $hash->{HELPER}{ibcToBarrelStartTime};
+    delete $hash->{HELPER}{ibcToBarrelStartTime};
+    return if(!$start);
+
+    my $minutes = (int(time()) - $start) / 60;
+    return if($minutes <= 0);
+
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, "lastIbcToBarrelDuration", sprintf("%.1f", $minutes));
+    readingsBulkUpdate($hash, "lastIbcToBarrelEnd", $reason || "unknown");
+    readingsEndUpdate($hash, 1);
+
+    Log3 $name, 3, sprintf("%s: IBC->barrel run ended (%s) after %.1f min",
+        $name, $reason || "unknown", $minutes);
 }
 
 ##############################################################################
@@ -5181,6 +5235,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>rainSinceFill_mm</b> - Regenmenge (mm) seit der letzten erkannten Füllstands-Reaktion von Fass/IBC. Grundlage der Sammel-Überwachung; wird bei einer Füllstands-Reaktion auf 0 zurückgesetzt.</li>
         <li><b>rainCollectionAlert</b> - <code>yes</code>/<code>no</code>; <code>yes</code>, wenn mindestens <code>rainCollectionCheckAmount</code> mm Regen fiel, ohne dass Fass/IBC innerhalb von <code>rainCollectionCheckDelay</code> Minuten Wasser meldeten (Zulauf/Dachrinne/Filter prüfen). Reset automatisch bei der nächsten Füllstands-Reaktion.</li>
         <li><b>rainSinceHarvest_mm</b> - Regenmenge (mm) seit der letzten IBC-Befuellung. Steuert zusammen mit <code>ibcFillRainAmount</code>, wann geerntet wird, und wird beim Start einer Befuellung auf 0 gesetzt - eine neue Ernte braucht daher immer neuen Regen.</li>
+        <li><b>lastIbcToBarrelDuration</b> / <b>lastIbcToBarrelEnd</b> - Dauer (Minuten) und Endgrund (<code>barrelFull</code>, <code>pauseEnd</code>) des letzten Laufs IBC&nbsp;&rarr;&nbsp;Fass, einschließlich der Schwerkraft-Nachspeisung während einer Gießpause.</li>
         <li><b>lastIbcFillDuration</b> / <b>lastIbcFillEnd</b> / <b>lastIbcFillVolume_l</b> - Dauer (Minuten), Endgrund (<code>barrelEmpty</code>, <code>ibcFull</code>, <code>watering</code>, <code>rainStopped</code>, <code>ibcToBarrel</code>, <code>manual</code>) und bewegtes Volumen der letzten Befüllung Fass&nbsp;&rarr;&nbsp;IBC.</li>
         <li><b>ibcFillFlow_lpm</b> - Gelernte Förderrate in Litern pro Minute. Wird nur aus vollständigen Läufen (volles Fass bis <code>barrelEmpty</code>) fortgeschrieben und gedämpft gemittelt, sinkt also automatisch mit, wenn der Filter zusetzt. Setzt <code>barrelUsableVolume</code> voraus.</li>
         <li><b>harvest_today_l</b> / <b>harvest_month_l</b> / <b>harvest_year_l</b> / <b>harvest_total_l</b> - Aufgefangene Regenwassermenge in Litern (heute, laufender Monat, laufendes Jahr, seit Inbetriebnahme). Berechnet als <code>Regenmenge (mm) × roofArea × runoffCoefficient</code>; nur aktiv, wenn <code>roofArea</code> gesetzt ist. Die Perioden-Zähler starten bei Tages-, Monats- bzw. Jahreswechsel automatisch neu, <code>harvest_total_l</code> läuft weiter. Zurücksetzen mit <code>set &lt;name&gt; resetHarvestStats</code>.<br>
