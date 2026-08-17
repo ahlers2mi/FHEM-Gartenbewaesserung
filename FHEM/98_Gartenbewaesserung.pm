@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.37 - 2026-08-16
+#     Version 1.0.38 - 2026-08-17
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,18 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.38 - 2026-08-17  Neu: Attribut ibcFillRainAmount (mm, 0 = aus). Die IBC-Befuellung setzte bisher
+#                      voraus, dass es GENAU in dem Moment regnet, in dem der Fass-voll-Sensor
+#                      anschlaegt. In der Praxis wird das Fenster fast immer verfehlt, weil Dach und
+#                      Rinne nach Regenende nachlaufen und das Fass erst danach voll meldet (real
+#                      beobachtet: Regen endete 08:27, barrelFull kam 09:41 - keine Befuellung).
+#                      Mit gesetztem ibcFillRainAmount genuegt jetzt, dass im Fenster rainAmountWindow
+#                      mindestens X mm gefallen sind; ein volles Fass wird dann auch nach dem Regen
+#                      noch geerntet, und eine laufende Befuellung wird bei Regenende nicht mehr
+#                      abgebrochen. Schutz gegen Hauswasser: Wurde das Fass aus der Hauswasserleitung
+#                      gefuellt (Refill-Quelle water_supply oder Fuellventil offen), greift die
+#                      Mengen-Bedingung nicht - es wird also kein Leitungswasser in den IBC gepumpt.
+#                      Ohne das Attribut bleibt das Verhalten exakt wie bisher.
 # 1.0.37 - 2026-08-16  Neu: Regenwasser-Ertragsstatistik. Mit den Attributen roofArea (Dachflaeche am
 #                      Fallrohr in m2) und runoffCoefficient (Abflussbeiwert, Default 0.8) rechnet das
 #                      Modul die gemessene Regenmenge in Liter um und fuehrt laufende Summen:
@@ -201,6 +213,7 @@ sub Gartenbewaesserung_Initialize {
         "rainSkipsWateringAmount:slider,0,0.5,50 " .
         "rainCollectionCheckAmount:slider,0,0.5,50 " .
         "rainCollectionCheckDelay:slider,5,5,720 " .
+        "ibcFillRainAmount:slider,0,0.1,20 " .
         "roofArea:textField " .
         "runoffCoefficient:textField " .
         "pumpStartDelay:slider,-30,1,30 " .
@@ -229,7 +242,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.37';
+    $hash->{VERSION}    = '1.0.38';
 
     my $name = $a[0];
 
@@ -483,12 +496,13 @@ sub Gartenbewaesserung_Notify {
                 if(Gartenbewaesserung_CheckSensorActive($name, $event, $barrelReading, $activeValue)) {
                     readingsSingleUpdate($hash, "barrelFull", "yes", 1);
                     Gartenbewaesserung_CheckBarrelFull($hash);
-                    # If raining and idle, start IBC fill immediately (event-triggered)
-                    if(ReadingsVal($name, "raining", "no") eq "yes" &&
+                    # Barrel full after (or during) rain and idle -> harvest into the IBC
+                    if(Gartenbewaesserung_RainRecentEnough($hash) &&
                        !$hash->{HELPER}{ibcFilling} &&
                        !$hash->{HELPER}{watering} &&
                         !$hash->{HELPER}{circuitMode}) {
-                        Log3 $name, 3, "$name: Barrel full and raining, starting IBC fill (event-triggered)";
+                        Log3 $name, 3, "$name: Barrel full after rain ("
+                            . ReadingsVal($name, "rainAmount_mm", "?") . " mm in window), starting IBC fill";
                         Gartenbewaesserung_StartIBCFill($hash, 0);
                     }
                     if($hash->{HELPER}{barrelEmptyResumePending} && $hash->{HELPER}{barrelEmptyRefillPause}) {
@@ -500,7 +514,7 @@ sub Gartenbewaesserung_Notify {
                     Gartenbewaesserung_RecoverFromNoWater($hash, 1);
                     # Barrel gained water from rain (not from an IBC->barrel transfer or house-water
                     # fill) -> the rainwater collection is working
-                    if(ReadingsVal($name, "raining", "no") eq "yes"
+                    if(Gartenbewaesserung_RainRecentEnough($hash)
                        && ReadingsVal($name, "ibcToBarrelActive", "no") eq "no"
                        && ReadingsVal($name, "ibcFilling", "no") eq "no") {
                         Gartenbewaesserung_RainCollectionSeenFill($hash, "barrelFull (rain)");
@@ -4011,6 +4025,35 @@ sub Gartenbewaesserung_StopIBCtoBarrel {
 }
 
 ##############################################################################
+# Did it rain recently enough to treat the water in the barrel as rainwater?
+#
+# The classic trigger required rain to be falling at the very moment the barrel
+# reports full. In practice the barrel fills late - roof and gutter keep draining
+# for a while after the rain has stopped - so that window is regularly missed.
+# With a rain gauge (rainAmountDevice) the attribute ibcFillRainAmount widens the
+# condition to "at least X mm fell within rainAmountWindow", which still tells
+# rainwater apart from a barrel topped up from the mains supply.
+##############################################################################
+sub Gartenbewaesserung_RainRecentEnough {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    # Classic behaviour: it is raining right now
+    return 1 if(ReadingsVal($name, "raining", "no") eq "yes");
+
+    my $minAmount = AttrVal($name, "ibcFillRainAmount", 0);
+    return 0 if($minAmount <= 0);                                  # feature disabled
+    return 0 if(AttrVal($name, "rainAmountDevice", "") eq "");     # no rain gauge
+
+    # Never treat a mains-fed barrel as harvested rainwater
+    return 0 if($hash->{HELPER}{barrelEmptyRefilling}
+                && ($hash->{HELPER}{barrelEmptyRefillSource} || "") eq "water_supply");
+    return 0 if(Gartenbewaesserung_IsDeviceOn($name, AttrVal($name, "barrelFillValveDevice", "")));
+
+    return (ReadingsVal($name, "rainAmount_mm", 0) >= $minAmount) ? 1 : 0;
+}
+
+##############################################################################
 # Rain amount (mm): maintain a rolling-window sum from a weather station rain
 # gauge and feed the rainwater-collection watchdog.
 #
@@ -4275,12 +4318,35 @@ sub Gartenbewaesserung_CheckRain {
                 delete $hash->{HELPER}{rainingSince};
                 Log3 $name, 4, "$name: Rain stopped";
 
-                # Stop IBC fill when rain stops
+                # Stop IBC fill when rain stops - unless enough rain fell recently
+                # (ibcFillRainAmount), in which case the barrel still holds rainwater
+                # worth harvesting. It then runs until barrelEmpty / ibcFull / watering.
                 if($hash->{HELPER}{ibcFilling}) {
-                    Gartenbewaesserung_StopIBCFill($hash);
+                    if(Gartenbewaesserung_RainRecentEnough($hash)) {
+                        Log3 $name, 4, "$name: Rain stopped but recent rain amount still "
+                            . "qualifies - continuing IBC fill";
+                    }
+                    else {
+                        Gartenbewaesserung_StopIBCFill($hash);
+                    }
                 }
             }
         }
+    }
+
+    # Harvest window after the rain has stopped: the barrel usually fills late
+    # (roof and gutter keep draining), so a full barrel is picked up here too.
+    if(AttrVal($name, "ibcFillRainAmount", 0) > 0
+       && ReadingsVal($name, "barrelFull", "no") eq "yes"
+       && ReadingsVal($name, "ibcFull", "no") ne "yes"
+       && !$hash->{HELPER}{ibcFilling}
+       && !$hash->{HELPER}{watering}
+       && !$hash->{HELPER}{circuitMode}
+       && !$hash->{HELPER}{ibcToBarrelActive}
+       && Gartenbewaesserung_RainRecentEnough($hash)) {
+        Log3 $name, 3, "$name: Barrel full and " . ReadingsVal($name, "rainAmount_mm", "?")
+            . " mm rain in window, starting IBC fill";
+        Gartenbewaesserung_StartIBCFill($hash, 0);
     }
 
     my $interval = AttrVal($name, "rainCheckInterval", 5) * 60;
@@ -4688,6 +4754,23 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             oder <code>ibcEmpty:no</code>), wird <code>rainCollectionAlert</code> auf <code>yes</code>
             gesetzt (Hinweis auf verstopften Zulauf/Dachrinne/Filter). Ist der IBC bereits voll,
             wird kein Alarm ausgelöst.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-ibcFillRainAmount"></a>
+            <b>ibcFillRainAmount</b><br>
+            Typ: Slider (0–20 mm, Schritt 0.1). Standardwert: 0 (deaktiviert).<br>
+            Erweitert die Bedingung für die IBC-Befüllung. Ohne dieses Attribut startet die
+            Befüllung nur, wenn es <b>genau in dem Moment regnet</b>, in dem der Fass-voll-Sensor
+            anschlägt. Da Dach und Dachrinne nach Regenende nachlaufen, meldet das Fass oft erst
+            deutlich später „voll" – das Zeitfenster wird dann verfehlt.<br>
+            Ist der Wert &gt; 0, genügt es, dass innerhalb von <code>rainAmountWindow</code>
+            mindestens so viele mm gefallen sind (Reading <code>rainAmount_mm</code>, setzt
+            <code>rainAmountDevice</code> voraus). Ein volles Fass wird dann auch nach dem Regen
+            noch in den IBC übernommen, und eine laufende Befüllung wird bei Regenende nicht mehr
+            abgebrochen – sie endet regulär bei <code>barrelEmpty</code>, <code>ibcFull</code> oder
+            Bewässerungsstart.<br>
+            <i>Schutz:</i> Wurde das Fass aus der Hauswasserleitung gefüllt (Refill-Quelle
+            <code>water_supply</code> oder <code>barrelFillValveDevice</code> offen), greift die
+            Mengen-Bedingung nicht – es wird also kein Leitungswasser in den IBC gepumpt.
         </li>
         <li><a id="Gartenbewaesserung-attr-roofArea"></a>
             <b>roofArea</b><br>
