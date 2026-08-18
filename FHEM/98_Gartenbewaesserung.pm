@@ -11,6 +11,18 @@
 #
 ##############################################################################
 #
+# 1.0.49 - 2026-08-18  Neu: Fuellstandsschaetzung fuer den IBC. Neues Attribut ibcUsableVolume
+#                      (Liter) und neue Readings ibcLevel_l, ibcLevel_pct, ibcLevelAnchor. Der IBC
+#                      hat keinen Pegelgeber, nur zwei Endschalter - der Stand wird deshalb
+#                      mitgefuehrt: was hochgepumpt wird kommt drauf, was per Schwerkraft
+#                      zurueckfliesst geht ab. Weil beide Raten gelernte Mittelwerte sind, driftet
+#                      das; jeder Ankerpunkt setzt es darum zurueck (ibcEmpty -> 0, ibcFull ->
+#                      ibcUsableVolume, set <name> ibcLevel <liter> -> abgelesener Wert).
+#                      ibcLevelAnchor haelt fest, woher der aktuelle Wert stammt. Die Rate der
+#                      Schwerkraftrichtung wird analog zur Pumpe gelernt: ein Lauf IBC->Fass, der
+#                      bei leerem Fass beginnt und mit barrelFull endet, hat barrelUsableVolume
+#                      bewegt (neues Reading ibcToBarrelFlow_lpm, dazu lastIbcToBarrelVolume_l).
+#                      Ohne ibcUsableVolume aendert sich nichts.
 # 1.0.48 - 2026-08-18  Neu: Ein Lauf mit offener Hauswasserzufuhr wird nicht mehr komplett verworfen,
 #                      sondern aufgeteilt. Neues Attribut barrelFloatLevel (Liter): Hoehe, auf der das
 #                      Schwimmerventil das Fass haelt. Alles darueber ist Regen, alles darunter kam aus
@@ -333,6 +345,7 @@ sub Gartenbewaesserung_Initialize {
         "ibcFillRainAmount:slider,0,0.1,20 " .
         "roofArea:textField " .
         "barrelUsableVolume:textField barrelFloatLevel:textField " .
+        "ibcUsableVolume:textField " .
         "mainsSupplyDevice:textField " .
         "mainsSupplyActiveValue:textField mainsSupplyInactiveValue:textField " .
         "runoffCoefficient:textField " .
@@ -362,7 +375,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.48';
+    $hash->{VERSION}    = '1.0.49';
 
     my $name = $a[0];
 
@@ -463,6 +476,7 @@ sub Gartenbewaesserung_Set {
                "startValve:1,2,3,4,5,6,7,8 stopValve:noArg " .
                "resetPumpOverrunAlert:noArg " .
                "resetHarvestStats:noArg " .
+               "ibcLevel:textField " .
                "refreshSensors:noArg " .
                "validate:noArg";
 
@@ -512,6 +526,16 @@ sub Gartenbewaesserung_Set {
         readingsBulkUpdate($hash, "mains_total_l", "0");
         readingsEndUpdate($hash, 1);
         Log3 $name, 3, "$name: harvest statistics reset";
+        return undef;
+    }
+    elsif($cmd eq "ibcLevel") {
+        my $capacity = AttrVal($name, "ibcUsableVolume", 0);
+        return "Set ibcUsableVolume first" if($capacity <= 0);
+        return "Usage: set $name ibcLevel <liter>"
+            if(!defined($args[0]) || $args[0] !~ /^\d+(?:\.\d+)?$/);
+        return "ibcLevel must not exceed ibcUsableVolume ($capacity l)" if($args[0] > $capacity);
+        Gartenbewaesserung_SetIbcLevel($hash, $args[0], "manual", 1);
+        Log3 $name, 3, "$name: IBC level anchored at $args[0] l (manual)";
         return undef;
     }
     elsif($cmd eq "refreshSensors") {
@@ -663,6 +687,9 @@ sub Gartenbewaesserung_Notify {
                     Gartenbewaesserung_CheckIBCFull($hash);
                     # IBC reported full -> water is being collected
                     Gartenbewaesserung_RainCollectionSeenFill($hash, "ibcFull");
+                    # Hard anchor for the level estimate: wipes accumulated drift
+                    Gartenbewaesserung_SetIbcLevel($hash,
+                        AttrVal($name, "ibcUsableVolume", 0), "ibcFull", 1);
                 }
                 elsif(Gartenbewaesserung_CheckSensorInactive($name, $event, $ibcReading,
                       AttrVal($name, "ibcFullSensorInactiveValue", ""))) {
@@ -680,6 +707,8 @@ sub Gartenbewaesserung_Notify {
                 my $activeValue = AttrVal($name, "ibcEmptySensorActiveValue", "");
                 if(Gartenbewaesserung_CheckSensorActive($name, $event, $ibcEmptyReading, $activeValue)) {
                     readingsSingleUpdate($hash, "ibcEmpty", "yes", 1);
+                    # Hard anchor for the level estimate: wipes accumulated drift
+                    Gartenbewaesserung_SetIbcLevel($hash, 0, "ibcEmpty", 1);
                 }
                 elsif(Gartenbewaesserung_CheckSensorInactive($name, $event, $ibcEmptyReading,
                       AttrVal($name, "ibcEmptySensorInactiveValue", ""))) {
@@ -4036,13 +4065,61 @@ sub Gartenbewaesserung_MainsSupplyState {
 }
 
 ##############################################################################
-# Measurement for the IBC -> barrel direction (the "out" side of a later level
+# IBC level estimate.
+#
+# The IBC has no level sensor, only the two end switches. The level is therefore
+# carried along: what the pump moves up is added, what runs back down by gravity
+# is subtracted. That integration drifts - both flow rates are learned averages,
+# and the gravity rate is not even constant, since a full IBC pushes harder than
+# an almost empty one. So every anchor point available is used to reset it:
+# ibcEmpty puts the level at 0, ibcFull at ibcUsableVolume, and
+# "set <name> ibcLevel" takes a value read off the tank. ibcLevelAnchor records
+# where the current number last came from - the older that is, the more drift
+# has had a chance to accumulate.
+##############################################################################
+sub Gartenbewaesserung_SetIbcLevel {
+    my ($hash, $liters, $reason, $anchor) = @_;
+    my $name = $hash->{NAME};
+
+    my $capacity = AttrVal($name, "ibcUsableVolume", 0);
+    return if($capacity <= 0);
+
+    $liters = 0 if($liters < 0);
+    $liters = $capacity if($liters > $capacity);
+
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, "ibcLevel_l", sprintf("%.0f", $liters));
+    readingsBulkUpdate($hash, "ibcLevel_pct", sprintf("%.0f", 100 * $liters / $capacity));
+    readingsBulkUpdate($hash, "ibcLevelAnchor", TimeNow() . " " . $reason) if($anchor);
+    readingsEndUpdate($hash, 1);
+}
+
+sub Gartenbewaesserung_AdjustIbcLevel {
+    my ($hash, $delta, $reason) = @_;
+    my $name = $hash->{NAME};
+
+    return if(AttrVal($name, "ibcUsableVolume", 0) <= 0);
+    return if(!$delta);
+
+    # No starting point yet: wait for an anchor rather than invent one
+    my $level = ReadingsVal($name, "ibcLevel_l", "");
+    return if($level !~ /^-?\d+(?:\.\d+)?$/);
+
+    Gartenbewaesserung_SetIbcLevel($hash, $level + $delta, $reason, 0);
+    Log3 $name, 4, sprintf("%s: IBC level %+.0f l (%s) -> %s l",
+        $name, $delta, $reason, ReadingsVal($name, "ibcLevel_l", "?"));
+}
+
+##############################################################################
+# Measurement for the IBC -> barrel direction (the "out" side of the level
 # estimate). A watering pause feeds the barrel from the IBC by gravity without
 # ever setting ibcToBarrelActive, so these runs are invisible otherwise.
 ##############################################################################
 sub Gartenbewaesserung_NoteIbcToBarrelStart {
     my ($hash) = @_;
     $hash->{HELPER}{ibcToBarrelStartTime} = int(time());
+    $hash->{HELPER}{ibcToBarrelFromEmpty} =
+        (ReadingsVal($hash->{NAME}, "barrelEmpty", "no") eq "yes") ? 1 : 0;
 }
 
 sub Gartenbewaesserung_NoteIbcToBarrelStop {
@@ -4050,19 +4127,51 @@ sub Gartenbewaesserung_NoteIbcToBarrelStop {
     my $name = $hash->{NAME};
 
     my $start = $hash->{HELPER}{ibcToBarrelStartTime};
+    my $fromEmpty = $hash->{HELPER}{ibcToBarrelFromEmpty};
     delete $hash->{HELPER}{ibcToBarrelStartTime};
+    delete $hash->{HELPER}{ibcToBarrelFromEmpty};
     return if(!$start);
 
+    $reason = "unknown" if(!defined($reason) || $reason eq "");
     my $minutes = (int(time()) - $start) / 60;
     return if($minutes <= 0);
 
+    # A transfer that started with an empty barrel and ended on barrelFull moved
+    # exactly barrelUsableVolume - the same trick that measures the pump, applied
+    # to the gravity side.
+    my $volume = AttrVal($name, "barrelUsableVolume", 0);
+    my $rate   = ReadingsVal($name, "ibcToBarrelFlow_lpm", 0);
+    $rate = 0 if($rate !~ /^\d+(?:\.\d+)?$/);
+
+    my $moved = 0;
+    my $measured = 0;
+    if($fromEmpty && $reason eq "barrelFull" && $volume > 0) {
+        $moved = $volume;
+        $measured = $volume / $minutes;
+        $rate = ($rate > 0) ? ($rate * 0.7 + $measured * 0.3) : $measured;
+    }
+    elsif($rate > 0) {
+        $moved = $rate * $minutes;
+    }
+
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "lastIbcToBarrelDuration", sprintf("%.1f", $minutes));
-    readingsBulkUpdate($hash, "lastIbcToBarrelEnd", $reason || "unknown");
+    readingsBulkUpdate($hash, "lastIbcToBarrelEnd", $reason);
+    readingsBulkUpdate($hash, "lastIbcToBarrelVolume_l",
+        $moved > 0 ? sprintf("%.0f", $moved) : "unknown");
+    readingsBulkUpdate($hash, "ibcToBarrelFlow_lpm", sprintf("%.1f", $rate)) if($measured > 0);
     readingsEndUpdate($hash, 1);
 
-    Log3 $name, 3, sprintf("%s: IBC->barrel run ended (%s) after %.1f min",
-        $name, $reason || "unknown", $minutes);
+    if($measured > 0) {
+        Log3 $name, 3, sprintf("%s: complete IBC->barrel run: %.0f l in %.1f min "
+            . "= %.1f l/min (learned rate now %.1f)", $name, $volume, $minutes, $measured, $rate);
+    }
+    else {
+        Log3 $name, 3, sprintf("%s: IBC->barrel run ended (%s) after %.1f min",
+            $name, $reason, $minutes);
+    }
+
+    Gartenbewaesserung_AdjustIbcLevel($hash, -$moved, "IBC->barrel") if($moved > 0);
 }
 
 ##############################################################################
@@ -4183,6 +4292,8 @@ sub Gartenbewaesserung_RecordIbcFillRun {
             if(!$complete);
     }
     readingsEndUpdate($hash, 1);
+
+    Gartenbewaesserung_AdjustIbcLevel($hash, $moved, "barrel->IBC") if($moved > 0);
 }
 
 ##############################################################################
@@ -4859,6 +4970,14 @@ sub Gartenbewaesserung_GetStatus {
         }
         $status .= "Foerderrate (gelernt): " . ReadingsVal($name, "ibcFillFlow_lpm", "-") . " l/min\n\n";
     }
+    if(ReadingsVal($name, "ibcLevel_l", "") ne "") {
+        $status .= "--- IBC-Fuellstand (geschaetzt) ---\n";
+        $status .= "Stand:  " . ReadingsVal($name, "ibcLevel_l", "-") . " l ("
+                 . ReadingsVal($name, "ibcLevel_pct", "-") . " %)\n";
+        $status .= "Anker:  " . ReadingsVal($name, "ibcLevelAnchor", "-") . "\n";
+        $status .= "Rueckfluss (gelernt): "
+                 . ReadingsVal($name, "ibcToBarrelFlow_lpm", "-") . " l/min\n\n";
+    }
     $status .= "Last Watering: " . ReadingsVal($name, "lastWatering", "never") . "\n";
     $status .= "Last Circuit: " . ReadingsVal($name, "lastCircuitWatering", "never") . "\n";
 
@@ -4981,6 +5100,8 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>startValve &lt;1-8&gt;</b> - Startet ein einzelnes Ventil manuell (ohne Automatik)</li>
         <li><b>stopValve</b> - Stoppt das aktuell laufende Ventil</li>
         <li><b>resetPumpOverrunAlert</b> - Setzt das Reading <code>pumpOverrunAlert</code> manuell auf <code>no</code> zurück</li>
+        <li><b>resetHarvestStats</b> - Setzt die Ertrags- und Fördermengen-Summen zurück</li>
+        <li><b>ibcLevel &lt;liter&gt;</b> - Verankert die Füllstandsschätzung des IBC auf einem abgelesenen Wert. Das ist der genaueste Eingriff, den es gibt: die Schätzung rechnet ab hier neu weiter und die bis dahin aufgelaufene Drift ist weg. Setzt <code>ibcUsableVolume</code> voraus.</li>
         <li><b>refreshSensors</b> - Liest alle konfigurierten Sensor-Readings sofort neu ein und aktualisiert die Readings (z. B. nach Neustart oder Gerätetausch)</li>
         <li><b>validate</b> - Prüft die komplette Konfiguration und zeigt Fehler, Warnungen und Infos an</li>
     </ul>
@@ -5248,6 +5369,23 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Ohne dieses Attribut bleibt es beim bisherigen Verhalten: Läufe mit offener
             Hauswasserzufuhr zählen gar nicht in <code>pumpedRain_total_l</code>.
         </li>
+        <li><a id="Gartenbewaesserung-attr-ibcUsableVolume"></a>
+            <b>ibcUsableVolume</b><br>
+            Typ: Zahl (Liter). Ohne Vorgabe deaktiviert.<br>
+            Nutzbares Volumen des IBC zwischen Leer- und Voll-Sensor. Schaltet die
+            Füllstandsschätzung frei (<code>ibcLevel_l</code>).<br>
+            <i>Wie sie funktioniert:</i> Der IBC hat keinen Pegelgeber. Der Stand wird deshalb
+            mitgeführt – jede Befüllung Fass&nbsp;&rarr;&nbsp;IBC kommt drauf, jeder Rücklauf per
+            Schwerkraft geht ab. Das ist eine Integration und driftet: beide Raten sind gelernte
+            Mittelwerte, und die Schwerkraftrate ist nicht einmal konstant, weil ein voller IBC
+            stärker drückt als ein fast leerer. Deshalb wird jeder verfügbare Ankerpunkt genutzt,
+            um den Wert zurückzusetzen – <code>ibcEmpty</code> setzt ihn auf 0, <code>ibcFull</code>
+            auf <code>ibcUsableVolume</code>, und <code>set &lt;name&gt; ibcLevel &lt;liter&gt;</code>
+            übernimmt einen abgelesenen Wert. <code>ibcLevelAnchor</code> zeigt, woher die aktuelle
+            Zahl stammt; je älter der Anker, desto mehr Drift konnte sich sammeln.<br>
+            Solange noch kein Anker gesetzt wurde, bleibt <code>ibcLevel_l</code> leer – das Modul
+            erfindet keinen Startwert.
+        </li>
         <li><a id="Gartenbewaesserung-attr-roofArea"></a>
             <b>roofArea</b><br>
             Typ: Zahl (Quadratmeter). Ohne Vorgabe deaktiviert.<br>
@@ -5458,6 +5596,8 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>lastIbcFillSource</b> - <code>rain</code> (Hauswasser war zu, reines Regenwasser), <code>mixed</code> (Hauswasser offen, Leitungswasser lief mit) oder <code>unknown</code> (kein <code>mainsSupplyDevice</code> gesetzt).</li>
         <li><b>pumped_total_l</b> / <b>pumpedRain_total_l</b> / <b>mains_total_l</b> - Insgesamt vom Fass in den IBC gefördertes Volumen, aufgeteilt in Regen- und Leitungswasseranteil. <code>pumpedRain_total_l</code> lässt sich direkt gegen <code>harvest_total_l</code> halten: Weichen die Werte dauerhaft voneinander ab, stimmt <code>roofArea</code> nicht. Läufe mit offener Hauswasserzufuhr steuern ihren Regenanteil nur bei, wenn <code>barrelFloatLevel</code> gesetzt ist. Zurücksetzen mit <code>set &lt;name&gt; resetHarvestStats</code>.</li>
         <li><b>lastIbcFillRain_l</b> / <b>lastIbcFillMains_l</b> - Aufteilung des letzten Laufs. Nur gefüllt, wenn <code>mainsSupplyDevice</code> konfiguriert ist.</li>
+        <li><b>ibcLevel_l</b> / <b>ibcLevel_pct</b> / <b>ibcLevelAnchor</b> - Geschätzter IBC-Füllstand in Litern bzw. Prozent, und woher der Wert zuletzt verankert wurde (<code>ibcEmpty</code>, <code>ibcFull</code>, <code>manual</code>) mit Zeitstempel. Setzt <code>ibcUsableVolume</code> voraus. <b>Eine Schätzung, keine Messung</b> – siehe dort.</li>
+        <li><b>ibcToBarrelFlow_lpm</b> / <b>lastIbcToBarrelVolume_l</b> - Gelernte Rate der Schwerkraftrichtung IBC&nbsp;&rarr;&nbsp;Fass und die daraus geschätzte Menge des letzten Rücklaufs. Gelernt wird nur aus Läufen, die bei leerem Fass beginnen und mit <code>barrelFull</code> enden – die haben <code>barrelUsableVolume</code> bewegt.</li>
         <li><b>lastIbcToBarrelDuration</b> / <b>lastIbcToBarrelEnd</b> - Dauer (Minuten) und Endgrund (<code>barrelFull</code>, <code>pauseEnd</code>) des letzten Laufs IBC&nbsp;&rarr;&nbsp;Fass, einschließlich der Schwerkraft-Nachspeisung während einer Gießpause.</li>
         <li><b>lastIbcFillDuration</b> / <b>lastIbcFillEnd</b> / <b>lastIbcFillVolume_l</b> - Dauer (Minuten), Endgrund (<code>barrelEmpty</code>, <code>ibcFull</code>, <code>watering</code>, <code>rainStopped</code>, <code>ibcToBarrel</code>, <code>manual</code>) und bewegtes Volumen der letzten Befüllung Fass&nbsp;&rarr;&nbsp;IBC.</li>
         <li><b>ibcFillFlow_lpm</b> - Gelernte Förderrate in Litern pro Minute. Wird nur aus vollständigen Läufen (volles Fass bis <code>barrelEmpty</code>) fortgeschrieben und gedämpft gemittelt, sinkt also automatisch mit, wenn der Filter zusetzt. Setzt <code>barrelUsableVolume</code> voraus.</li>
