@@ -11,6 +11,18 @@
 #
 ##############################################################################
 #
+# 1.0.52 - 2026-08-18  Neu: Attribut ibcFullFromLevel (0/1). Damit darf die Fuellstandsschaetzung
+#                      selbst 'IBC voll' melden, statt dass der Voll-Zustand nur aus dem Sensor bzw.
+#                      einem von Hand gesetzten Dummy kommt. Beim Start einer Befuellung rechnet das
+#                      Modul aus dem freien Rest und der gelernten Foerderrate aus, wann der Behaelter
+#                      voll ist, und stellt einen Wecker - der Lauf endet dann von selbst, statt
+#                      ueberzulaufen. Faellt der Stand spaeter wieder unter die Kapazitaet, geht
+#                      ibcFull von allein zurueck auf no.
+#                      Wichtig: Die Schaetzung ist damit steuernd, nicht mehr nur beschreibend. Zu
+#                      hoch geschaetzt heisst Regen verschenkt, zu niedrig heisst weiterhin
+#                      Ueberlauf. Der Sensor bzw. der Dummy hat weiter Vorrang und verankert den
+#                      Stand - er bleibt die Korrektur von aussen. Ohne das Attribut aendert sich
+#                      nichts.
 # 1.0.51 - 2026-08-18  Fix: Der Sammel-Watchdog schlug nach jeder erfolgreichen Ernte Alarm. Die
 #                      Pruefung 'Fass ist voll geworden, also sammelt die Anlage' stand im
 #                      barrelFull-Zweig NACH dem Start der Ernte - und die setzt ibcFilling auf yes.
@@ -378,7 +390,7 @@ sub Gartenbewaesserung_Initialize {
         "ibcFillRainAmount:slider,0,0.1,20 " .
         "roofArea:textField " .
         "barrelUsableVolume:textField barrelFloatLevel:textField " .
-        "ibcUsableVolume:textField " .
+        "ibcUsableVolume:textField ibcFullFromLevel:0,1 " .
         "mainsSupplyDevice:textField " .
         "mainsSupplyActiveValue:textField mainsSupplyInactiveValue:textField " .
         "runoffCoefficient:textField " .
@@ -408,7 +420,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.51';
+    $hash->{VERSION}    = '1.0.52';
 
     my $name = $a[0];
 
@@ -1032,7 +1044,8 @@ sub Gartenbewaesserung_UpdateSensorReadings {
         my $activeValue = AttrVal($name, "ibcFullSensorActiveValue", "");
         my $inactiveValue = AttrVal($name, "ibcFullSensorInactiveValue", "");
         my $value = Gartenbewaesserung_GetSensorValue($name, $ibcSensorDef, $activeValue, $inactiveValue);
-        readingsBulkUpdate($hash, "ibcFull", $value ? "yes" : "no");
+        my $full = $value || Gartenbewaesserung_IbcFullByLevelState($hash);
+        readingsBulkUpdate($hash, "ibcFull", $full ? "yes" : "no");
         Log3 $name, 4, "$name: IBC full sensor: " . ($value ? "yes" : "no");
     }
     else {
@@ -4063,6 +4076,7 @@ sub Gartenbewaesserung_StartIBCFill {
     $hash->{HELPER}{ibcFillStartTime} = int(time());
     $hash->{HELPER}{ibcFillFromFull}  = (ReadingsVal($name, "barrelFull", "no") eq "yes") ? 1 : 0;
     $hash->{HELPER}{ibcFillMainsAtStart} = Gartenbewaesserung_MainsSupplyState($hash);
+    Gartenbewaesserung_ArmIbcFullByLevel($hash);
 
     if($pumpDevice ne "") {
         my $delay = AttrVal($name, "pumpStartDelay", 3);
@@ -4290,6 +4304,61 @@ sub Gartenbewaesserung_LearnWateringFlow {
         . "= %.1f l/min (learned rate now %.1f)", $name, $minutes, $measured, $new);
 }
 
+# Does the level estimate consider the IBC full? Only with ibcFullFromLevel set,
+# and only once a level is known at all.
+sub Gartenbewaesserung_IbcFullByLevelState {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    return 0 if(!AttrVal($name, "ibcFullFromLevel", 0));
+    my $capacity = AttrVal($name, "ibcUsableVolume", 0);
+    my $level    = ReadingsVal($name, "ibcLevel_l", "");
+    return 0 if($capacity <= 0 || $level !~ /^-?\d+(?:\.\d+)?$/);
+    return ($level >= $capacity) ? 1 : 0;
+}
+
+# A fill is starting: work out how long the remaining headroom lasts at the
+# learned pump rate and set an alarm clock for it. Without this the estimate
+# could only block the NEXT run - the current one would overflow first.
+sub Gartenbewaesserung_ArmIbcFullByLevel {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    RemoveInternalTimer($hash, "Gartenbewaesserung_IbcFullByLevel");
+    return if(!AttrVal($name, "ibcFullFromLevel", 0));
+
+    my $capacity = AttrVal($name, "ibcUsableVolume", 0);
+    my $level    = ReadingsVal($name, "ibcLevel_l", "");
+    my $rate     = ReadingsVal($name, "ibcFillFlow_lpm", 0);
+    $rate = 0 if($rate !~ /^\d+(?:\.\d+)?$/);
+    return if($capacity <= 0 || $rate <= 0 || $level !~ /^-?\d+(?:\.\d+)?$/);
+
+    my $headroom = $capacity - $level;
+    if($headroom <= 0) {
+        Gartenbewaesserung_IbcFullByLevel($hash);
+        return;
+    }
+
+    my $minutes = $headroom / $rate;
+    Log3 $name, 3, sprintf("%s: IBC has room for %.0f l = %.1f min at %.1f l/min",
+        $name, $headroom, $minutes, $rate);
+    InternalTimer(gettimeofday() + $minutes * 60, "Gartenbewaesserung_IbcFullByLevel", $hash);
+}
+
+sub Gartenbewaesserung_IbcFullByLevel {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    RemoveInternalTimer($hash, "Gartenbewaesserung_IbcFullByLevel");
+    return if(!AttrVal($name, "ibcFullFromLevel", 0));
+
+    Log3 $name, 3, "$name: IBC full according to the level estimate - stopping fill";
+    Gartenbewaesserung_SetIbcLevel($hash,
+        AttrVal($name, "ibcUsableVolume", 0), "level estimate", 1);
+    readingsSingleUpdate($hash, "ibcFull", "yes", 1);
+    Gartenbewaesserung_StopIBCFill($hash, "ibcFull (level)") if($hash->{HELPER}{ibcFilling});
+}
+
 ##############################################################################
 # Measurement for the IBC -> barrel direction (the "out" side of the level
 # estimate). A watering pause feeds the barrel from the IBC by gravity without
@@ -4492,6 +4561,7 @@ sub Gartenbewaesserung_StopIBCFill {
     my ($hash, $reason) = @_;
     my $name = $hash->{NAME};
 
+    RemoveInternalTimer($hash, "Gartenbewaesserung_IbcFullByLevel");
     return if(!$hash->{HELPER}{ibcFilling});
 
     Gartenbewaesserung_RecordIbcFillRun($hash, $reason);
@@ -5595,6 +5665,22 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Zahl stammt; je älter der Anker, desto mehr Drift konnte sich sammeln.<br>
             Solange noch kein Anker gesetzt wurde, bleibt <code>ibcLevel_l</code> leer – das Modul
             erfindet keinen Startwert.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-ibcFullFromLevel"></a>
+            <b>ibcFullFromLevel</b><br>
+            Typ: 0 oder 1. Standardwert: 0 (aus).<br>
+            Erlaubt der Füllstandsschätzung, selbst <code>ibcFull</code> zu melden – sinnvoll, wenn
+            es keinen Voll-Sensor gibt und der Zustand bisher von Hand gesetzt wurde. Beim Start
+            einer Befüllung rechnet das Modul aus dem freien Rest und <code>ibcFillFlow_lpm</code>
+            aus, wann der Behälter voll ist, und stellt einen Wecker; der Lauf endet dann von
+            selbst. Fällt der Stand später wieder unter die Kapazität, geht <code>ibcFull</code>
+            von allein auf <code>no</code> zurück.<br>
+            <i>Damit wird die Schätzung steuernd, nicht mehr nur beschreibend.</i> Zu hoch geschätzt
+            heißt verschenkter Regen, zu niedrig heißt weiterhin Überlauf. Ein vorhandener Sensor
+            bzw. der Dummy hat weiterhin Vorrang und verankert den Stand – er bleibt die Korrektur
+            von außen, ebenso wie <code>set &lt;name&gt; ibcLevel</code>.<br>
+            Voraussetzungen: <code>ibcUsableVolume</code>, ein gesetzter Anker und eine gelernte
+            Förderrate. Fehlt eines davon, passiert nichts.
         </li>
         <li><a id="Gartenbewaesserung-attr-roofArea"></a>
             <b>roofArea</b><br>
