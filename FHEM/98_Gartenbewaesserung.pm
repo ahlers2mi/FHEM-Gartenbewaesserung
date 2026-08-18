@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.45 - 2026-08-18
+#     Version 1.0.46 - 2026-08-18
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,16 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.46 - 2026-08-18  Revert von 1.0.45. Die dortige Annahme war falsch: barrelEmpty: yes->no wurde
+#                      als Erfolg des Fass-Fuell-Watchdogs gewertet. Steht im Fass aber ein
+#                      Schwimmerventil aus der Hauswasserleitung, wird barrelEmpty auch bei
+#                      staubtrockenem IBC binnen Minuten wieder 'no' - 'Wasser ist da' sagt dann
+#                      nichts ueber die konfigurierte Quelle aus. Das eigentliche Unterscheidungs-
+#                      merkmal ist barrelFull: Ein IBC mit Wasser hebt das Fass bis zum Voll-Kontakt
+#                      (und zwar schneller als ibcToBarrelDuration), ein Schwimmer allein bleibt
+#                      darunter stehen. 1.0.45 haette damit genau die Erkennung eines leeren IBC
+#                      stillgelegt. Die Alarme, die den Umbau ausgeloest hatten, waren keine
+#                      Fehlalarme, sondern richtig - der IBC war tatsaechlich leer.
 # 1.0.45 - 2026-08-18  Fix: Der Fass-Fuell-Watchdog pruefte auf das falsche Kriterium. Er galt nur dann
 #                      als erfuellt, wenn barrelFull meldet. Wo eine Nachspeisung das Fass aber nur bis
 #                      zu einem Schwimmerniveau deutlich UNTER dem Voll-Sensor bringt - z.B. bis etwa
@@ -328,7 +338,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.45';
+    $hash->{VERSION}    = '1.0.46';
 
     my $name = $a[0];
 
@@ -675,19 +685,13 @@ sub Gartenbewaesserung_Notify {
                 }
                 elsif(Gartenbewaesserung_CheckSensorInactive($name, $event, $barrelEmptyReading,
                       AttrVal($name, "barrelEmptySensorInactiveValue", ""))) {
-                    # Water has arrived - the barrel is no longer empty. THAT is the
-                    # honest success criterion for the fill watchdog, not barrelFull.
-                    # Where a refill only brings the barrel back to a float level well
-                    # below the full sensor, barrelFull can never be reached during a
-                    # pause and the watchdog would fire every single time, wrongly
-                    # suggesting a dry IBC or a blocked supply.
-                    Gartenbewaesserung_StopBarrelFillTimeout($hash);
-                    if(ReadingsVal($name, "barrelFillTimeoutAlert", "no") ne "no") {
-                        readingsSingleUpdate($hash, "barrelFillTimeoutAlert", "no", 1);
-                        Log3 $name, 3, "$name: barrel no longer empty - water arrived, "
-                            . "clearing barrelFillTimeoutAlert";
-                    }
-
+                    # NOTE: deliberately does NOT stop the fill watchdog. A mains float
+                    # valve in the barrel makes barrelEmpty clear within minutes even
+                    # when the IBC is bone dry, so "water arrived" says nothing about
+                    # the configured source. barrelFull is the discriminating signal:
+                    # a working IBC lifts the barrel to the full contact, a float alone
+                    # stops well below it. Cancelling here would silently disable the
+                    # empty-IBC detection (was briefly the case in 1.0.45).
                     my $resumePending = $hash->{HELPER}{barrelEmptyResumePending};
                     if($hash->{HELPER}{barrelEmptyRefilling}) {
                         Log3 $name, 3, "$name: barrelEmpty inactive during refill - letting timer/sensor finish the refill";
@@ -5127,12 +5131,13 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><a id="Gartenbewaesserung-attr-barrelFillTimeout"></a>
             <b>barrelFillTimeout</b><br>
             Typ: Slider (0–120 Minuten). Standardwert: 0 Minuten.<br>
-            Watchdog für die Fass-Befüllung. Als Erfolg zählt, dass <b>Wasser ankommt</b>
-            (<code>barrelEmpty</code> wechselt auf <code>no</code>) oder das Fass voll meldet –
-            nicht ausschließlich <code>barrelFull</code>. Das ist wichtig, wenn eine Nachspeisung
-            das Fass nur bis zu einem Schwimmerniveau unterhalb des Voll-Sensors bringt: Dort wäre
-            <code>barrelFull</code> nie erreichbar und der Watchdog würde bei jeder Pause
-            fehlalarmieren.<br>
+            Watchdog für die Fass-Befüllung. Als Erfolg zählt ausschließlich
+            <code>barrelFull</code>. Das ist Absicht: Steht im Fass ein Schwimmerventil aus der
+            Hauswasserleitung, wird <code>barrelEmpty</code> auch bei staubtrockenem IBC binnen
+            Minuten wieder <code>no</code> – „Wasser ist da“ sagt dann nichts über die
+            konfigurierte Quelle aus. Nur der Voll-Kontakt unterscheidet: Ein IBC mit Wasser hebt
+            das Fass bis dorthin, ein Schwimmer allein bleibt darunter. Genau daraus lässt sich
+            ein leerer IBC ableiten.<br>
             Wird das Befüllventil
             (<code>barrelFillValveDevice</code> oder <code>ibcToBarrelValveDevice</code>)
             geöffnet, aber der <code>barrelFullSensorDevice</code> meldet innerhalb der
