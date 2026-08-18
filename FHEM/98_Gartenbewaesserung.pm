@@ -11,6 +11,18 @@
 #
 ##############################################################################
 #
+# 1.0.48 - 2026-08-18  Neu: Ein Lauf mit offener Hauswasserzufuhr wird nicht mehr komplett verworfen,
+#                      sondern aufgeteilt. Neues Attribut barrelFloatLevel (Liter): Hoehe, auf der das
+#                      Schwimmerventil das Fass haelt. Alles darueber ist Regen, alles darunter kam aus
+#                      der Leitung - der Regenanteil eines Misch-Laufs ist damit konstant
+#                      barrelUsableVolume - barrelFloatLevel, unabhaengig von der Laufzeit. Neue
+#                      Readings lastIbcFillRain_l, lastIbcFillMains_l und mains_total_l;
+#                      pumpedRain_total_l bekommt jetzt auch aus Misch-Laeufen seinen Anteil.
+#                      Ausserdem Fix: die Foerderrate wird aus Misch-Laeufen nicht mehr gelernt. Dort
+#                      laeuft waehrend des Pumpens Wasser nach, der Lauf dauert also laenger als
+#                      barrelUsableVolume / Rate - die gelernte Rate fiel dadurch systematisch zu
+#                      niedrig aus. Gemessen: Fass voll -> leer 258 s, Schwimmer -> leer 132 s, der
+#                      Schwimmer sitzt also auf 51 % der nutzbaren Kapazitaet.
 # 1.0.47 - 2026-08-18  Neu: Das Modul kann wissen, ob die Hauswasserzufuhr offen ist. Neues Attribut
 #                      mainsSupplyDevice (Device:Reading, dazu mainsSupplyActiveValue/-InactiveValue).
 #                      Hintergrund: Steht im Fass ein Schwimmerventil, fuellt es waehrend einer
@@ -320,7 +332,7 @@ sub Gartenbewaesserung_Initialize {
         "rainCollectionCheckDelay:slider,5,5,720 " .
         "ibcFillRainAmount:slider,0,0.1,20 " .
         "roofArea:textField " .
-        "barrelUsableVolume:textField " .
+        "barrelUsableVolume:textField barrelFloatLevel:textField " .
         "mainsSupplyDevice:textField " .
         "mainsSupplyActiveValue:textField mainsSupplyInactiveValue:textField " .
         "runoffCoefficient:textField " .
@@ -350,7 +362,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.47';
+    $hash->{VERSION}    = '1.0.48';
 
     my $name = $a[0];
 
@@ -497,6 +509,7 @@ sub Gartenbewaesserung_Set {
         readingsBulkUpdate($hash, "harvest_total_l", "0.0");
         readingsBulkUpdate($hash, "pumped_total_l", "0");
         readingsBulkUpdate($hash, "pumpedRain_total_l", "0");
+        readingsBulkUpdate($hash, "mains_total_l", "0");
         readingsEndUpdate($hash, 1);
         Log3 $name, 3, "$name: harvest statistics reset";
         return undef;
@@ -4090,48 +4103,84 @@ sub Gartenbewaesserung_RecordIbcFillRun {
     readingsBulkUpdate($hash, "lastIbcFillEnd", $reason);
     readingsBulkUpdate($hash, "lastIbcFillSource", $source);
 
-    # Complete run from a full barrel down to empty -> known volume, learn the rate
     my $volume = AttrVal($name, "barrelUsableVolume", 0);
+    my $float  = AttrVal($name, "barrelFloatLevel", 0);
+    my $rate   = ReadingsVal($name, "ibcFillFlow_lpm", 0);
+    $rate = 0 if($rate !~ /^\d+(?:\.\d+)?$/);
+
+    # A run from a full barrel down to empty moved a known volume - but only
+    # without a mains top-up. With the float valve feeding, the pump also moves
+    # everything that flowed in meanwhile, so the run is measured by the rate.
+    my $complete = ($fromFull && $reason eq "barrelEmpty" && $volume > 0) ? 1 : 0;
     my $moved = 0;
-    if($fromFull && $reason eq "barrelEmpty" && $volume > 0) {
+    if($complete && $source ne "mixed") {
         $moved = $volume;
     }
-    else {
-        my $r = ReadingsVal($name, "ibcFillFlow_lpm", 0);
-        $moved = ($r =~ /^\d+(?:\.\d+)?$/ && $r > 0) ? $r * $minutes : 0;
+    elsif($rate > 0) {
+        $moved = $rate * $minutes;
     }
 
-    # Cumulative volume actually pumped into the IBC. pumpedRain counts only runs
-    # that ran without a mains top-up - those are pure harvest and can be held
-    # against harvest_total_l to check the configured roofArea.
+    # Split the moved volume into harvested rain and mains water. The float valve
+    # holds the barrel at barrelFloatLevel, so only what sits ABOVE that line is
+    # rain; from the moment the level reaches the float, everything pumped is
+    # either the stored mains water or fresh inflow. The rain share of a run that
+    # started with a full barrel is therefore constant - volume minus float level -
+    # no matter how long the pump keeps running afterwards.
+    my $rainPart  = 0;
+    my $mainsPart = 0;
     if($moved > 0) {
-        foreach my $c (["pumped_total_l", 1], ["pumpedRain_total_l", $source eq "rain" ? 1 : 0]) {
-            next if(!$c->[1]);
+        if($source eq "mixed") {
+            if($fromFull && $volume > 0 && $float > 0 && $float < $volume) {
+                $rainPart = $volume - $float;
+                $rainPart = $moved if($rainPart > $moved);
+            }
+            # else: started below the barrel-full mark, so there is no way to tell
+            # how much of it was rain - credit none of it.
+            $mainsPart = $moved - $rainPart;
+        }
+        elsif($source eq "rain") {
+            $rainPart = $moved;
+        }
+        # source "unknown" (no mainsSupplyDevice): no split, only pumped_total_l
+    }
+
+    if($moved > 0) {
+        readingsBulkUpdate($hash, "lastIbcFillRain_l",  sprintf("%.0f", $rainPart))
+            if($source ne "unknown");
+        readingsBulkUpdate($hash, "lastIbcFillMains_l", sprintf("%.0f", $mainsPart))
+            if($source ne "unknown");
+
+        foreach my $c (["pumped_total_l", $moved], ["pumpedRain_total_l", $rainPart],
+                       ["mains_total_l", $mainsPart]) {
+            next if($c->[1] <= 0);
             my $v = ReadingsVal($name, $c->[0], 0);
             $v = 0 if($v !~ /^-?\d+(?:\.\d+)?$/);
-            readingsBulkUpdate($hash, $c->[0], sprintf("%.0f", $v + $moved));
+            readingsBulkUpdate($hash, $c->[0], sprintf("%.0f", $v + $c->[1]));
         }
     }
 
-    if($fromFull && $reason eq "barrelEmpty" && $volume > 0) {
-        my $rate = $volume / $minutes;
-        my $old  = ReadingsVal($name, "ibcFillFlow_lpm", 0);
-        $old = 0 if($old !~ /^\d+(?:\.\d+)?$/);
+    if($complete && $source eq "mixed" && $moved > 0) {
+        Log3 $name, 3, sprintf("%s: barrel->IBC run with mains open: %.0f l in %.1f min "
+            . "(%.0f l rain, %.0f l mains) - rate not learned from this run",
+            $name, $moved, $minutes, $rainPart, $mainsPart);
+    }
+
+    if($complete && $source ne "mixed") {
+        my $measured = $volume / $minutes;
         # Damped average so a single odd run does not dominate
-        my $new = ($old > 0) ? ($old * 0.7 + $rate * 0.3) : $rate;
+        my $new = ($rate > 0) ? ($rate * 0.7 + $measured * 0.3) : $measured;
         readingsBulkUpdate($hash, "ibcFillFlow_lpm", sprintf("%.1f", $new));
         readingsBulkUpdate($hash, "lastIbcFillVolume_l", sprintf("%.0f", $volume));
         Log3 $name, 3, sprintf("%s: complete barrel->IBC run: %.0f l in %.1f min "
-            . "= %.1f l/min (learned rate now %.1f)", $name, $volume, $minutes, $rate, $new);
+            . "= %.1f l/min (learned rate now %.1f)", $name, $volume, $minutes, $measured, $new);
     }
     else {
-        # Partial run - estimate from the learned rate if we already have one
-        my $rate = ReadingsVal($name, "ibcFillFlow_lpm", 0);
-        $rate = 0 if($rate !~ /^\d+(?:\.\d+)?$/);
+        # Partial or mains-fed run - estimate from the learned rate if we have one
         readingsBulkUpdate($hash, "lastIbcFillVolume_l",
-            $rate > 0 ? sprintf("%.0f", $rate * $minutes) : "unknown");
+            $moved > 0 ? sprintf("%.0f", $moved) : "unknown");
         Log3 $name, 3, sprintf("%s: barrel->IBC run ended (%s) after %.1f min",
-            $name, $reason, $minutes);
+            $name, $reason, $minutes)
+            if(!$complete);
     }
     readingsEndUpdate($hash, 1);
 }
@@ -4794,7 +4843,9 @@ sub Gartenbewaesserung_GetStatus {
         $status .= "Gesamt: " . ReadingsVal($name, "harvest_total_l", "0") . " l\n";
         $status .= "  davon nachweislich gefoerdert: "
                  . ReadingsVal($name, "pumpedRain_total_l", "0") . " l (nur Regen), "
-                 . ReadingsVal($name, "pumped_total_l", "0") . " l gesamt\n\n";
+                 . ReadingsVal($name, "pumped_total_l", "0") . " l gesamt\n";
+        $status .= "  aus der Leitung mitgefoerdert: "
+                 . ReadingsVal($name, "mains_total_l", "0") . " l\n\n";
     }
     if(ReadingsVal($name, "lastIbcFillDuration", "") ne "") {
         $status .= "\n--- Letzte IBC-Befuellung ---\n";
@@ -4802,6 +4853,10 @@ sub Gartenbewaesserung_GetStatus {
         $status .= "Endgrund:  " . ReadingsVal($name, "lastIbcFillEnd", "-") . "\n";
         $status .= "Volumen:   " . ReadingsVal($name, "lastIbcFillVolume_l", "-") . " l\n";
         $status .= "Quelle:    " . ReadingsVal($name, "lastIbcFillSource", "-") . "\n";
+        if(ReadingsVal($name, "lastIbcFillRain_l", "") ne "") {
+            $status .= "  davon Regen:   " . ReadingsVal($name, "lastIbcFillRain_l", "-") . " l\n";
+            $status .= "  davon Leitung: " . ReadingsVal($name, "lastIbcFillMains_l", "-") . " l\n";
+        }
         $status .= "Foerderrate (gelernt): " . ReadingsVal($name, "ibcFillFlow_lpm", "-") . " l/min\n\n";
     }
     $status .= "Last Watering: " . ReadingsVal($name, "lastWatering", "never") . "\n";
@@ -5159,7 +5214,8 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Zeigt an, ob die Hauswasserzufuhr zum Fass offen ist. Steht im Fass ein Schwimmerventil,
             füllt es während einer Befüllung Fass&nbsp;&rarr;&nbsp;IBC laufend nach – das geförderte
             Wasser ist dann <b>kein reiner Regen</b>. Das Modul kennzeichnet solche Läufe als
-            <code>mixed</code> und zählt nur Läufe ohne Hauswasser in <code>pumpedRain_total_l</code>.<br>
+            <code>mixed</code>. Ist zusätzlich <code>barrelFloatLevel</code> gesetzt, wird ein
+            solcher Lauf aufgeteilt statt verworfen.<br>
             <i>Reine Statistik:</i> Auf die Steuerung – Ernte-Trigger, Watchdog, Pausen – hat das
             Attribut keinen Einfluss. Die Werte für „an“/„aus“ lassen sich bei Bedarf über
             <code>mainsSupplyActiveValue</code> und <code>mainsSupplyInactiveValue</code> anpassen;
@@ -5172,6 +5228,25 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Fass&nbsp;&rarr;&nbsp;IBC von einem vollen Fass bis <code>barrelEmpty</code> durch, ist
             das bewegte Volumen damit bekannt; das Modul leitet daraus die aktuelle Förderrate ab
             (<code>ibcFillFlow_lpm</code>). Grundlage für eine spätere Füllstandsschätzung.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-barrelFloatLevel"></a>
+            <b>barrelFloatLevel</b><br>
+            Typ: Zahl (Liter). Ohne Vorgabe deaktiviert.<br>
+            Füllstand, auf dem das Schwimmerventil der Hauswasserleitung das Fass hält – gemessen
+            ab derselben Linie wie <code>barrelUsableVolume</code>, also ab dem Fass-leer-Sensor.
+            Damit lässt sich ein Lauf mit offener Hauswasserzufuhr aufteilen: Was <b>über</b> der
+            Schwimmerhöhe stand, ist Regen; ab dem Moment, in dem der Pegel den Schwimmer erreicht,
+            fördert die Pumpe nur noch gespeichertes und nachlaufendes Leitungswasser. Der
+            Regenanteil eines solchen Laufs ist deshalb konstant
+            <code>barrelUsableVolume - barrelFloatLevel</code>, unabhängig davon, wie lange die
+            Pumpe danach noch läuft.<br>
+            <i>Bestimmen:</i> zweimal messen, jeweils mit <b>geschlossener</b> Hauswasserzufuhr –
+            einmal von vollem Fass bis <code>barrelEmpty</code> (Zeit T&#8321;), einmal von
+            Schwimmerhöhe bis <code>barrelEmpty</code> (T&#8322;). Dann ist
+            <code>barrelFloatLevel = barrelUsableVolume &times; T&#8322; / T&#8321;</code>. Das
+            Verhältnis zweier Pumpenlaufzeiten genügt, eine Durchflussmessung ist nicht nötig.<br>
+            Ohne dieses Attribut bleibt es beim bisherigen Verhalten: Läufe mit offener
+            Hauswasserzufuhr zählen gar nicht in <code>pumpedRain_total_l</code>.
         </li>
         <li><a id="Gartenbewaesserung-attr-roofArea"></a>
             <b>roofArea</b><br>
@@ -5381,7 +5456,8 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>rainSinceHarvest_mm</b> - Regenmenge (mm) seit der letzten IBC-Befuellung. Steuert zusammen mit <code>ibcFillRainAmount</code>, wann geerntet wird, und wird beim Start einer Befuellung auf 0 gesetzt - eine neue Ernte braucht daher immer neuen Regen.</li>
         <li><b>mainsSupply</b> - <code>on</code>/<code>off</code>; Zustand der Hauswasserzufuhr laut <code>mainsSupplyDevice</code>.</li>
         <li><b>lastIbcFillSource</b> - <code>rain</code> (Hauswasser war zu, reines Regenwasser), <code>mixed</code> (Hauswasser offen, Leitungswasser lief mit) oder <code>unknown</code> (kein <code>mainsSupplyDevice</code> gesetzt).</li>
-        <li><b>pumped_total_l</b> / <b>pumpedRain_total_l</b> - Insgesamt vom Fass in den IBC gefördertes Volumen bzw. nur der Anteil aus Läufen ohne Hauswasser. <code>pumpedRain_total_l</code> lässt sich direkt gegen <code>harvest_total_l</code> halten: Weichen die Werte dauerhaft voneinander ab, stimmt <code>roofArea</code> nicht. Zurücksetzen mit <code>set &lt;name&gt; resetHarvestStats</code>.</li>
+        <li><b>pumped_total_l</b> / <b>pumpedRain_total_l</b> / <b>mains_total_l</b> - Insgesamt vom Fass in den IBC gefördertes Volumen, aufgeteilt in Regen- und Leitungswasseranteil. <code>pumpedRain_total_l</code> lässt sich direkt gegen <code>harvest_total_l</code> halten: Weichen die Werte dauerhaft voneinander ab, stimmt <code>roofArea</code> nicht. Läufe mit offener Hauswasserzufuhr steuern ihren Regenanteil nur bei, wenn <code>barrelFloatLevel</code> gesetzt ist. Zurücksetzen mit <code>set &lt;name&gt; resetHarvestStats</code>.</li>
+        <li><b>lastIbcFillRain_l</b> / <b>lastIbcFillMains_l</b> - Aufteilung des letzten Laufs. Nur gefüllt, wenn <code>mainsSupplyDevice</code> konfiguriert ist.</li>
         <li><b>lastIbcToBarrelDuration</b> / <b>lastIbcToBarrelEnd</b> - Dauer (Minuten) und Endgrund (<code>barrelFull</code>, <code>pauseEnd</code>) des letzten Laufs IBC&nbsp;&rarr;&nbsp;Fass, einschließlich der Schwerkraft-Nachspeisung während einer Gießpause.</li>
         <li><b>lastIbcFillDuration</b> / <b>lastIbcFillEnd</b> / <b>lastIbcFillVolume_l</b> - Dauer (Minuten), Endgrund (<code>barrelEmpty</code>, <code>ibcFull</code>, <code>watering</code>, <code>rainStopped</code>, <code>ibcToBarrel</code>, <code>manual</code>) und bewegtes Volumen der letzten Befüllung Fass&nbsp;&rarr;&nbsp;IBC.</li>
         <li><b>ibcFillFlow_lpm</b> - Gelernte Förderrate in Litern pro Minute. Wird nur aus vollständigen Läufen (volles Fass bis <code>barrelEmpty</code>) fortgeschrieben und gedämpft gemittelt, sinkt also automatisch mit, wenn der Filter zusetzt. Setzt <code>barrelUsableVolume</code> voraus.</li>
