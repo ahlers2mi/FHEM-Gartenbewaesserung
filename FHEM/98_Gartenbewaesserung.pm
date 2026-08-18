@@ -11,6 +11,19 @@
 #
 ##############################################################################
 #
+# 1.0.51 - 2026-08-18  Fix: Der Sammel-Watchdog schlug nach jeder erfolgreichen Ernte Alarm. Die
+#                      Pruefung 'Fass ist voll geworden, also sammelt die Anlage' stand im
+#                      barrelFull-Zweig NACH dem Start der Ernte - und die setzt ibcFilling auf yes.
+#                      Der Waechter 'ibcFilling eq no' sah damit immer die Befuellung, die er selbst
+#                      gerade ausgeloest hatte, und rainSinceFill_mm wurde nie zurueckgesetzt.
+#                      Dasselbe galt fuer ibcToBarrelActive, das CheckBarrelFull vorher abraeumt.
+#                      Beide Kennzeichen werden jetzt VOR der Verarbeitung festgehalten; zusaetzlich
+#                      zaehlt eine laufende Fassbefuellung aus der Leitung nicht mehr als Beleg.
+#                      Nachweis: 18.08., zwei Ernten um 08:58 und 10:21, rainSinceFill_mm lief
+#                      trotzdem von 0,68 auf 6,30 mm durch und loeste um 12:26 den Alarm aus.
+#                      Neu dazu: Faellt der Fass-leer-Kontakt bei GESCHLOSSENER Hauswasserzufuhr
+#                      weg, gilt auch das als Beleg. Ohne mainsSupplyDevice bleibt das aus - genau
+#                      diese Unterscheidung fehlte 1.0.45, weshalb das damals zurueckgenommen wurde.
 # 1.0.50 - 2026-08-18  Neu: Fuellstandsschaetzung fuer das Fass (barrelLevel_l, barrelLevelAnchor).
 #                      Das Fass ist besser vermessen als der IBC - drei Ankerpunkte statt zwei:
 #                      barrelFull -> barrelUsableVolume, barrelEmpty -> 0, und bei offener
@@ -390,7 +403,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.50';
+    $hash->{VERSION}    = '1.0.51';
 
     my $name = $a[0];
 
@@ -656,6 +669,13 @@ sub Gartenbewaesserung_Notify {
             if($devName eq $barrelDev) {
                 my $activeValue = AttrVal($name, "barrelFullSensorActiveValue", "");
                 if(Gartenbewaesserung_CheckSensorActive($name, $event, $barrelReading, $activeValue)) {
+                    # Snapshot BEFORE anything below runs: CheckBarrelFull clears
+                    # ibcToBarrelActive, and the harvest a few lines down sets
+                    # ibcFilling. Reading those flags afterwards would show the
+                    # module its own doing and never credit the rain.
+                    my $notFromRain = (ReadingsVal($name, "ibcToBarrelActive", "no") eq "yes"
+                                    || ReadingsVal($name, "ibcFilling", "no") eq "yes"
+                                    || $hash->{HELPER}{barrelFilling}) ? 1 : 0;
                     readingsSingleUpdate($hash, "barrelFull", "yes", 1);
                     # Hard anchor for the level estimate, and the starting line
                     # for learning the watering draw rate
@@ -683,9 +703,7 @@ sub Gartenbewaesserung_Notify {
                     Gartenbewaesserung_RecoverFromNoWater($hash, 1);
                     # Barrel gained water from rain (not from an IBC->barrel transfer or house-water
                     # fill) -> the rainwater collection is working
-                    if(Gartenbewaesserung_RainRecentEnough($hash)
-                       && ReadingsVal($name, "ibcToBarrelActive", "no") eq "no"
-                       && ReadingsVal($name, "ibcFilling", "no") eq "no") {
+                    if(Gartenbewaesserung_RainRecentEnough($hash) && !$notFromRain) {
                         Gartenbewaesserung_RainCollectionSeenFill($hash, "barrelFull (rain)");
                     }
                 }
@@ -773,6 +791,22 @@ sub Gartenbewaesserung_Notify {
                     # a working IBC lifts the barrel to the full contact, a float alone
                     # stops well below it. Cancelling here would silently disable the
                     # empty-IBC detection (was briefly the case in 1.0.45).
+                    # Separate question, same edge: does this count as evidence
+                    # that the RAIN COLLECTION works (the collection watchdog,
+                    # rainSinceFill_mm)? With the mains closed, yes - the contact
+                    # can then only clear because water arrived, and that comes
+                    # much earlier than waiting for barrelFull. With the mains
+                    # open it says nothing, the float valve clears it too. That
+                    # distinction is what 1.0.45 lacked; mainsSupplyDevice
+                    # supplies it now. The fill watchdog above stays untouched.
+                    if(ReadingsVal($name, "barrelEmpty", "no") eq "yes"
+                       && Gartenbewaesserung_MainsSupplyState($hash) eq "off"
+                       && !$hash->{HELPER}{ibcToBarrelActive}
+                       && !$hash->{HELPER}{barrelFilling}
+                       && !$hash->{HELPER}{pauseActive}) {
+                        Gartenbewaesserung_RainCollectionSeenFill($hash, "barrelEmpty:no (rain)");
+                    }
+
                     my $resumePending = $hash->{HELPER}{barrelEmptyResumePending};
                     if($hash->{HELPER}{barrelEmptyRefilling}) {
                         Log3 $name, 3, "$name: barrelEmpty inactive during refill - letting timer/sensor finish the refill";
