@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.46 - 2026-08-18
+#     Version 1.0.47 - 2026-08-18
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -11,7 +11,17 @@
 #
 ##############################################################################
 #
-# Versionshistorie:
+# 1.0.47 - 2026-08-18  Neu: Das Modul kann wissen, ob die Hauswasserzufuhr offen ist. Neues Attribut
+#                      mainsSupplyDevice (Device:Reading, dazu mainsSupplyActiveValue/-InactiveValue).
+#                      Hintergrund: Steht im Fass ein Schwimmerventil, fuellt es waehrend einer
+#                      Befuellung Fass->IBC staendig nach - das ins IBC gefoerderte Wasser ist dann
+#                      nicht reiner Regen, und harvest_*_l passt nicht zur tatsaechlich bewegten
+#                      Menge. Neue Readings: mainsSupply (on/off), lastIbcFillSource (rain/mixed/
+#                      unknown) sowie die kumulierten Foerdermengen pumped_total_l und
+#                      pumpedRain_total_l. Letzteres zaehlt nur Laeufe ohne Hauswasser und laesst
+#                      sich damit direkt gegen harvest_total_l halten - daraus ergibt sich der echte
+#                      Wert fuer roofArea. Reine Statistik, die Steuerung bleibt unberuehrt; ohne
+#                      mainsSupplyDevice aendert sich nichts.
 # 1.0.46 - 2026-08-18  Revert von 1.0.45. Die dortige Annahme war falsch: barrelEmpty: yes->no wurde
 #                      als Erfolg des Fass-Fuell-Watchdogs gewertet. Steht im Fass aber ein
 #                      Schwimmerventil aus der Hauswasserleitung, wird barrelEmpty auch bei
@@ -311,6 +321,8 @@ sub Gartenbewaesserung_Initialize {
         "ibcFillRainAmount:slider,0,0.1,20 " .
         "roofArea:textField " .
         "barrelUsableVolume:textField " .
+        "mainsSupplyDevice:textField " .
+        "mainsSupplyActiveValue:textField mainsSupplyInactiveValue:textField " .
         "runoffCoefficient:textField " .
         "pumpStartDelay:slider,-30,1,30 " .
         "pumpMaxRuntime:slider,0,1,240 " .
@@ -338,7 +350,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.46';
+    $hash->{VERSION}    = '1.0.47';
 
     my $name = $a[0];
 
@@ -483,6 +495,8 @@ sub Gartenbewaesserung_Set {
         readingsBulkUpdate($hash, "harvest_month_l", "0.0");
         readingsBulkUpdate($hash, "harvest_year_l",  "0.0");
         readingsBulkUpdate($hash, "harvest_total_l", "0.0");
+        readingsBulkUpdate($hash, "pumped_total_l", "0");
+        readingsBulkUpdate($hash, "pumpedRain_total_l", "0");
         readingsEndUpdate($hash, 1);
         Log3 $name, 3, "$name: harvest statistics reset";
         return undef;
@@ -978,6 +992,9 @@ sub Gartenbewaesserung_UpdateSensorReadings {
     else {
         readingsBulkUpdate($hash, "soilMoisture", "not configured");
     }
+
+    my $mains = Gartenbewaesserung_MainsSupplyState($hash);
+    readingsBulkUpdate($hash, "mainsSupply", $mains) if($mains ne "");
 
     readingsEndUpdate($hash, 1);
 
@@ -3947,6 +3964,7 @@ sub Gartenbewaesserung_StartIBCFill {
     # barrel. Only a full->empty run moves a known volume and can teach the rate.
     $hash->{HELPER}{ibcFillStartTime} = int(time());
     $hash->{HELPER}{ibcFillFromFull}  = (ReadingsVal($name, "barrelFull", "no") eq "yes") ? 1 : 0;
+    $hash->{HELPER}{ibcFillMainsAtStart} = Gartenbewaesserung_MainsSupplyState($hash);
 
     if($pumpDevice ne "") {
         my $delay = AttrVal($name, "pumpStartDelay", 3);
@@ -3983,6 +4001,25 @@ sub Gartenbewaesserung_StartIBCFill {
     }
 
     return undef;
+}
+
+##############################################################################
+# Is the mains top-up available right now?
+#
+# Returns "on", "off" or "" when no mainsSupplyDevice is configured. Matters for
+# the statistics, not for control: while the mains float can refill the barrel,
+# water pumped from the barrel into the IBC is not purely harvested rain.
+##############################################################################
+sub Gartenbewaesserung_MainsSupplyState {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    my $def = AttrVal($name, "mainsSupplyDevice", "");
+    return "" if($def eq "");
+
+    return Gartenbewaesserung_GetSensorValue($name, $def,
+        AttrVal($name, "mainsSupplyActiveValue", ""),
+        AttrVal($name, "mainsSupplyInactiveValue", "")) ? "on" : "off";
 }
 
 ##############################################################################
@@ -4037,12 +4074,45 @@ sub Gartenbewaesserung_RecordIbcFillRun {
     my $minutes = (int(time()) - $start) / 60;
     return if($minutes <= 0);
 
+    # Was the mains top-up available at any point during the run? Then the barrel
+    # was refilled from the tap while the pump drained it, and the volume moved
+    # into the IBC is not purely harvested rain.
+    my $mainsStart = $hash->{HELPER}{ibcFillMainsAtStart} || "";
+    delete $hash->{HELPER}{ibcFillMainsAtStart};
+    my $mainsNow = Gartenbewaesserung_MainsSupplyState($hash);
+    my $source = "unknown";
+    if($mainsStart ne "" || $mainsNow ne "") {
+        $source = ($mainsStart eq "on" || $mainsNow eq "on") ? "mixed" : "rain";
+    }
+
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "lastIbcFillDuration", sprintf("%.1f", $minutes));
     readingsBulkUpdate($hash, "lastIbcFillEnd", $reason);
+    readingsBulkUpdate($hash, "lastIbcFillSource", $source);
 
     # Complete run from a full barrel down to empty -> known volume, learn the rate
     my $volume = AttrVal($name, "barrelUsableVolume", 0);
+    my $moved = 0;
+    if($fromFull && $reason eq "barrelEmpty" && $volume > 0) {
+        $moved = $volume;
+    }
+    else {
+        my $r = ReadingsVal($name, "ibcFillFlow_lpm", 0);
+        $moved = ($r =~ /^\d+(?:\.\d+)?$/ && $r > 0) ? $r * $minutes : 0;
+    }
+
+    # Cumulative volume actually pumped into the IBC. pumpedRain counts only runs
+    # that ran without a mains top-up - those are pure harvest and can be held
+    # against harvest_total_l to check the configured roofArea.
+    if($moved > 0) {
+        foreach my $c (["pumped_total_l", 1], ["pumpedRain_total_l", $source eq "rain" ? 1 : 0]) {
+            next if(!$c->[1]);
+            my $v = ReadingsVal($name, $c->[0], 0);
+            $v = 0 if($v !~ /^-?\d+(?:\.\d+)?$/);
+            readingsBulkUpdate($hash, $c->[0], sprintf("%.0f", $v + $moved));
+        }
+    }
+
     if($fromFull && $reason eq "barrelEmpty" && $volume > 0) {
         my $rate = $volume / $minutes;
         my $old  = ReadingsVal($name, "ibcFillFlow_lpm", 0);
@@ -4721,13 +4791,17 @@ sub Gartenbewaesserung_GetStatus {
         $status .= "Heute:  " . ReadingsVal($name, "harvest_today_l", "0") . " l\n";
         $status .= "Monat:  " . ReadingsVal($name, "harvest_month_l", "0") . " l\n";
         $status .= "Jahr:   " . ReadingsVal($name, "harvest_year_l",  "0") . " l\n";
-        $status .= "Gesamt: " . ReadingsVal($name, "harvest_total_l", "0") . " l\n\n";
+        $status .= "Gesamt: " . ReadingsVal($name, "harvest_total_l", "0") . " l\n";
+        $status .= "  davon nachweislich gefoerdert: "
+                 . ReadingsVal($name, "pumpedRain_total_l", "0") . " l (nur Regen), "
+                 . ReadingsVal($name, "pumped_total_l", "0") . " l gesamt\n\n";
     }
     if(ReadingsVal($name, "lastIbcFillDuration", "") ne "") {
         $status .= "\n--- Letzte IBC-Befuellung ---\n";
         $status .= "Dauer:     " . ReadingsVal($name, "lastIbcFillDuration", "-") . " min\n";
         $status .= "Endgrund:  " . ReadingsVal($name, "lastIbcFillEnd", "-") . "\n";
         $status .= "Volumen:   " . ReadingsVal($name, "lastIbcFillVolume_l", "-") . " l\n";
+        $status .= "Quelle:    " . ReadingsVal($name, "lastIbcFillSource", "-") . "\n";
         $status .= "Foerderrate (gelernt): " . ReadingsVal($name, "ibcFillFlow_lpm", "-") . " l/min\n\n";
     }
     $status .= "Last Watering: " . ReadingsVal($name, "lastWatering", "never") . "\n";
@@ -5078,6 +5152,19 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             das Modul Regen- und Leitungswasser nicht unterscheiden – in dem Fall sollte der Schwimmer
             unterhalb des Fass-voll-Sensors abregeln.
         </li>
+        <li><a id="Gartenbewaesserung-attr-mainsSupplyDevice"></a>
+            <b>mainsSupplyDevice</b><br>
+            Typ: Text (<code>Device:Reading</code>), z.&nbsp;B. <code>d_RegenwasserPumpe:stadtwasser</code>.
+            Ohne Vorgabe deaktiviert.<br>
+            Zeigt an, ob die Hauswasserzufuhr zum Fass offen ist. Steht im Fass ein Schwimmerventil,
+            füllt es während einer Befüllung Fass&nbsp;&rarr;&nbsp;IBC laufend nach – das geförderte
+            Wasser ist dann <b>kein reiner Regen</b>. Das Modul kennzeichnet solche Läufe als
+            <code>mixed</code> und zählt nur Läufe ohne Hauswasser in <code>pumpedRain_total_l</code>.<br>
+            <i>Reine Statistik:</i> Auf die Steuerung – Ernte-Trigger, Watchdog, Pausen – hat das
+            Attribut keinen Einfluss. Die Werte für „an“/„aus“ lassen sich bei Bedarf über
+            <code>mainsSupplyActiveValue</code> und <code>mainsSupplyInactiveValue</code> anpassen;
+            ohne Angabe gelten die üblichen (<code>on</code>/<code>off</code> usw.).
+        </li>
         <li><a id="Gartenbewaesserung-attr-barrelUsableVolume"></a>
             <b>barrelUsableVolume</b><br>
             Typ: Zahl (Liter). Ohne Vorgabe deaktiviert.<br>
@@ -5292,6 +5379,9 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>rainSinceFill_mm</b> - Regenmenge (mm) seit der letzten erkannten Füllstands-Reaktion von Fass/IBC. Grundlage der Sammel-Überwachung; wird bei einer Füllstands-Reaktion auf 0 zurückgesetzt.</li>
         <li><b>rainCollectionAlert</b> - <code>yes</code>/<code>no</code>; <code>yes</code>, wenn mindestens <code>rainCollectionCheckAmount</code> mm Regen fiel, ohne dass Fass/IBC innerhalb von <code>rainCollectionCheckDelay</code> Minuten Wasser meldeten (Zulauf/Dachrinne/Filter prüfen). Reset automatisch bei der nächsten Füllstands-Reaktion.</li>
         <li><b>rainSinceHarvest_mm</b> - Regenmenge (mm) seit der letzten IBC-Befuellung. Steuert zusammen mit <code>ibcFillRainAmount</code>, wann geerntet wird, und wird beim Start einer Befuellung auf 0 gesetzt - eine neue Ernte braucht daher immer neuen Regen.</li>
+        <li><b>mainsSupply</b> - <code>on</code>/<code>off</code>; Zustand der Hauswasserzufuhr laut <code>mainsSupplyDevice</code>.</li>
+        <li><b>lastIbcFillSource</b> - <code>rain</code> (Hauswasser war zu, reines Regenwasser), <code>mixed</code> (Hauswasser offen, Leitungswasser lief mit) oder <code>unknown</code> (kein <code>mainsSupplyDevice</code> gesetzt).</li>
+        <li><b>pumped_total_l</b> / <b>pumpedRain_total_l</b> - Insgesamt vom Fass in den IBC gefördertes Volumen bzw. nur der Anteil aus Läufen ohne Hauswasser. <code>pumpedRain_total_l</code> lässt sich direkt gegen <code>harvest_total_l</code> halten: Weichen die Werte dauerhaft voneinander ab, stimmt <code>roofArea</code> nicht. Zurücksetzen mit <code>set &lt;name&gt; resetHarvestStats</code>.</li>
         <li><b>lastIbcToBarrelDuration</b> / <b>lastIbcToBarrelEnd</b> - Dauer (Minuten) und Endgrund (<code>barrelFull</code>, <code>pauseEnd</code>) des letzten Laufs IBC&nbsp;&rarr;&nbsp;Fass, einschließlich der Schwerkraft-Nachspeisung während einer Gießpause.</li>
         <li><b>lastIbcFillDuration</b> / <b>lastIbcFillEnd</b> / <b>lastIbcFillVolume_l</b> - Dauer (Minuten), Endgrund (<code>barrelEmpty</code>, <code>ibcFull</code>, <code>watering</code>, <code>rainStopped</code>, <code>ibcToBarrel</code>, <code>manual</code>) und bewegtes Volumen der letzten Befüllung Fass&nbsp;&rarr;&nbsp;IBC.</li>
         <li><b>ibcFillFlow_lpm</b> - Gelernte Förderrate in Litern pro Minute. Wird nur aus vollständigen Läufen (volles Fass bis <code>barrelEmpty</code>) fortgeschrieben und gedämpft gemittelt, sinkt also automatisch mit, wenn der Filter zusetzt. Setzt <code>barrelUsableVolume</code> voraus.</li>
