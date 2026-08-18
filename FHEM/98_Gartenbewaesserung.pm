@@ -3,7 +3,7 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.43 - 2026-08-17
+#     Version 1.0.44 - 2026-08-18
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -12,6 +12,16 @@
 ##############################################################################
 #
 # Versionshistorie:
+# 1.0.44 - 2026-08-18  Fix: Die Regen- und Ertrags-Readings wurden bei JEDEM Durchlauf von
+#                      UpdateRainAmount geschrieben, also alle rainCheckInterval Minuten (Default 5)
+#                      auch dann, wenn sich nichts geaendert hat. Das sind rund 290 Ereignisse je
+#                      Reading und Tag, die durch DoTrigger, saemtliche Notifies und DbLog laufen und
+#                      das FileLog des Geraets zumuellen: In einem realen 6000-Zeilen-Auszug entfielen
+#                      allein auf rainAmount_mm und rainSinceFill_mm zusammen rund 3000 Zeilen - die
+#                      Haelfte, und entsprechend weniger Historie. Sichtbare Readings werden jetzt nur
+#                      noch bei echter Wertaenderung geschrieben. Die versteckten .rain*-Readings
+#                      bleiben ausgenommen: sie aendern sich bauartbedingt staendig und erzeugen als
+#                      Punkt-Readings ohnehin keine Ereignisse.
 # 1.0.43 - 2026-08-17  Fix: Der mit 1.0.40 eingebaute Pendelschutz griff beim haeufigsten Fall nicht.
 #                      CheckBarrelFull hat zwei getrennte Zweige - einen fuer HELPER{ibcToBarrelActive}
 #                      (nur von StartIBCtoBarrel gesetzt) und einen fuer eine aktive Giesspause. Die
@@ -307,7 +317,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.43';
+    $hash->{VERSION}    = '1.0.44';
 
     my $name = $a[0];
 
@@ -4403,21 +4413,33 @@ sub Gartenbewaesserung_UpdateRainAmount {
         }
     }
 
+    # Only write the visible readings when the value actually changed. This runs
+    # every rainCheckInterval (default 5 min), so writing unconditionally means
+    # ~290 events per reading per day - all of them passing through DoTrigger,
+    # every notify and DbLog, and filling the device's FileLog with noise. The
+    # hidden .rain* readings are exempt: they change constantly by design and
+    # dot-readings do not generate events anyway.
+    my $setzeWennGeaendert = sub {
+        my ($reading, $value) = @_;
+        return if(ReadingsVal($name, $reading, "") eq $value);
+        readingsBulkUpdate($hash, $reading, $value);
+    };
+
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, ".rainLastRaw", $raw);
     readingsBulkUpdate($hash, ".rainAccum", sprintf("%.2f", $accum));
     readingsBulkUpdate($hash, ".rainBuffer", join(",", @kept));
-    readingsBulkUpdate($hash, "rainAmount_mm", sprintf("%.2f", $windowSum));
-    readingsBulkUpdate($hash, "rainSinceFill_mm", sprintf("%.2f", $sinceFill));
-    readingsBulkUpdate($hash, "rainSinceHarvest_mm", sprintf("%.2f", $sinceHarvest));
+    $setzeWennGeaendert->("rainAmount_mm", sprintf("%.2f", $windowSum));
+    $setzeWennGeaendert->("rainSinceFill_mm", sprintf("%.2f", $sinceFill));
+    $setzeWennGeaendert->("rainSinceHarvest_mm", sprintf("%.2f", $sinceHarvest));
     if($roofArea > 0) {
         readingsBulkUpdate($hash, ".harvestDay",   $day);
         readingsBulkUpdate($hash, ".harvestMonth", $month);
         readingsBulkUpdate($hash, ".harvestYear",  $year);
-        readingsBulkUpdate($hash, "harvest_today_l", sprintf("%.1f", $todayL));
-        readingsBulkUpdate($hash, "harvest_month_l", sprintf("%.1f", $monthL));
-        readingsBulkUpdate($hash, "harvest_year_l",  sprintf("%.1f", $yearL));
-        readingsBulkUpdate($hash, "harvest_total_l", sprintf("%.1f", $totalL));
+        $setzeWennGeaendert->("harvest_today_l", sprintf("%.1f", $todayL));
+        $setzeWennGeaendert->("harvest_month_l", sprintf("%.1f", $monthL));
+        $setzeWennGeaendert->("harvest_year_l",  sprintf("%.1f", $yearL));
+        $setzeWennGeaendert->("harvest_total_l", sprintf("%.1f", $totalL));
     }
     readingsEndUpdate($hash, 1);
 
