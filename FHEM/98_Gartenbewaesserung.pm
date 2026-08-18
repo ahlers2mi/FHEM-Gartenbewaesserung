@@ -11,6 +11,11 @@
 #
 ##############################################################################
 #
+# 1.0.53 - 2026-08-18  Neu: set <name> barrelLevel <liter>|<prozent>% als Gegenstueck zu ibcLevel.
+#                      Das Fass verankert sich zwar mehrmals taeglich von selbst an barrelFull oder
+#                      barrelEmpty - bis der erste Kontakt kommt, hat die Schaetzung aber keinen
+#                      Startwert und zeigt nichts. Beide Befehle teilen sich jetzt einen Parser und
+#                      nehmen Liter oder Prozent.
 # 1.0.52 - 2026-08-18  Neu: Attribut ibcFullFromLevel (0/1). Damit darf die Fuellstandsschaetzung
 #                      selbst 'IBC voll' melden, statt dass der Voll-Zustand nur aus dem Sensor bzw.
 #                      einem von Hand gesetzten Dummy kommt. Beim Start einer Befuellung rechnet das
@@ -420,7 +425,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.52';
+    $hash->{VERSION}    = '1.0.53';
 
     my $name = $a[0];
 
@@ -521,7 +526,7 @@ sub Gartenbewaesserung_Set {
                "startValve:1,2,3,4,5,6,7,8 stopValve:noArg " .
                "resetPumpOverrunAlert:noArg " .
                "resetHarvestStats:noArg " .
-               "ibcLevel:textField " .
+               "ibcLevel:textField barrelLevel:textField " .
                "refreshSensors:noArg " .
                "validate:noArg";
 
@@ -573,14 +578,32 @@ sub Gartenbewaesserung_Set {
         Log3 $name, 3, "$name: harvest statistics reset";
         return undef;
     }
-    elsif($cmd eq "ibcLevel") {
-        my $capacity = AttrVal($name, "ibcUsableVolume", 0);
-        return "Set ibcUsableVolume first" if($capacity <= 0);
-        return "Usage: set $name ibcLevel <liter>"
-            if(!defined($args[0]) || $args[0] !~ /^\d+(?:\.\d+)?$/);
-        return "ibcLevel must not exceed ibcUsableVolume ($capacity l)" if($args[0] > $capacity);
-        Gartenbewaesserung_SetIbcLevel($hash, $args[0], "manual", 1);
-        Log3 $name, 3, "$name: IBC level anchored at $args[0] l (manual)";
+    elsif($cmd eq "ibcLevel" || $cmd eq "barrelLevel") {
+        # Beide Behaelter, ein Parser. Liter, oder Prozent mit angehaengtem
+        # Prozentzeichen - am Tank ist "etwa ein Drittel" oft leichter
+        # abzulesen als eine Litermenge.
+        my $isIbc  = ($cmd eq "ibcLevel");
+        my $volAttr = $isIbc ? "ibcUsableVolume" : "barrelUsableVolume";
+        my $capacity = AttrVal($name, $volAttr, 0);
+        return "Set $volAttr first" if($capacity <= 0);
+
+        my $value = defined($args[0]) ? $args[0] : "";
+        return "Usage: set $name $cmd <liter> | <prozent>%"
+            if($value !~ /^(\d+(?:\.\d+)?)\s*(%?)$/);
+        my ($number, $isPercent) = ($1, $2);
+        my $liters = $isPercent ? ($capacity * $number / 100) : $number;
+        return "$cmd must not exceed $volAttr ($capacity l)" if($liters > $capacity);
+
+        if($isIbc) {
+            Gartenbewaesserung_SetIbcLevel($hash, $liters, "manual", 1);
+        }
+        else {
+            Gartenbewaesserung_SetBarrelLevel($hash, $liters, "manual", 1);
+            # Von Hand gesetzt heisst: wir wissen nicht, was vorher hineinlief -
+            # die gesammelte Ventilzeit taugt danach nicht mehr zum Lernen.
+            $hash->{HELPER}{drawTainted} = 1;
+        }
+        Log3 $name, 3, sprintf("%s: %s anchored at %.0f l (manual)", $name, $cmd, $liters);
         return undef;
     }
     elsif($cmd eq "refreshSensors") {
@@ -5374,7 +5397,8 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>stopValve</b> - Stoppt das aktuell laufende Ventil</li>
         <li><b>resetPumpOverrunAlert</b> - Setzt das Reading <code>pumpOverrunAlert</code> manuell auf <code>no</code> zurück</li>
         <li><b>resetHarvestStats</b> - Setzt die Ertrags- und Fördermengen-Summen zurück</li>
-        <li><b>ibcLevel &lt;liter&gt;</b> - Verankert die Füllstandsschätzung des IBC auf einem abgelesenen Wert. Das ist der genaueste Eingriff, den es gibt: die Schätzung rechnet ab hier neu weiter und die bis dahin aufgelaufene Drift ist weg. Setzt <code>ibcUsableVolume</code> voraus.</li>
+        <li><b>ibcLevel &lt;liter&gt;</b> bzw. <b>ibcLevel &lt;prozent&gt;%</b> - Verankert die Füllstandsschätzung des IBC auf einem abgelesenen Wert. Das ist der genaueste Eingriff, den es gibt: die Schätzung rechnet ab hier neu weiter und die bis dahin aufgelaufene Drift ist weg. Ohne Prozentzeichen wird die Zahl als Liter verstanden. Setzt <code>ibcUsableVolume</code> voraus.</li>
+        <li><b>barrelLevel &lt;liter&gt;</b> bzw. <b>barrelLevel &lt;prozent&gt;%</b> - Dasselbe für das Fass. Das Fass verankert sich normalerweise mehrmals täglich von selbst an <code>barrelFull</code> oder <code>barrelEmpty</code>; dieser Befehl ist für den Anfang, solange noch kein Kontakt gemeldet hat. Setzt <code>barrelUsableVolume</code> voraus.</li>
         <li><b>refreshSensors</b> - Liest alle konfigurierten Sensor-Readings sofort neu ein und aktualisiert die Readings (z. B. nach Neustart oder Gerätetausch)</li>
         <li><b>validate</b> - Prüft die komplette Konfiguration und zeigt Fehler, Warnungen und Infos an</li>
     </ul>
