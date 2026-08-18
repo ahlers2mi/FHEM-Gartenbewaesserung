@@ -21,9 +21,14 @@
 #                      zaehlt eine laufende Fassbefuellung aus der Leitung nicht mehr als Beleg.
 #                      Nachweis: 18.08., zwei Ernten um 08:58 und 10:21, rainSinceFill_mm lief
 #                      trotzdem von 0,68 auf 6,30 mm durch und loeste um 12:26 den Alarm aus.
-#                      Neu dazu: Faellt der Fass-leer-Kontakt bei GESCHLOSSENER Hauswasserzufuhr
-#                      weg, gilt auch das als Beleg. Ohne mainsSupplyDevice bleibt das aus - genau
-#                      diese Unterscheidung fehlte 1.0.45, weshalb das damals zurueckgenommen wurde.
+#                      Bewusst NICHT ergaenzt: der Wegfall des Fass-leer-Kontakts als zweites,
+#                      frueheres Signal. barrelEmptySensorDevice ist haeufig kein Pegelschalter,
+#                      sondern ein von einer Regel gefuellter Dummy - in der Anlage des Autors aus
+#                      der Pumpenleistung abgeleitet und von einer Regel zurueckgesetzt, die auf
+#                      REGEN reagiert. Das waere ein Zirkelschluss: Regen setzt das Reading zurueck,
+#                      das zurueckgesetzte Reading belegt, dass der Regen gesammelt wurde - ein
+#                      verstopftes Fallrohr fiele nie auf. Eine falsche Entwarnung ist schlimmer als
+#                      ein Fehlalarm.
 # 1.0.50 - 2026-08-18  Neu: Fuellstandsschaetzung fuer das Fass (barrelLevel_l, barrelLevelAnchor).
 #                      Das Fass ist besser vermessen als der IBC - drei Ankerpunkte statt zwei:
 #                      barrelFull -> barrelUsableVolume, barrelEmpty -> 0, und bei offener
@@ -791,21 +796,16 @@ sub Gartenbewaesserung_Notify {
                     # a working IBC lifts the barrel to the full contact, a float alone
                     # stops well below it. Cancelling here would silently disable the
                     # empty-IBC detection (was briefly the case in 1.0.45).
-                    # Separate question, same edge: does this count as evidence
-                    # that the RAIN COLLECTION works (the collection watchdog,
-                    # rainSinceFill_mm)? With the mains closed, yes - the contact
-                    # can then only clear because water arrived, and that comes
-                    # much earlier than waiting for barrelFull. With the mains
-                    # open it says nothing, the float valve clears it too. That
-                    # distinction is what 1.0.45 lacked; mainsSupplyDevice
-                    # supplies it now. The fill watchdog above stays untouched.
-                    if(ReadingsVal($name, "barrelEmpty", "no") eq "yes"
-                       && Gartenbewaesserung_MainsSupplyState($hash) eq "off"
-                       && !$hash->{HELPER}{ibcToBarrelActive}
-                       && !$hash->{HELPER}{barrelFilling}
-                       && !$hash->{HELPER}{pauseActive}) {
-                        Gartenbewaesserung_RainCollectionSeenFill($hash, "barrelEmpty:no (rain)");
-                    }
+                    # NOTE: this edge is deliberately NOT counted as evidence for
+                    # the collection watchdog either, even with the mains closed.
+                    # barrelEmptySensorDevice is often not a level switch but a
+                    # dummy fed by an automation - in the author's installation it
+                    # is derived from the pump's power draw and cleared by a rule
+                    # that reacts to RAIN. Crediting it would close a circle: rain
+                    # clears the reading, the cleared reading proves the rain was
+                    # collected, and a blocked downpipe would never be noticed.
+                    # A false all-clear is worse than a false alarm. barrelFull is
+                    # the only signal that cannot be faked by an inference.
 
                     my $resumePending = $hash->{HELPER}{barrelEmptyResumePending};
                     if($hash->{HELPER}{barrelEmptyRefilling}) {
