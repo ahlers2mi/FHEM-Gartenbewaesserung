@@ -11,6 +11,34 @@
 #
 ##############################################################################
 #
+# 1.0.51 - 2026-08-18  Fix: Der Sammel-Watchdog schlug nach jeder erfolgreichen Ernte Alarm. Die
+#                      Pruefung 'Fass ist voll geworden, also sammelt die Anlage' stand im
+#                      barrelFull-Zweig NACH dem Start der Ernte - und die setzt ibcFilling auf yes.
+#                      Der Waechter 'ibcFilling eq no' sah damit immer die Befuellung, die er selbst
+#                      gerade ausgeloest hatte, und rainSinceFill_mm wurde nie zurueckgesetzt.
+#                      Dasselbe galt fuer ibcToBarrelActive, das CheckBarrelFull vorher abraeumt.
+#                      Beide Kennzeichen werden jetzt VOR der Verarbeitung festgehalten; zusaetzlich
+#                      zaehlt eine laufende Fassbefuellung aus der Leitung nicht mehr als Beleg.
+#                      Nachweis: 18.08., zwei Ernten um 08:58 und 10:21, rainSinceFill_mm lief
+#                      trotzdem von 0,68 auf 6,30 mm durch und loeste um 12:26 den Alarm aus.
+#                      Neu dazu: Faellt der Fass-leer-Kontakt bei GESCHLOSSENER Hauswasserzufuhr
+#                      weg, gilt auch das als Beleg. Ohne mainsSupplyDevice bleibt das aus - genau
+#                      diese Unterscheidung fehlte 1.0.45, weshalb das damals zurueckgenommen wurde.
+# 1.0.50 - 2026-08-18  Neu: Fuellstandsschaetzung fuer das Fass (barrelLevel_l, barrelLevelAnchor).
+#                      Das Fass ist besser vermessen als der IBC - drei Ankerpunkte statt zwei:
+#                      barrelFull -> barrelUsableVolume, barrelEmpty -> 0, und bei offener
+#                      Hauswasserzufuhr haelt das Schwimmerventil barrelFloatLevel als Untergrenze,
+#                      sobald der Leer-Kontakt frei ist und nichts entnimmt. Dazu Zu- und Abfluesse:
+#                      Regen (mm x roofArea x runoffCoefficient), Rueckfluss aus dem IBC, Foerderung
+#                      ins IBC und die Entnahme beim Giessen.
+#                      Das bisherige barrelLevel war reine Simulation - Start bei 100, minus 12 je
+#                      Ventil - und stand zuletzt auf 38 %, waehrend das Fass leer war. Es wird jetzt
+#                      aus barrelLevel_l abgeleitet, sobald barrelUsableVolume gesetzt ist; ohne das
+#                      Attribut bleibt die alte Simulation unveraendert. barrelFillThreshold liest
+#                      weiterhin dasselbe Reading und arbeitet damit ohne Aenderung auf echten Zahlen.
+#                      Die Entnahmerate beim Giessen wird gelernt (wateringFlow_lpm): laeuft ein
+#                      volles Fass allein durch Giessen leer, entspricht die summierte Ventil-Offenzeit
+#                      genau barrelUsableVolume. Bis dahin gelten die alten 12 % je Ventil.
 # 1.0.49 - 2026-08-18  Neu: Fuellstandsschaetzung fuer den IBC. Neues Attribut ibcUsableVolume
 #                      (Liter) und neue Readings ibcLevel_l, ibcLevel_pct, ibcLevelAnchor. Der IBC
 #                      hat keinen Pegelgeber, nur zwei Endschalter - der Stand wird deshalb
@@ -375,7 +403,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.49';
+    $hash->{VERSION}    = '1.0.51';
 
     my $name = $a[0];
 
@@ -641,7 +669,20 @@ sub Gartenbewaesserung_Notify {
             if($devName eq $barrelDev) {
                 my $activeValue = AttrVal($name, "barrelFullSensorActiveValue", "");
                 if(Gartenbewaesserung_CheckSensorActive($name, $event, $barrelReading, $activeValue)) {
+                    # Snapshot BEFORE anything below runs: CheckBarrelFull clears
+                    # ibcToBarrelActive, and the harvest a few lines down sets
+                    # ibcFilling. Reading those flags afterwards would show the
+                    # module its own doing and never credit the rain.
+                    my $notFromRain = (ReadingsVal($name, "ibcToBarrelActive", "no") eq "yes"
+                                    || ReadingsVal($name, "ibcFilling", "no") eq "yes"
+                                    || $hash->{HELPER}{barrelFilling}) ? 1 : 0;
                     readingsSingleUpdate($hash, "barrelFull", "yes", 1);
+                    # Hard anchor for the level estimate, and the starting line
+                    # for learning the watering draw rate
+                    Gartenbewaesserung_SetBarrelLevel($hash,
+                        AttrVal($name, "barrelUsableVolume", 0), "barrelFull", 1);
+                    $hash->{HELPER}{drawMinutes} = 0;
+                    delete $hash->{HELPER}{drawTainted};
                     Gartenbewaesserung_CheckBarrelFull($hash);
                     # Barrel full after (or during) rain and idle -> harvest into the IBC
                     if(Gartenbewaesserung_HarvestDue($hash) &&
@@ -662,9 +703,7 @@ sub Gartenbewaesserung_Notify {
                     Gartenbewaesserung_RecoverFromNoWater($hash, 1);
                     # Barrel gained water from rain (not from an IBC->barrel transfer or house-water
                     # fill) -> the rainwater collection is working
-                    if(Gartenbewaesserung_RainRecentEnough($hash)
-                       && ReadingsVal($name, "ibcToBarrelActive", "no") eq "no"
-                       && ReadingsVal($name, "ibcFilling", "no") eq "no") {
+                    if(Gartenbewaesserung_RainRecentEnough($hash) && !$notFromRain) {
                         Gartenbewaesserung_RainCollectionSeenFill($hash, "barrelFull (rain)");
                     }
                 }
@@ -736,6 +775,10 @@ sub Gartenbewaesserung_Notify {
                 my $activeValue = AttrVal($name, "barrelEmptySensorActiveValue", "");
                 if(Gartenbewaesserung_CheckSensorActive($name, $event, $barrelEmptyReading, $activeValue)) {
                     readingsSingleUpdate($hash, "barrelEmpty", "yes", 1);
+                    # Emptied by watering alone? Then the accumulated valve time
+                    # corresponds to a known volume - learn before anchoring.
+                    Gartenbewaesserung_LearnWateringFlow($hash);
+                    Gartenbewaesserung_SetBarrelLevel($hash, 0, "barrelEmpty", 1);
                     Log3 $name, 3, "$name: Barrel empty detected, stopping pump and watering";
                     Gartenbewaesserung_HandleBarrelEmpty($hash);
                 }
@@ -748,6 +791,22 @@ sub Gartenbewaesserung_Notify {
                     # a working IBC lifts the barrel to the full contact, a float alone
                     # stops well below it. Cancelling here would silently disable the
                     # empty-IBC detection (was briefly the case in 1.0.45).
+                    # Separate question, same edge: does this count as evidence
+                    # that the RAIN COLLECTION works (the collection watchdog,
+                    # rainSinceFill_mm)? With the mains closed, yes - the contact
+                    # can then only clear because water arrived, and that comes
+                    # much earlier than waiting for barrelFull. With the mains
+                    # open it says nothing, the float valve clears it too. That
+                    # distinction is what 1.0.45 lacked; mainsSupplyDevice
+                    # supplies it now. The fill watchdog above stays untouched.
+                    if(ReadingsVal($name, "barrelEmpty", "no") eq "yes"
+                       && Gartenbewaesserung_MainsSupplyState($hash) eq "off"
+                       && !$hash->{HELPER}{ibcToBarrelActive}
+                       && !$hash->{HELPER}{barrelFilling}
+                       && !$hash->{HELPER}{pauseActive}) {
+                        Gartenbewaesserung_RainCollectionSeenFill($hash, "barrelEmpty:no (rain)");
+                    }
+
                     my $resumePending = $hash->{HELPER}{barrelEmptyResumePending};
                     if($hash->{HELPER}{barrelEmptyRefilling}) {
                         Log3 $name, 3, "$name: barrelEmpty inactive during refill - letting timer/sensor finish the refill";
@@ -1039,6 +1098,8 @@ sub Gartenbewaesserung_UpdateSensorReadings {
     readingsBulkUpdate($hash, "mainsSupply", $mains) if($mains ne "");
 
     readingsEndUpdate($hash, 1);
+
+    Gartenbewaesserung_ApplyBarrelFloatFloor($hash);
 
     # Refresh rolling rain amount (separate readings transaction)
     Gartenbewaesserung_UpdateRainAmount($hash);
@@ -2041,6 +2102,7 @@ sub Gartenbewaesserung_RunCircuit {
 
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "phase", "watering circuit $circuitLabel");
+    $hash->{HELPER}{valveOpenTime} = int(time());
     readingsBulkUpdate($hash, "currentValve", $circuitNum);
     readingsBulkUpdate($hash, "currentValveName", Gartenbewaesserung_ValveName($hash, $circuitNum));
     readingsEndUpdate($hash, 1);
@@ -2072,14 +2134,10 @@ sub Gartenbewaesserung_FinishOrPauseCircuit {
 
     delete $hash->{HELPER}{valveCloseTimer};
     Gartenbewaesserung_ClearEndTime($hash);
+    Gartenbewaesserung_NoteValveDraw($hash);
+
     readingsSingleUpdate($hash, "currentValve", "none", 1);
     readingsSingleUpdate($hash, "currentValveName", "none", 1);
-
-    # Decrease barrel level (simulated)
-    my $currentLevel = ReadingsVal($name, "barrelLevel", 100);
-    my $newLevel = $currentLevel - 12;
-    $newLevel = 0 if($newLevel < 0);
-    readingsSingleUpdate($hash, "barrelLevel", $newLevel, 1);
 
     # Check if we have remaining time (pause is needed)
     if(defined($hash->{HELPER}{valveRemainingTime}) && $hash->{HELPER}{valveRemainingTime} > 0) {
@@ -2759,6 +2817,7 @@ sub Gartenbewaesserung_OpenValve {
 
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "phase", "watering");
+    $hash->{HELPER}{valveOpenTime} = int(time());
     readingsBulkUpdate($hash, "currentValve", $valveNum);
     readingsBulkUpdate($hash, "currentValveName", Gartenbewaesserung_ValveName($hash, $valveNum));
     readingsBulkUpdate($hash, "cycleProgress", "$index/$total");
@@ -2797,11 +2856,7 @@ sub Gartenbewaesserung_CloseValve {
         Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "off");
     }
 
-    # Decrease barrel level (simulated)
-    my $currentLevel = ReadingsVal($name, "barrelLevel", 100);
-    my $newLevel = $currentLevel - 12;  # Each valve uses about 12%
-    $newLevel = 0 if($newLevel < 0);
-    readingsSingleUpdate($hash, "barrelLevel", $newLevel, 1);
+    Gartenbewaesserung_NoteValveDraw($hash);
 
     # Check if we have remaining time (pause is needed)
     if(defined($hash->{HELPER}{valveRemainingTime}) && $hash->{HELPER}{valveRemainingTime} > 0) {
@@ -3862,6 +3917,7 @@ sub Gartenbewaesserung_StartSingleValve {
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "state", "manual");
     readingsBulkUpdate($hash, "phase", "manual watering");
+    $hash->{HELPER}{valveOpenTime} = int(time());
     readingsBulkUpdate($hash, "currentValve", $valveNum);
     readingsBulkUpdate($hash, "currentValveName", Gartenbewaesserung_ValveName($hash, $valveNum));
     readingsEndUpdate($hash, 1);
@@ -4111,6 +4167,130 @@ sub Gartenbewaesserung_AdjustIbcLevel {
 }
 
 ##############################################################################
+# Barrel level estimate.
+#
+# Same idea as the IBC estimate, but the barrel is better instrumented - three
+# anchors instead of two. barrelFull puts the level at barrelUsableVolume,
+# barrelEmpty at 0, and with the mains supply open the float valve guarantees
+# barrelFloatLevel as a floor once the bottom contact has cleared.
+#
+# The percentage in barrelLevel used to be pure simulation: start at 100, minus
+# 12 per valve. That is kept as the fallback so nothing changes where
+# barrelUsableVolume is unset; where the volume is known the percentage is
+# derived from the litres instead, and barrelFillThreshold keeps working
+# unchanged - just on real numbers.
+##############################################################################
+sub Gartenbewaesserung_SetBarrelLevel {
+    my ($hash, $liters, $reason, $anchor) = @_;
+    my $name = $hash->{NAME};
+
+    my $capacity = AttrVal($name, "barrelUsableVolume", 0);
+    return if($capacity <= 0);
+
+    $liters = 0 if($liters < 0);
+    $liters = $capacity if($liters > $capacity);
+
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, "barrelLevel_l", sprintf("%.0f", $liters));
+    readingsBulkUpdate($hash, "barrelLevel", sprintf("%.0f", 100 * $liters / $capacity));
+    readingsBulkUpdate($hash, "barrelLevelAnchor", TimeNow() . " " . $reason) if($anchor);
+    readingsEndUpdate($hash, 1);
+}
+
+# Returns 1 when the litre estimate handled it, 0 when the caller should fall
+# back to the old percentage simulation.
+sub Gartenbewaesserung_AdjustBarrelLevel {
+    my ($hash, $delta, $reason) = @_;
+    my $name = $hash->{NAME};
+
+    return 0 if(AttrVal($name, "barrelUsableVolume", 0) <= 0);
+
+    my $level = ReadingsVal($name, "barrelLevel_l", "");
+    return 0 if($level !~ /^-?\d+(?:\.\d+)?$/);
+
+    # Anything that puts water in makes the accumulated valve time useless for
+    # learning the draw rate - the barrel no longer empties on watering alone.
+    $hash->{HELPER}{drawTainted} = 1 if($delta > 0);
+
+    return 1 if(!$delta);
+    Gartenbewaesserung_SetBarrelLevel($hash, $level + $delta, $reason, 0);
+    Log3 $name, 4, sprintf("%s: barrel level %+.0f l (%s) -> %s l",
+        $name, $delta, $reason, ReadingsVal($name, "barrelLevel_l", "?"));
+    return 1;
+}
+
+# With the mains open and nothing drawing, the barrel cannot sit below the level
+# the float valve holds it at.
+sub Gartenbewaesserung_ApplyBarrelFloatFloor {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    my $float = AttrVal($name, "barrelFloatLevel", 0);
+    return if($float <= 0 || AttrVal($name, "barrelUsableVolume", 0) <= 0);
+    return if(Gartenbewaesserung_MainsSupplyState($hash) ne "on");
+    return if(ReadingsVal($name, "barrelEmpty", "no") eq "yes");
+    return if($hash->{HELPER}{watering}   || $hash->{HELPER}{circuitMode}
+           || $hash->{HELPER}{ibcFilling} || $hash->{HELPER}{ibcToBarrelActive}
+           || $hash->{HELPER}{barrelFilling} || $hash->{HELPER}{pauseActive});
+
+    my $level = ReadingsVal($name, "barrelLevel_l", "");
+    return if($level !~ /^-?\d+(?:\.\d+)?$/ || $level >= $float);
+
+    Gartenbewaesserung_SetBarrelLevel($hash, $float, "float valve", 1);
+    $hash->{HELPER}{drawTainted} = 1;
+}
+
+# One valve has just closed: book its draw and remember how long it was open.
+sub Gartenbewaesserung_NoteValveDraw {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    my $opened = $hash->{HELPER}{valveOpenTime};
+    delete $hash->{HELPER}{valveOpenTime};
+    my $minutes = $opened ? (int(time()) - $opened) / 60 : 0;
+    $minutes = 0 if($minutes < 0);
+    $hash->{HELPER}{drawMinutes} = ($hash->{HELPER}{drawMinutes} || 0) + $minutes;
+
+    my $capacity = AttrVal($name, "barrelUsableVolume", 0);
+    if($capacity > 0) {
+        my $rate = ReadingsVal($name, "wateringFlow_lpm", 0);
+        $rate = 0 if($rate !~ /^\d+(?:\.\d+)?$/);
+        # Learned rate where we have one, otherwise the historical 12 % per valve
+        my $drawn = ($rate > 0 && $minutes > 0) ? ($rate * $minutes) : ($capacity * 0.12);
+        return if(Gartenbewaesserung_AdjustBarrelLevel($hash, -$drawn, "watering"));
+    }
+
+    my $current = ReadingsVal($name, "barrelLevel", 100);
+    $current = 100 if($current !~ /^-?\d+(?:\.\d+)?$/);
+    my $new = $current - 12;
+    $new = 0 if($new < 0);
+    readingsSingleUpdate($hash, "barrelLevel", $new, 1);
+}
+
+# A full barrel emptied by watering alone tells us how much a minute of valve
+# time costs - the same trick that measures the pump, applied to the consumer.
+sub Gartenbewaesserung_LearnWateringFlow {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    my $minutes  = $hash->{HELPER}{drawMinutes} || 0;
+    my $tainted  = $hash->{HELPER}{drawTainted} || 0;
+    my $capacity = AttrVal($name, "barrelUsableVolume", 0);
+    $hash->{HELPER}{drawMinutes} = 0;
+
+    return if($tainted || $minutes <= 0 || $capacity <= 0);
+    return if(ReadingsVal($name, "barrelLevelAnchor", "") !~ /barrelFull/);
+
+    my $measured = $capacity / $minutes;
+    my $old = ReadingsVal($name, "wateringFlow_lpm", 0);
+    $old = 0 if($old !~ /^\d+(?:\.\d+)?$/);
+    my $new = ($old > 0) ? ($old * 0.7 + $measured * 0.3) : $measured;
+    readingsSingleUpdate($hash, "wateringFlow_lpm", sprintf("%.1f", $new), 1);
+    Log3 $name, 3, sprintf("%s: full barrel emptied by %.1f min of watering "
+        . "= %.1f l/min (learned rate now %.1f)", $name, $minutes, $measured, $new);
+}
+
+##############################################################################
 # Measurement for the IBC -> barrel direction (the "out" side of the level
 # estimate). A watering pause feeds the barrel from the IBC by gravity without
 # ever setting ibcToBarrelActive, so these runs are invisible otherwise.
@@ -4171,7 +4351,10 @@ sub Gartenbewaesserung_NoteIbcToBarrelStop {
             $name, $reason, $minutes);
     }
 
-    Gartenbewaesserung_AdjustIbcLevel($hash, -$moved, "IBC->barrel") if($moved > 0);
+    if($moved > 0) {
+        Gartenbewaesserung_AdjustIbcLevel($hash, -$moved, "IBC->barrel");
+        Gartenbewaesserung_AdjustBarrelLevel($hash, $moved, "IBC->barrel");
+    }
 }
 
 ##############################################################################
@@ -4293,7 +4476,13 @@ sub Gartenbewaesserung_RecordIbcFillRun {
     }
     readingsEndUpdate($hash, 1);
 
-    Gartenbewaesserung_AdjustIbcLevel($hash, $moved, "barrel->IBC") if($moved > 0);
+    if($moved > 0) {
+        Gartenbewaesserung_AdjustIbcLevel($hash, $moved, "barrel->IBC");
+        # Everything pumped left the barrel. With the mains open it refilled at
+        # the same time, which this does not model - the barrelEmpty anchor and
+        # the float floor correct that within the same run.
+        Gartenbewaesserung_AdjustBarrelLevel($hash, -$moved, "barrel->IBC");
+    }
 }
 
 ##############################################################################
@@ -4651,8 +4840,10 @@ sub Gartenbewaesserung_UpdateRainAmount {
     # not (and cannot be) deducted here.
     my $roofArea = AttrVal($name, "roofArea", 0);
     my ($todayL, $monthL, $yearL, $totalL, $day, $month, $year);
+    my $harvested = 0;
     if($roofArea > 0) {
         my $liters = $delta * $roofArea * AttrVal($name, "runoffCoefficient", 0.8);
+        $harvested = $liters;
 
         my @lt = localtime($now);
         $day   = sprintf("%04d-%02d-%02d", $lt[5] + 1900, $lt[4] + 1, $lt[3]);
@@ -4700,6 +4891,10 @@ sub Gartenbewaesserung_UpdateRainAmount {
         $setzeWennGeaendert->("harvest_total_l", sprintf("%.1f", $totalL));
     }
     readingsEndUpdate($hash, 1);
+
+    # Rain reaching the downpipe goes into the barrel. Overflow at a full barrel
+    # is handled by the clamp in SetBarrelLevel, not modelled here.
+    Gartenbewaesserung_AdjustBarrelLevel($hash, $harvested, "rain") if($harvested > 0);
 
     Log3 $name, 5, "$name: rain amount update raw=$raw delta=$delta accum=$accum "
         . "window(${windowH}h)=$windowSum sinceFill=$sinceFill";
@@ -4970,6 +5165,14 @@ sub Gartenbewaesserung_GetStatus {
         }
         $status .= "Foerderrate (gelernt): " . ReadingsVal($name, "ibcFillFlow_lpm", "-") . " l/min\n\n";
     }
+    if(ReadingsVal($name, "barrelLevel_l", "") ne "") {
+        $status .= "--- Fass-Fuellstand (geschaetzt) ---\n";
+        $status .= "Stand:  " . ReadingsVal($name, "barrelLevel_l", "-") . " l ("
+                 . ReadingsVal($name, "barrelLevel", "-") . " %)\n";
+        $status .= "Anker:  " . ReadingsVal($name, "barrelLevelAnchor", "-") . "\n";
+        $status .= "Entnahme Giessen (gelernt): "
+                 . ReadingsVal($name, "wateringFlow_lpm", "-") . " l/min\n\n";
+    }
     if(ReadingsVal($name, "ibcLevel_l", "") ne "") {
         $status .= "--- IBC-Fuellstand (geschaetzt) ---\n";
         $status .= "Stand:  " . ReadingsVal($name, "ibcLevel_l", "-") . " l ("
@@ -5235,8 +5438,10 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><a id="Gartenbewaesserung-attr-barrelFillThreshold"></a>
             <b>barrelFillThreshold</b><br>
             Typ: Slider (0–100 %). Standardwert: 30 %.<br>
-            Simulierter Füllstand-Schwellwert: Fällt <code>barrelLevel</code> darunter,
-            wird vor dem nächsten Ventil eine Befüllung gestartet.
+            Füllstand-Schwellwert: Fällt <code>barrelLevel</code> darunter, wird vor dem nächsten
+            Ventil eine Befüllung gestartet. Ist <code>barrelUsableVolume</code> gesetzt, stammt der
+            Prozentwert aus der Füllstandsschätzung (<code>barrelLevel_l</code>); ohne das Attribut
+            bleibt es bei der alten Simulation (Start 100, minus 12 je Ventil).
         </li>
         <li><a id="Gartenbewaesserung-attr-ibcToBarrelDuration"></a>
             <b>ibcToBarrelDuration</b><br>
@@ -5348,7 +5553,12 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Nutzbares Fassvolumen zwischen Fass-voll- und Fass-leer-Sensor. Läuft eine Befüllung
             Fass&nbsp;&rarr;&nbsp;IBC von einem vollen Fass bis <code>barrelEmpty</code> durch, ist
             das bewegte Volumen damit bekannt; das Modul leitet daraus die aktuelle Förderrate ab
-            (<code>ibcFillFlow_lpm</code>). Grundlage für eine spätere Füllstandsschätzung.
+            (<code>ibcFillFlow_lpm</code>). Schaltet außerdem die Füllstandsschätzung des Fasses
+            frei (<code>barrelLevel_l</code>): drei Ankerpunkte – <code>barrelFull</code> setzt auf
+            das volle Volumen, <code>barrelEmpty</code> auf 0, und bei offener Hauswasserzufuhr hält
+            das Schwimmerventil <code>barrelFloatLevel</code> als Untergrenze, sobald der
+            Leer-Kontakt frei ist und nichts entnimmt. Dazwischen wird gerechnet: Regen und Rücklauf
+            aus dem IBC kommen drauf, Förderung ins IBC und Gießen gehen ab.
         </li>
         <li><a id="Gartenbewaesserung-attr-barrelFloatLevel"></a>
             <b>barrelFloatLevel</b><br>
@@ -5596,6 +5806,8 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>lastIbcFillSource</b> - <code>rain</code> (Hauswasser war zu, reines Regenwasser), <code>mixed</code> (Hauswasser offen, Leitungswasser lief mit) oder <code>unknown</code> (kein <code>mainsSupplyDevice</code> gesetzt).</li>
         <li><b>pumped_total_l</b> / <b>pumpedRain_total_l</b> / <b>mains_total_l</b> - Insgesamt vom Fass in den IBC gefördertes Volumen, aufgeteilt in Regen- und Leitungswasseranteil. <code>pumpedRain_total_l</code> lässt sich direkt gegen <code>harvest_total_l</code> halten: Weichen die Werte dauerhaft voneinander ab, stimmt <code>roofArea</code> nicht. Läufe mit offener Hauswasserzufuhr steuern ihren Regenanteil nur bei, wenn <code>barrelFloatLevel</code> gesetzt ist. Zurücksetzen mit <code>set &lt;name&gt; resetHarvestStats</code>.</li>
         <li><b>lastIbcFillRain_l</b> / <b>lastIbcFillMains_l</b> - Aufteilung des letzten Laufs. Nur gefüllt, wenn <code>mainsSupplyDevice</code> konfiguriert ist.</li>
+        <li><b>barrelLevel_l</b> / <b>barrelLevel</b> / <b>barrelLevelAnchor</b> - Geschätzter Fass-Füllstand in Litern bzw. Prozent, und woher der Wert zuletzt verankert wurde (<code>barrelFull</code>, <code>barrelEmpty</code>, <code>float valve</code>) mit Zeitstempel. <code>barrelLevel_l</code> setzt <code>barrelUsableVolume</code> voraus; <code>barrelLevel</code> gibt es immer – ohne das Attribut als alte Simulation, mit ihm aus den Litern abgeleitet.</li>
+        <li><b>wateringFlow_lpm</b> - Gelernte Entnahmerate beim Gießen in Litern pro Minute Ventil-Offenzeit. Gelernt wird nur, wenn ein volles Fass <b>allein durch Gießen</b> leerläuft – kommt zwischendurch Wasser nach (Regen, IBC, Hauswasser), wird der Lauf verworfen. Bis dahin rechnet die Schätzung mit den historischen 12 % je Ventil.</li>
         <li><b>ibcLevel_l</b> / <b>ibcLevel_pct</b> / <b>ibcLevelAnchor</b> - Geschätzter IBC-Füllstand in Litern bzw. Prozent, und woher der Wert zuletzt verankert wurde (<code>ibcEmpty</code>, <code>ibcFull</code>, <code>manual</code>) mit Zeitstempel. Setzt <code>ibcUsableVolume</code> voraus. <b>Eine Schätzung, keine Messung</b> – siehe dort.</li>
         <li><b>ibcToBarrelFlow_lpm</b> / <b>lastIbcToBarrelVolume_l</b> - Gelernte Rate der Schwerkraftrichtung IBC&nbsp;&rarr;&nbsp;Fass und die daraus geschätzte Menge des letzten Rücklaufs. Gelernt wird nur aus Läufen, die bei leerem Fass beginnen und mit <code>barrelFull</code> enden – die haben <code>barrelUsableVolume</code> bewegt.</li>
         <li><b>lastIbcToBarrelDuration</b> / <b>lastIbcToBarrelEnd</b> - Dauer (Minuten) und Endgrund (<code>barrelFull</code>, <code>pauseEnd</code>) des letzten Laufs IBC&nbsp;&rarr;&nbsp;Fass, einschließlich der Schwerkraft-Nachspeisung während einer Gießpause.</li>
