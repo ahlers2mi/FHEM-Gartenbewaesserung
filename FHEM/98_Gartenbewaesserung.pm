@@ -11,6 +11,13 @@
 #
 ##############################################################################
 #
+# 1.0.56 - 2026-08-19  Neu: Die Entnahmerate wird jetzt AUF DEN KREIS gelernt, wenn zwischen den
+#                      beiden Ankern nur ein einziger Kreis gelaufen ist - dann steht das bewegte
+#                      Volumen fest und gehoert eindeutig ihm. Ergebnis landet im Reading
+#                      valve<N>Flow_lpm und hat Vorrang vor allem anderen. Waren mehrere Kreise
+#                      beteiligt, bleibt es beim gemeinsamen wateringFlow_lpm wie bisher.
+#                      Erreichbar ist das nur fuer Kreise, die ein volles Fass allein leerziehen;
+#                      kuerzere schaffen das nicht und brauchen weiter das Attribut.
 # 1.0.55 - 2026-08-19  Neu: Entnahmerate je Kreis - valve<N>Flow_lpm. Jeder Kreis hat andere
 #                      Sprenger und nicht gleich viele, eine gemeinsame Rate ist deshalb bestenfalls
 #                      ein Mittelwert. Die Reihenfolge ist jetzt: Rate des Kreises, dann die
@@ -445,7 +452,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.55';
+    $hash->{VERSION}    = '1.0.56';
 
     my $name = $a[0];
 
@@ -4307,6 +4314,12 @@ sub Gartenbewaesserung_NoteValveDraw {
     my $minutes = $opened ? (int(time()) - $opened) / 60 : 0;
     $minutes = 0 if($minutes < 0);
     $hash->{HELPER}{drawMinutes} = ($hash->{HELPER}{drawMinutes} || 0) + $minutes;
+    # Zusaetzlich je Kreis, damit ein Lauf, an dem nur einer beteiligt war,
+    # seine eigene Rate bekommen kann.
+    if(defined($valveNum) && $valveNum =~ /^\d+$/ && $minutes > 0) {
+        $hash->{HELPER}{drawByValve}{$valveNum} =
+            ($hash->{HELPER}{drawByValve}{$valveNum} || 0) + $minutes;
+    }
 
     my $capacity = AttrVal($name, "barrelUsableVolume", 0);
     if($capacity > 0) {
@@ -4315,10 +4328,11 @@ sub Gartenbewaesserung_NoteValveDraw {
         # viele. Danach die gelernte Gesamtrate, dann das Attribut, zuletzt der
         # Pauschalabzug - der ignoriert die Laufzeit und liegt bei laengeren
         # Ventilen weit daneben, deshalb der Log-Hinweis.
+        my $vn = (defined($valveNum) && $valveNum =~ /^\d+$/) ? $valveNum : "";
         my $rate = 0;
         foreach my $candidate (
-            (defined($valveNum) && $valveNum =~ /^\d+$/)
-                ? AttrVal($name, "valve${valveNum}Flow_lpm", 0) : 0,
+            $vn ne "" ? ReadingsVal($name, "valve${vn}Flow_lpm", 0) : 0,
+            $vn ne "" ? AttrVal($name, "valve${vn}Flow_lpm", 0) : 0,
             ReadingsVal($name, "wateringFlow_lpm", 0),
             AttrVal($name, "wateringFlow_lpm", 0),
         ) {
@@ -4358,18 +4372,27 @@ sub Gartenbewaesserung_LearnWateringFlow {
     my $minutes  = $hash->{HELPER}{drawMinutes} || 0;
     my $tainted  = $hash->{HELPER}{drawTainted} || 0;
     my $capacity = AttrVal($name, "barrelUsableVolume", 0);
+    my $byValve  = $hash->{HELPER}{drawByValve} || {};
     $hash->{HELPER}{drawMinutes} = 0;
+    delete $hash->{HELPER}{drawByValve};
 
     return if($tainted || $minutes <= 0 || $capacity <= 0);
     return if(ReadingsVal($name, "barrelLevelAnchor", "") !~ /barrelFull/);
 
+    # War nur ein einziger Kreis beteiligt, gehoert das Volumen eindeutig ihm -
+    # dann lernen wir seine Rate statt einer Mischung ueber alle.
+    my @valves = keys %$byValve;
+    my $target = (scalar(@valves) == 1) ? "valve$valves[0]Flow_lpm" : "wateringFlow_lpm";
+
     my $measured = $capacity / $minutes;
-    my $old = ReadingsVal($name, "wateringFlow_lpm", 0);
+    my $old = ReadingsVal($name, $target, 0);
     $old = 0 if($old !~ /^\d+(?:\.\d+)?$/);
     my $new = ($old > 0) ? ($old * 0.7 + $measured * 0.3) : $measured;
-    readingsSingleUpdate($hash, "wateringFlow_lpm", sprintf("%.1f", $new), 1);
-    Log3 $name, 3, sprintf("%s: full barrel emptied by %.1f min of watering "
-        . "= %.1f l/min (learned rate now %.1f)", $name, $minutes, $measured, $new);
+    readingsSingleUpdate($hash, $target, sprintf("%.1f", $new), 1);
+    Log3 $name, 3, sprintf("%s: full barrel emptied by %.1f min of watering (%s) "
+        . "= %.1f l/min (learned rate now %.1f)", $name, $minutes,
+        (scalar(@valves) == 1) ? "circuit $valves[0]" : scalar(@valves) . " circuits",
+        $measured, $new);
 }
 
 # Does the level estimate consider the IBC full? Only with ibcFullFromLevel set,
@@ -5775,9 +5798,12 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Typ: Zahl (Liter je Minute Offenzeit). Ohne Vorgabe deaktiviert.<br>
             Entnahmerate eines <b>einzelnen</b> Kreises. Jeder Kreis hat andere Sprenger und nicht
             gleich viele, eine gemeinsame Rate ist deshalb bestenfalls ein Mittelwert.<br>
-            Reihenfolge, in der die Füllstandsschätzung sucht: Rate dieses Kreises, dann das
-            gelernte Reading <code>wateringFlow_lpm</code>, dann das gleichnamige Attribut, zuletzt
-            der Pauschalabzug.<br>
+            Reihenfolge, in der die Füllstandsschätzung sucht: gelerntes Reading
+            <code>valve&lt;N&gt;Flow_lpm</code>, dann das gleichnamige Attribut, dann das gelernte
+            <code>wateringFlow_lpm</code>, dann dessen Attribut, zuletzt der Pauschalabzug.<br>
+            <i>Gelernt</i> wird je Kreis, wenn zwischen zwei Ankern <b>nur dieser eine</b> gelaufen
+            ist und dabei ein volles Fass bis <code>barrelEmpty</code> leergezogen wurde. Kürzere
+            Kreise schaffen das nicht – für die bleibt das Attribut der Weg.<br>
             <i>Bestimmen:</i> je Kreis einmal aus vollem Fass laufen lassen und die Restmenge
             ablesen – <code>(barrelUsableVolume - Restmenge) ÷ Ventilminuten</code>.
         </li>
