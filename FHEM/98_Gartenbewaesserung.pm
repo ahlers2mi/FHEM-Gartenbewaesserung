@@ -11,6 +11,38 @@
 #
 ##############################################################################
 #
+# 1.0.57 - 2026-08-19  Fix: Der Fass-leer-Refill aus dem IBC wurde nicht gemessen. Genau dieser
+#                      Weg startet bei LEEREM Fass und endet auf barrelFull, bewegt also die
+#                      bekannte barrelUsableVolume - er ist der einzige, aus dem sich
+#                      ibcToBarrelFlow_lpm ueberhaupt lernen laesst. Der Aufruf fehlte auf beiden
+#                      Seiten: NoteIbcToBarrelStop im ibcToBarrelActive-Zweig von CheckBarrelFull
+#                      und beim Abbruch. Nachweis: 19.08. lief die Nachspeisung von 05:00:00 (Fass
+#                      leer) bis 05:10:20 (barrelFull) - zehneinhalb Minuten fuer 250 l, rund
+#                      24 l/min - und im Log steht dazu kein einziges Reading.
+# 1.0.56 - 2026-08-19  Neu: Die Entnahmerate wird jetzt AUF DEN KREIS gelernt, wenn zwischen den
+#                      beiden Ankern nur ein einziger Kreis gelaufen ist - dann steht das bewegte
+#                      Volumen fest und gehoert eindeutig ihm. Ergebnis landet im Reading
+#                      valve<N>Flow_lpm und hat Vorrang vor allem anderen. Waren mehrere Kreise
+#                      beteiligt, bleibt es beim gemeinsamen wateringFlow_lpm wie bisher.
+#                      Erreichbar ist das nur fuer Kreise, die ein volles Fass allein leerziehen;
+#                      kuerzere schaffen das nicht und brauchen weiter das Attribut.
+# 1.0.55 - 2026-08-19  Neu: Entnahmerate je Kreis - valve<N>Flow_lpm. Jeder Kreis hat andere
+#                      Sprenger und nicht gleich viele, eine gemeinsame Rate ist deshalb bestenfalls
+#                      ein Mittelwert. Die Reihenfolge ist jetzt: Rate des Kreises, dann die
+#                      gelernte Gesamtrate, dann das Attribut wateringFlow_lpm, zuletzt der
+#                      Pauschalabzug.
+# 1.0.54 - 2026-08-19  Fix: Die Entnahme beim Giessen wurde mit einem Pauschalwert gebucht - 12 % der
+#                      nutzbaren Kapazitaet je Ventil, UNABHAENGIG von der Laufzeit. Ein Ventil mit
+#                      zwei Minuten kostete damit so viel wie eines mit zwanzig. In der Anlage des
+#                      Autors: zwoelf Minuten Giessen zogen rund 115 l, gebucht wurden 30 - der
+#                      Fass-Stand meldete danach 245 l, im Fass standen 135.
+#                      Neues Attribut wateringFlow_lpm (Liter je Minute Ventil-Offenzeit). Damit
+#                      wird nach Zeit gerechnet statt pauschal. Der gelernte Wert hat weiter Vorrang;
+#                      ohne beides bleibt es beim alten Pauschalabzug, dann aber mit Log-Hinweis.
+#                      Hintergrund: die Lernbedingung (volles Fass laeuft allein durchs Giessen bis
+#                      barrelEmpty leer) ist nicht ueberall erreichbar - endet die Bewaesserung
+#                      vorher, etwa auf Schwimmerhoehe, greift sie nie. Dann ist das Attribut der
+#                      einzige Weg zu einer brauchbaren Zahl.
 # 1.0.53 - 2026-08-18  Neu: set <name> barrelLevel <liter>|<prozent>% als Gegenstueck zu ibcLevel.
 #                      Das Fass verankert sich zwar mehrmals taeglich von selbst an barrelFull oder
 #                      barrelEmpty - bis der erste Kontakt kommt, hat die Schaetzung aber keinen
@@ -360,6 +392,8 @@ sub Gartenbewaesserung_Initialize {
     $hash->{AttrList} =
         "valve1Device:textField valve2Device:textField valve3Device:textField valve4Device:textField " .
         "valve5Device:textField valve6Device:textField valve7Device:textField valve8Device:textField " .
+        "valve1Flow_lpm:textField valve2Flow_lpm:textField valve3Flow_lpm:textField valve4Flow_lpm:textField " .
+        "valve5Flow_lpm:textField valve6Flow_lpm:textField valve7Flow_lpm:textField valve8Flow_lpm:textField " .
         "valve1Name:textField valve2Name:textField valve3Name:textField valve4Name:textField " .
         "valve5Name:textField valve6Name:textField valve7Name:textField valve8Name:textField " .
         "pumpDevice:textField " .
@@ -395,6 +429,7 @@ sub Gartenbewaesserung_Initialize {
         "ibcFillRainAmount:slider,0,0.1,20 " .
         "roofArea:textField " .
         "barrelUsableVolume:textField barrelFloatLevel:textField " .
+        "wateringFlow_lpm:textField " .
         "ibcUsableVolume:textField ibcFullFromLevel:0,1 " .
         "mainsSupplyDevice:textField " .
         "mainsSupplyActiveValue:textField mainsSupplyInactiveValue:textField " .
@@ -425,7 +460,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.53';
+    $hash->{VERSION}    = '1.0.57';
 
     my $name = $a[0];
 
@@ -2170,7 +2205,7 @@ sub Gartenbewaesserung_FinishOrPauseCircuit {
 
     delete $hash->{HELPER}{valveCloseTimer};
     Gartenbewaesserung_ClearEndTime($hash);
-    Gartenbewaesserung_NoteValveDraw($hash);
+    Gartenbewaesserung_NoteValveDraw($hash, $circuitNum);
 
     readingsSingleUpdate($hash, "currentValve", "none", 1);
     readingsSingleUpdate($hash, "currentValveName", "none", 1);
@@ -2892,7 +2927,7 @@ sub Gartenbewaesserung_CloseValve {
         Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "off");
     }
 
-    Gartenbewaesserung_NoteValveDraw($hash);
+    Gartenbewaesserung_NoteValveDraw($hash, $valveNum);
 
     # Check if we have remaining time (pause is needed)
     if(defined($hash->{HELPER}{valveRemainingTime}) && $hash->{HELPER}{valveRemainingTime} > 0) {
@@ -2990,9 +3025,14 @@ sub Gartenbewaesserung_CheckBarrelFull {
         # otherwise the caller would pump it straight back up once the transfer ends.
         Gartenbewaesserung_NoteNonRainFill($hash, "IBC-to-barrel transfer");
         if($hash->{HELPER}{barrelEmptyRefilling}) {
+            # Dieser Weg beginnt bei leerem Fass und endet hier auf barrelFull -
+            # er hat also genau barrelUsableVolume bewegt und ist der einzige,
+            # aus dem sich die Schwerkraftrate lernen laesst. Der Aufruf fehlte.
+            Gartenbewaesserung_NoteIbcToBarrelStop($hash, "barrelFull");
             Gartenbewaesserung_StopBarrelEmptyRefill($hash);
         }
         else {
+            Gartenbewaesserung_NoteIbcToBarrelStop($hash, "barrelFull");
             Gartenbewaesserung_StopIBCtoBarrel($hash);
         }
         return;
@@ -4279,7 +4319,7 @@ sub Gartenbewaesserung_ApplyBarrelFloatFloor {
 
 # One valve has just closed: book its draw and remember how long it was open.
 sub Gartenbewaesserung_NoteValveDraw {
-    my ($hash) = @_;
+    my ($hash, $valveNum) = @_;
     my $name = $hash->{NAME};
 
     my $opened = $hash->{HELPER}{valveOpenTime};
@@ -4287,13 +4327,45 @@ sub Gartenbewaesserung_NoteValveDraw {
     my $minutes = $opened ? (int(time()) - $opened) / 60 : 0;
     $minutes = 0 if($minutes < 0);
     $hash->{HELPER}{drawMinutes} = ($hash->{HELPER}{drawMinutes} || 0) + $minutes;
+    # Zusaetzlich je Kreis, damit ein Lauf, an dem nur einer beteiligt war,
+    # seine eigene Rate bekommen kann.
+    if(defined($valveNum) && $valveNum =~ /^\d+$/ && $minutes > 0) {
+        $hash->{HELPER}{drawByValve}{$valveNum} =
+            ($hash->{HELPER}{drawByValve}{$valveNum} || 0) + $minutes;
+    }
 
     my $capacity = AttrVal($name, "barrelUsableVolume", 0);
     if($capacity > 0) {
-        my $rate = ReadingsVal($name, "wateringFlow_lpm", 0);
-        $rate = 0 if($rate !~ /^\d+(?:\.\d+)?$/);
-        # Learned rate where we have one, otherwise the historical 12 % per valve
-        my $drawn = ($rate > 0 && $minutes > 0) ? ($rate * $minutes) : ($capacity * 0.12);
+        # Vom Speziellen zum Allgemeinen: die Rate DIESES Kreises schlaegt die
+        # gemeinsame, denn jeder Kreis hat andere Sprenger und nicht gleich
+        # viele. Danach die gelernte Gesamtrate, dann das Attribut, zuletzt der
+        # Pauschalabzug - der ignoriert die Laufzeit und liegt bei laengeren
+        # Ventilen weit daneben, deshalb der Log-Hinweis.
+        my $vn = (defined($valveNum) && $valveNum =~ /^\d+$/) ? $valveNum : "";
+        my $rate = 0;
+        foreach my $candidate (
+            $vn ne "" ? ReadingsVal($name, "valve${vn}Flow_lpm", 0) : 0,
+            $vn ne "" ? AttrVal($name, "valve${vn}Flow_lpm", 0) : 0,
+            ReadingsVal($name, "wateringFlow_lpm", 0),
+            AttrVal($name, "wateringFlow_lpm", 0),
+        ) {
+            next if($candidate !~ /^\d+(?:\.\d+)?$/ || $candidate <= 0);
+            $rate = $candidate;
+            last;
+        }
+
+        my $drawn;
+        if($rate > 0 && $minutes > 0) {
+            $drawn = $rate * $minutes;
+        }
+        else {
+            $drawn = $capacity * 0.12;
+            my $which = (defined($valveNum) && $valveNum =~ /^\d+$/)
+                ? "valve${valveNum}Flow_lpm" : "wateringFlow_lpm";
+            Log3 $name, 3, sprintf("%s: no watering flow rate known - deducting a flat %.0f l for "
+                . "%.1f min of valve time. Set attr %s for a level estimate that follows the "
+                . "actual run length.", $name, $drawn, $minutes, $which);
+        }
         return if(Gartenbewaesserung_AdjustBarrelLevel($hash, -$drawn, "watering"));
     }
 
@@ -4313,18 +4385,27 @@ sub Gartenbewaesserung_LearnWateringFlow {
     my $minutes  = $hash->{HELPER}{drawMinutes} || 0;
     my $tainted  = $hash->{HELPER}{drawTainted} || 0;
     my $capacity = AttrVal($name, "barrelUsableVolume", 0);
+    my $byValve  = $hash->{HELPER}{drawByValve} || {};
     $hash->{HELPER}{drawMinutes} = 0;
+    delete $hash->{HELPER}{drawByValve};
 
     return if($tainted || $minutes <= 0 || $capacity <= 0);
     return if(ReadingsVal($name, "barrelLevelAnchor", "") !~ /barrelFull/);
 
+    # War nur ein einziger Kreis beteiligt, gehoert das Volumen eindeutig ihm -
+    # dann lernen wir seine Rate statt einer Mischung ueber alle.
+    my @valves = keys %$byValve;
+    my $target = (scalar(@valves) == 1) ? "valve$valves[0]Flow_lpm" : "wateringFlow_lpm";
+
     my $measured = $capacity / $minutes;
-    my $old = ReadingsVal($name, "wateringFlow_lpm", 0);
+    my $old = ReadingsVal($name, $target, 0);
     $old = 0 if($old !~ /^\d+(?:\.\d+)?$/);
     my $new = ($old > 0) ? ($old * 0.7 + $measured * 0.3) : $measured;
-    readingsSingleUpdate($hash, "wateringFlow_lpm", sprintf("%.1f", $new), 1);
-    Log3 $name, 3, sprintf("%s: full barrel emptied by %.1f min of watering "
-        . "= %.1f l/min (learned rate now %.1f)", $name, $minutes, $measured, $new);
+    readingsSingleUpdate($hash, $target, sprintf("%.1f", $new), 1);
+    Log3 $name, 3, sprintf("%s: full barrel emptied by %.1f min of watering (%s) "
+        . "= %.1f l/min (learned rate now %.1f)", $name, $minutes,
+        (scalar(@valves) == 1) ? "circuit $valves[0]" : scalar(@valves) . " circuits",
+        $measured, $new);
 }
 
 # Does the level estimate consider the IBC full? Only with ibcFullFromLevel set,
@@ -5706,6 +5787,39 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Voraussetzungen: <code>ibcUsableVolume</code>, ein gesetzter Anker und eine gelernte
             Förderrate. Fehlt eines davon, passiert nichts.
         </li>
+        <li><a id="Gartenbewaesserung-attr-wateringFlow_lpm"></a>
+            <b>wateringFlow_lpm</b><br>
+            Typ: Zahl (Liter je Minute Ventil-Offenzeit). Ohne Vorgabe deaktiviert.<br>
+            Wie viel Wasser eine Minute Gießen aus dem Fass zieht. Nur für die
+            Füllstandsschätzung; die Steuerung berührt es nicht.<br>
+            Das Modul lernt diesen Wert selbst, wenn ein volles Fass <b>allein durch Gießen</b> bis
+            <code>barrelEmpty</code> leerläuft – das gleichnamige Reading hat dann Vorrang. Endet
+            die Bewässerung aber regelmäßig vorher, etwa weil das Schwimmerventil nachspeist oder
+            die Laufzeit um ist, greift die Lernbedingung <b>nie</b>, und das Attribut ist der
+            einzige Weg zu einer brauchbaren Zahl.<br>
+            <i>Bestimmen:</i> Fass bis <code>barrelFull</code> füllen lassen, eine Bewässerung
+            laufen lassen, danach den Stand ablesen. <code>(250 - Restmenge) ÷ Ventilminuten</code>.
+            Die Ventilminuten stehen im Log zwischen <code>currentValve: 8</code> und
+            <code>currentValve: none</code>.<br>
+            Ohne beides zieht das Modul pauschal 12&nbsp;% der nutzbaren Kapazität je Ventil ab –
+            das alte Verhalten, das die Laufzeit ignoriert und im Log einen Hinweis hinterlässt.<br>
+            Gilt für alle Kreise gemeinsam. Unterscheiden sie sich – andere Sprenger, unterschiedlich
+            viele –, ist <code>valve&lt;N&gt;Flow_lpm</code> der genauere Weg.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-valveNFlow_lpm"></a>
+            <b>valve1Flow_lpm</b> … <b>valve8Flow_lpm</b><br>
+            Typ: Zahl (Liter je Minute Offenzeit). Ohne Vorgabe deaktiviert.<br>
+            Entnahmerate eines <b>einzelnen</b> Kreises. Jeder Kreis hat andere Sprenger und nicht
+            gleich viele, eine gemeinsame Rate ist deshalb bestenfalls ein Mittelwert.<br>
+            Reihenfolge, in der die Füllstandsschätzung sucht: gelerntes Reading
+            <code>valve&lt;N&gt;Flow_lpm</code>, dann das gleichnamige Attribut, dann das gelernte
+            <code>wateringFlow_lpm</code>, dann dessen Attribut, zuletzt der Pauschalabzug.<br>
+            <i>Gelernt</i> wird je Kreis, wenn zwischen zwei Ankern <b>nur dieser eine</b> gelaufen
+            ist und dabei ein volles Fass bis <code>barrelEmpty</code> leergezogen wurde. Kürzere
+            Kreise schaffen das nicht – für die bleibt das Attribut der Weg.<br>
+            <i>Bestimmen:</i> je Kreis einmal aus vollem Fass laufen lassen und die Restmenge
+            ablesen – <code>(barrelUsableVolume - Restmenge) ÷ Ventilminuten</code>.
+        </li>
         <li><a id="Gartenbewaesserung-attr-roofArea"></a>
             <b>roofArea</b><br>
             Typ: Zahl (Quadratmeter). Ohne Vorgabe deaktiviert.<br>
@@ -5917,7 +6031,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>pumped_total_l</b> / <b>pumpedRain_total_l</b> / <b>mains_total_l</b> - Insgesamt vom Fass in den IBC gefördertes Volumen, aufgeteilt in Regen- und Leitungswasseranteil. <code>pumpedRain_total_l</code> lässt sich direkt gegen <code>harvest_total_l</code> halten: Weichen die Werte dauerhaft voneinander ab, stimmt <code>roofArea</code> nicht. Läufe mit offener Hauswasserzufuhr steuern ihren Regenanteil nur bei, wenn <code>barrelFloatLevel</code> gesetzt ist. Zurücksetzen mit <code>set &lt;name&gt; resetHarvestStats</code>.</li>
         <li><b>lastIbcFillRain_l</b> / <b>lastIbcFillMains_l</b> - Aufteilung des letzten Laufs. Nur gefüllt, wenn <code>mainsSupplyDevice</code> konfiguriert ist.</li>
         <li><b>barrelLevel_l</b> / <b>barrelLevel</b> / <b>barrelLevelAnchor</b> - Geschätzter Fass-Füllstand in Litern bzw. Prozent, und woher der Wert zuletzt verankert wurde (<code>barrelFull</code>, <code>barrelEmpty</code>, <code>float valve</code>) mit Zeitstempel. <code>barrelLevel_l</code> setzt <code>barrelUsableVolume</code> voraus; <code>barrelLevel</code> gibt es immer – ohne das Attribut als alte Simulation, mit ihm aus den Litern abgeleitet.</li>
-        <li><b>wateringFlow_lpm</b> - Gelernte Entnahmerate beim Gießen in Litern pro Minute Ventil-Offenzeit. Gelernt wird nur, wenn ein volles Fass <b>allein durch Gießen</b> leerläuft – kommt zwischendurch Wasser nach (Regen, IBC, Hauswasser), wird der Lauf verworfen. Bis dahin rechnet die Schätzung mit den historischen 12 % je Ventil.</li>
+        <li><b>wateringFlow_lpm</b> - Gelernte Entnahmerate beim Gießen in Litern pro Minute Ventil-Offenzeit. Gelernt wird nur, wenn ein volles Fass <b>allein durch Gießen</b> bis <code>barrelEmpty</code> leerläuft – kommt zwischendurch Wasser nach (Regen, IBC, Hauswasser), wird der Lauf verworfen. Erreicht die Bewässerung den Leer-Kontakt nie, greift stattdessen das gleichnamige <b>Attribut</b>; ohne beides bleibt es beim Pauschalabzug von 12 % je Ventil.</li>
         <li><b>ibcLevel_l</b> / <b>ibcLevel_pct</b> / <b>ibcLevelAnchor</b> - Geschätzter IBC-Füllstand in Litern bzw. Prozent, und woher der Wert zuletzt verankert wurde (<code>ibcEmpty</code>, <code>ibcFull</code>, <code>manual</code>) mit Zeitstempel. Setzt <code>ibcUsableVolume</code> voraus. <b>Eine Schätzung, keine Messung</b> – siehe dort.</li>
         <li><b>ibcToBarrelFlow_lpm</b> / <b>lastIbcToBarrelVolume_l</b> - Gelernte Rate der Schwerkraftrichtung IBC&nbsp;&rarr;&nbsp;Fass und die daraus geschätzte Menge des letzten Rücklaufs. Gelernt wird nur aus Läufen, die bei leerem Fass beginnen und mit <code>barrelFull</code> enden – die haben <code>barrelUsableVolume</code> bewegt.</li>
         <li><b>lastIbcToBarrelDuration</b> / <b>lastIbcToBarrelEnd</b> - Dauer (Minuten) und Endgrund (<code>barrelFull</code>, <code>pauseEnd</code>) des letzten Laufs IBC&nbsp;&rarr;&nbsp;Fass, einschließlich der Schwerkraft-Nachspeisung während einer Gießpause.</li>
