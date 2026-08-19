@@ -11,6 +11,17 @@
 #
 ##############################################################################
 #
+# 1.0.61 - 2026-08-19  Doku: die Luecken in der commandref geschlossen.
+#                      Ein Abgleich von AttrList, Set-Liste und allen readings*Update-Aufrufen
+#                      gegen die commandref ergab: die Set-Befehle sind vollstaendig, bei den
+#                      Attributen fehlten mainsSupplyActiveValue/mainsSupplyInactiveValue, und
+#                      18 Readings waren gar nicht beschrieben - darunter die Zustands-Readings,
+#                      an denen man einen Lauf ueberhaupt erst mitlesen kann (phase, ibcFilling,
+#                      ibcFillStarted, ibcToBarrelActive, pauseActive, cycleProgress, nextValve,
+#                      remainingTime, barrelFull/barrelEmpty, ibcFull/ibcEmpty, raining,
+#                      rainDetectedSince, soilMoisture, lastWatering, lastCircuitWatering).
+#                      Nur Dokumentation, kein Verhalten geaendert.
+#
 # 1.0.60 - 2026-08-19  Neu: set <name> waterSource rain|other fuer Wasser, das nicht vom Dach kommt
 #                      - Poolwasser ins Fass ablassen, Nachbars Regentonne umfuellen, was auch immer.
 #                      Ohne das griff die Einstufung dreimal daneben: solches Wasser galt als
@@ -489,7 +500,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.60';
+    $hash->{VERSION}    = '1.0.61';
 
     my $name = $a[0];
 
@@ -6098,6 +6109,13 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Wert des Regensensors bei kein Regen. Leer = automatische Erkennung
             (off/0/false/no/open/inactive/dry).
         </li>
+        <li><a id="Gartenbewaesserung-attr-mainsSupplyActiveValue"></a>
+            <b>mainsSupplyActiveValue</b> / <b>mainsSupplyInactiveValue</b><br>
+            Typ: Text. Ohne Angabe gilt die übliche Erkennung (<code>on</code>/<code>off</code>,
+            <code>1</code>/<code>0</code>, <code>true</code>/<code>false</code> …).<br>
+            Werte, an denen <code>mainsSupplyDevice</code> „Zufuhr offen“ bzw. „Zufuhr zu“ erkennt.
+            Nur nötig, wenn das Gerät eigene Begriffe verwendet.
+        </li>
         <li><a id="Gartenbewaesserung-attr-barrelFullSensorActiveValue"></a>
             <b>barrelFullSensorActiveValue</b><br>
             Typ: textField. Standardwert: automatisch.<br>
@@ -6142,6 +6160,17 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>pumpOverrunAlert</b> - <code>yes</code>/<code>no</code>; wird auf <code>yes</code> gesetzt, wenn die Pumpe wegen überschrittener <code>pumpMaxRuntime</code> abgeschaltet wurde.</li>
         <li><b>barrelFillTimeoutAlert</b> - <code>yes</code>/<code>no</code>; wird auf <code>yes</code> gesetzt, wenn das Befüllventil länger als <code>barrelFillTimeout</code> Minuten offen war, ohne dass <code>barrelFull</code> auf <code>yes</code> ging (IBC vermutlich leer oder Wasserzufuhr gestört). Reset automatisch bei <code>barrelFull:yes</code> oder <code>raining:yes</code>.</li>
         <li><b>currentValve</b> - Aktuell aktives Ventil (1–8) oder <code>none</code>.</li>
+        <li><b>phase</b> - Was das Modul gerade tut, im Klartext (<code>watering circuit 8</code>, <code>pause - refilling</code>, <code>idle</code> …). Feiner als <code>state</code> und vor allem zum Mitlesen im Log gedacht.</li>
+        <li><b>barrelFull</b> / <b>barrelEmpty</b> - <code>yes</code>/<code>no</code> laut <code>barrelFullSensorDevice</code> bzw. <code>barrelEmptySensorDevice</code>, sonst <code>not configured</code>. Die beiden sind die einzigen <b>physischen</b> Aussagen über das Fass – alle Füllstandszahlen verankern sich an ihnen.</li>
+        <li><b>ibcFull</b> / <b>ibcEmpty</b> - dasselbe für den IBC.</li>
+        <li><b>ibcFilling</b> - <code>yes</code>, solange vom Fass in den IBC gefördert wird. <b>ibcFillStarted</b> hält den Startzeitpunkt fest; beides zusammen erlaubt es, einen Lauf nach einem Neustart wieder aufzunehmen.</li>
+        <li><b>ibcToBarrelActive</b> - <code>yes</code>, solange Wasser aus dem IBC ins Fass läuft (Schwerkraft oder Pumpe).</li>
+        <li><b>pauseActive</b> / <b>pauseTimeRemaining</b> - Ob gerade eine Nachfüllpause läuft und wie lange noch. Pausen entstehen aus <code>wateringPauseInterval</code> oder weil das Fass leer wurde.</li>
+        <li><b>nextValve</b> / <b>cycleProgress</b> - Nächstes Ventil der Warteschlange und Fortschritt im Zyklus (<code>3/5</code>).</li>
+        <li><b>remainingTime</b> - Restlaufzeit des aktuellen Ventils in Minuten.</li>
+        <li><b>lastWatering</b> / <b>lastCircuitWatering</b> - Zeitpunkt der letzten kompletten Bewässerung bzw. des letzten Einzelkreises.</li>
+        <li><b>raining</b> / <b>rainDetectedSince</b> - Zustand des <code>rainSensorDevice</code> und seit wann Regen gemeldet wird. <code>raining</code> allein ist träge – für Mengen ist <code>rainAmount_mm</code> die bessere Quelle.</li>
+        <li><b>soilMoisture</b> - Letzter Wert des <code>soilSensorDevice</code> in Prozent.</li>
         <li><b>currentValveName</b> - Klartext-Name des aktuell aktiven Kreises (aus <code>valveNName</code>) oder <code>none</code>.</li>
         <li><b>state</b> - u.a. <code>stopped - no water</code>, wenn das Fass trotz wiederholtem Nachfüllen leer bleibt (siehe <code>barrelEmptyMaxRefillAttempts</code>); <code>skipped - raining</code> bei <code>rainSkipsWatering</code>; <code>skipped - enough rain (X mm)</code> bei <code>rainSkipsWateringAmount</code>.</li>
         <li><b>rainAmount_mm</b> - Aufsummierte Regenmenge (mm) im gleitenden Fenster <code>rainAmountWindow</code> (aus <code>rainAmountDevice</code>, reset-fest berechnet).</li>
