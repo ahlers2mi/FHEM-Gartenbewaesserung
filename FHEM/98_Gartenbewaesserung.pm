@@ -11,6 +11,13 @@
 #
 ##############################################################################
 #
+# 1.0.59 - 2026-08-19  Fix: Eine laufende Befuellung Fass->IBC war im state nicht zu sehen. Die
+#                      Gegenrichtung setzt 'ibc to barrel', die Ernte setzte gar nichts - das Geraet
+#                      stand waehrend des ganzen Laufs auf 'idle' und schrieb am Ende nochmal
+#                      'idle'. Auf der FHEMWEB-Geraeteseite war der Lauf damit unsichtbar, sofern
+#                      man nicht wusste, dass man auf ibcFilling schauen muss. Jetzt 'ibc filling',
+#                      am Ende zurueck auf 'idle' - aber nur, wenn nicht gerade gegossen wird:
+#                      StopIBCFill wird auch aus einer startenden Bewaesserung heraus gerufen.
 # 1.0.58 - 2026-08-19  Fix: Ein Neustart oder Modul-Reload mitten in einer Befuellung liess den
 #                      ganzen Lauf aus der Statistik fallen. Die Messung haengt an $hash->{HELPER},
 #                      und das ist reiner Arbeitsspeicher - nach dem Reload wusste das Modul nicht
@@ -471,7 +478,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.58';
+    $hash->{VERSION}    = '1.0.59';
 
     my $name = $a[0];
 
@@ -4139,6 +4146,9 @@ sub Gartenbewaesserung_StartIBCFill {
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "ibcFilling", "yes");
     readingsBulkUpdate($hash, "ibcFillStarted", TimeNow());
+    # Auch im state sichtbar machen - die Gegenrichtung tut das laengst, die
+    # Ernte fehlte. Ohne das steht das Geraet waehrend des Laufs auf 'idle'.
+    readingsBulkUpdate($hash, "state", "ibc filling");
     # Consume the harvest trigger: the next automatic harvest needs new rain.
     # Without this the barrel could be refilled by gravity from the IBC during a
     # watering pause and immediately pumped back up again.
@@ -4719,6 +4729,15 @@ sub Gartenbewaesserung_StopIBCFill {
     $hash->{HELPER}{ibcFilling} = 0;
 
     readingsSingleUpdate($hash, "ibcFilling", "no", 1);
+
+    # Nur zuruecknehmen, was wir selbst gesetzt haben, und nur wenn nichts
+    # anderes laeuft: StopIBCFill wird auch aus einer startenden Bewaesserung
+    # heraus gerufen, die ihren eigenen state schon geschrieben hat.
+    if(ReadingsVal($name, "state", "") eq "ibc filling"
+       && !$hash->{HELPER}{watering} && !$hash->{HELPER}{circuitMode}
+       && !$hash->{HELPER}{pauseActive}) {
+        readingsSingleUpdate($hash, "state", "idle", 1);
+    }
 
     Log3 $name, 3, "$name: IBC filling stopped";
 
