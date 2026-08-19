@@ -11,6 +11,17 @@
 #
 ##############################################################################
 #
+# 1.0.60 - 2026-08-19  Neu: set <name> waterSource rain|other fuer Wasser, das nicht vom Dach kommt
+#                      - Poolwasser ins Fass ablassen, Nachbars Regentonne umfuellen, was auch immer.
+#                      Ohne das griff die Einstufung dreimal daneben: solches Wasser galt als
+#                      'rain' und verunreinigte pumpedRain_total_l, ein volles Fass gab dem
+#                      Sammel-Watchdog eine falsche Entwarnung (ein verstopftes Fallrohr waere
+#                      unsichtbar geworden), und geerntet wurde es gar nicht erst, weil die Ernte
+#                      auf rainSinceHarvest_mm wartet - das Fass waere schlicht stehen geblieben.
+#                      Solange waterSource auf 'other' steht: Ernte startet allein bei vollem Fass,
+#                      das Volumen zaehlt in pumpedOther_total_l, und barrelFull gilt nicht als
+#                      Beleg fuer die Regensammlung. Endet von selbst beim naechsten barrelEmpty -
+#                      dann ist das Fremdwasser oben und der Normalfall gilt wieder.
 # 1.0.59 - 2026-08-19  Fix: Eine laufende Befuellung Fass->IBC war im state nicht zu sehen. Die
 #                      Gegenrichtung setzt 'ibc to barrel', die Ernte setzte gar nichts - das Geraet
 #                      stand waehrend des ganzen Laufs auf 'idle' und schrieb am Ende nochmal
@@ -478,7 +489,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.59';
+    $hash->{VERSION}    = '1.0.60';
 
     my $name = $a[0];
 
@@ -580,6 +591,7 @@ sub Gartenbewaesserung_Set {
                "resetPumpOverrunAlert:noArg " .
                "resetHarvestStats:noArg " .
                "ibcLevel:textField barrelLevel:textField " .
+               "waterSource:rain,other " .
                "refreshSensors:noArg " .
                "validate:noArg";
 
@@ -627,6 +639,7 @@ sub Gartenbewaesserung_Set {
         readingsBulkUpdate($hash, "pumped_total_l", "0");
         readingsBulkUpdate($hash, "pumpedRain_total_l", "0");
         readingsBulkUpdate($hash, "mains_total_l", "0");
+        readingsBulkUpdate($hash, "pumpedOther_total_l", "0");
         readingsEndUpdate($hash, 1);
         Log3 $name, 3, "$name: harvest statistics reset";
         return undef;
@@ -657,6 +670,18 @@ sub Gartenbewaesserung_Set {
             $hash->{HELPER}{drawTainted} = 1;
         }
         Log3 $name, 3, sprintf("%s: %s anchored at %.0f l (manual)", $name, $cmd, $liters);
+        return undef;
+    }
+    elsif($cmd eq "waterSource") {
+        my $value = defined($args[0]) ? lc($args[0]) : "";
+        return "Usage: set $name waterSource rain|other"
+            if($value ne "rain" && $value ne "other");
+        readingsSingleUpdate($hash, "waterSource", $value, 1);
+        Log3 $name, 3, ($value eq "other")
+            ? "$name: water source set to 'other' - harvesting on a full barrel alone, "
+              . "volume booked separately, collection watchdog not credited. "
+              . "Falls back to 'rain' at the next barrelEmpty."
+            : "$name: water source back to 'rain'";
         return undef;
     }
     elsif($cmd eq "refreshSensors") {
@@ -768,6 +793,7 @@ sub Gartenbewaesserung_Notify {
                     # module its own doing and never credit the rain.
                     my $notFromRain = (ReadingsVal($name, "ibcToBarrelActive", "no") eq "yes"
                                     || ReadingsVal($name, "ibcFilling", "no") eq "yes"
+                                    || ReadingsVal($name, "waterSource", "rain") eq "other"
                                     || $hash->{HELPER}{barrelFilling}) ? 1 : 0;
                     readingsSingleUpdate($hash, "barrelFull", "yes", 1);
                     # Hard anchor for the level estimate, and the starting line
@@ -872,6 +898,11 @@ sub Gartenbewaesserung_Notify {
                     # corresponds to a known volume - learn before anchoring.
                     Gartenbewaesserung_LearnWateringFlow($hash);
                     Gartenbewaesserung_SetBarrelLevel($hash, 0, "barrelEmpty", 1);
+                    # Fremdwasser ist raus - ab jetzt gilt wieder der Normalfall.
+                    if(ReadingsVal($name, "waterSource", "rain") ne "rain") {
+                        readingsSingleUpdate($hash, "waterSource", "rain", 1);
+                        Log3 $name, 3, "$name: barrel empty - water source back to 'rain'";
+                    }
                     Log3 $name, 3, "$name: Barrel empty detected, stopping pump and watering";
                     Gartenbewaesserung_HandleBarrelEmpty($hash);
                 }
@@ -4583,6 +4614,9 @@ sub Gartenbewaesserung_RecordIbcFillRun {
     if($mainsStart ne "" || $mainsNow ne "") {
         $source = ($mainsStart eq "on" || $mainsNow eq "on") ? "mixed" : "rain";
     }
+    # Vom Nutzer angesagtes Fremdwasser schlaegt die Automatik: woher es kam,
+    # kann das Modul nicht sehen - nur, dass es nicht vom Dach war.
+    $source = "other" if(ReadingsVal($name, "waterSource", "rain") eq "other");
 
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "lastIbcFillDuration", sprintf("%.1f", $minutes));
@@ -4627,6 +4661,11 @@ sub Gartenbewaesserung_RecordIbcFillRun {
         elsif($source eq "rain") {
             $rainPart = $moved;
         }
+        elsif($source eq "other") {
+            # Kein Regen und kein Leitungswasser - eigener Topf.
+            $rainPart = 0;
+            $mainsPart = 0;
+        }
         # source "unknown" (no mainsSupplyDevice): no split, only pumped_total_l
     }
 
@@ -4636,8 +4675,10 @@ sub Gartenbewaesserung_RecordIbcFillRun {
         readingsBulkUpdate($hash, "lastIbcFillMains_l", sprintf("%.0f", $mainsPart))
             if($source ne "unknown");
 
-        foreach my $c (["pumped_total_l", $moved], ["pumpedRain_total_l", $rainPart],
-                       ["mains_total_l", $mainsPart]) {
+        foreach my $c (["pumped_total_l", $moved],
+                       ["pumpedRain_total_l", $source eq "other" ? 0 : $rainPart],
+                       ["pumpedOther_total_l", $source eq "other" ? $moved : 0],
+                       ["mains_total_l", $source eq "other" ? 0 : $mainsPart]) {
             next if($c->[1] <= 0);
             my $v = ReadingsVal($name, $c->[0], 0);
             $v = 0 if($v !~ /^-?\d+(?:\.\d+)?$/);
@@ -4955,6 +4996,11 @@ sub Gartenbewaesserung_NoteNonRainFill {
 sub Gartenbewaesserung_HarvestDue {
     my ($hash) = @_;
     my $name = $hash->{NAME};
+
+    # Fremdwasser: dann gibt es keinen Regen, auf den man warten koennte. Ein
+    # volles Fass ist hier der einzige und ausreichende Grund - sonst bliebe
+    # das Wasser stehen, bis es zufaellig regnet.
+    return 1 if(ReadingsVal($name, "waterSource", "rain") eq "other");
 
     return 0 if(!Gartenbewaesserung_RainRecentEnough($hash));
 
@@ -5378,7 +5424,17 @@ sub Gartenbewaesserung_GetStatus {
                  . ReadingsVal($name, "pumpedRain_total_l", "0") . " l (nur Regen), "
                  . ReadingsVal($name, "pumped_total_l", "0") . " l gesamt\n";
         $status .= "  aus der Leitung mitgefoerdert: "
-                 . ReadingsVal($name, "mains_total_l", "0") . " l\n\n";
+                 . ReadingsVal($name, "mains_total_l", "0") . " l\n";
+        if(ReadingsVal($name, "pumpedOther_total_l", "0") ne "0") {
+            $status .= "  aus anderer Quelle: "
+                     . ReadingsVal($name, "pumpedOther_total_l", "0") . " l\n";
+        }
+        if(ReadingsVal($name, "waterSource", "rain") ne "rain") {
+            $status .= "  ACHTUNG Wasserquelle steht auf '"
+                     . ReadingsVal($name, "waterSource", "rain")
+                     . "' - Ernte laeuft ohne Regenpruefung\n";
+        }
+        $status .= "\n";
     }
     if(ReadingsVal($name, "lastIbcFillDuration", "") ne "") {
         $status .= "\n--- Letzte IBC-Befuellung ---\n";
@@ -5531,6 +5587,19 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>stopValve</b> - Stoppt das aktuell laufende Ventil</li>
         <li><b>resetPumpOverrunAlert</b> - Setzt das Reading <code>pumpOverrunAlert</code> manuell auf <code>no</code> zurück</li>
         <li><b>resetHarvestStats</b> - Setzt die Ertrags- und Fördermengen-Summen zurück</li>
+        <li><b>waterSource rain|other</b> - Sagt dem Modul, dass gerade Wasser im Fass steht, das
+        <b>nicht vom Dach</b> kommt – Poolwasser abgelassen, eine andere Tonne umgefüllt, was auch
+        immer. Solange <code>other</code> gilt: die Ernte startet allein bei vollem Fass (ohne auf
+        Regen zu warten – sonst bliebe das Wasser stehen), das geförderte Volumen zählt in
+        <code>pumpedOther_total_l</code> statt in <code>pumpedRain_total_l</code>, und ein volles
+        Fass gilt <b>nicht</b> als Beleg für eine funktionierende Regensammlung. Letzteres ist der
+        wichtigste Teil: sonst gäbe Fremdwasser dem Sammel-Watchdog eine falsche Entwarnung und ein
+        verstopftes Fallrohr fiele nicht mehr auf.<br>
+        Der Modus endet <b>von selbst</b> beim nächsten <code>barrelEmpty</code> – dann ist das
+        Fremdwasser oben im IBC und der Normalfall gilt wieder. Man kann ihn also vergessen
+        auszuschalten, nicht einzuschalten.<br>
+        Den Füllstand zieht man bei Bedarf mit <code>set &lt;name&gt; barrelLevel</code> nach; nötig
+        ist es nicht, der nächste Kontakt verankert ihn ohnehin.</li>
         <li><b>ibcLevel &lt;liter&gt;</b> bzw. <b>ibcLevel &lt;prozent&gt;%</b> - Verankert die Füllstandsschätzung des IBC auf einem abgelesenen Wert. Das ist der genaueste Eingriff, den es gibt: die Schätzung rechnet ab hier neu weiter und die bis dahin aufgelaufene Drift ist weg. Ohne Prozentzeichen wird die Zahl als Liter verstanden. Setzt <code>ibcUsableVolume</code> voraus.</li>
         <li><b>barrelLevel &lt;liter&gt;</b> bzw. <b>barrelLevel &lt;prozent&gt;%</b> - Dasselbe für das Fass. Das Fass verankert sich normalerweise mehrmals täglich von selbst an <code>barrelFull</code> oder <code>barrelEmpty</code>; dieser Befehl ist für den Anfang, solange noch kein Kontakt gemeldet hat. Setzt <code>barrelUsableVolume</code> voraus.</li>
         <li><b>refreshSensors</b> - Liest alle konfigurierten Sensor-Readings sofort neu ein und aktualisiert die Readings (z. B. nach Neustart oder Gerätetausch)</li>
@@ -6080,8 +6149,10 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>rainCollectionAlert</b> - <code>yes</code>/<code>no</code>; <code>yes</code>, wenn mindestens <code>rainCollectionCheckAmount</code> mm Regen fiel, ohne dass Fass/IBC innerhalb von <code>rainCollectionCheckDelay</code> Minuten Wasser meldeten (Zulauf/Dachrinne/Filter prüfen). Reset automatisch bei der nächsten Füllstands-Reaktion.</li>
         <li><b>rainSinceHarvest_mm</b> - Regenmenge (mm) seit der letzten IBC-Befuellung. Steuert zusammen mit <code>ibcFillRainAmount</code>, wann geerntet wird, und wird beim Start einer Befuellung auf 0 gesetzt - eine neue Ernte braucht daher immer neuen Regen.</li>
         <li><b>mainsSupply</b> - <code>on</code>/<code>off</code>; Zustand der Hauswasserzufuhr laut <code>mainsSupplyDevice</code>.</li>
-        <li><b>lastIbcFillSource</b> - <code>rain</code> (Hauswasser war zu, reines Regenwasser), <code>mixed</code> (Hauswasser offen, Leitungswasser lief mit) oder <code>unknown</code> (kein <code>mainsSupplyDevice</code> gesetzt).</li>
+        <li><b>lastIbcFillSource</b> - <code>rain</code> (Hauswasser war zu, reines Regenwasser), <code>mixed</code> (Hauswasser offen, Leitungswasser lief mit), <code>other</code> (angesagtes Fremdwasser, siehe <code>set &lt;name&gt; waterSource</code>) oder <code>unknown</code> (kein <code>mainsSupplyDevice</code> gesetzt).</li>
         <li><b>pumped_total_l</b> / <b>pumpedRain_total_l</b> / <b>mains_total_l</b> - Insgesamt vom Fass in den IBC gefördertes Volumen, aufgeteilt in Regen- und Leitungswasseranteil. <code>pumpedRain_total_l</code> lässt sich direkt gegen <code>harvest_total_l</code> halten: Weichen die Werte dauerhaft voneinander ab, stimmt <code>roofArea</code> nicht. Läufe mit offener Hauswasserzufuhr steuern ihren Regenanteil nur bei, wenn <code>barrelFloatLevel</code> gesetzt ist. Zurücksetzen mit <code>set &lt;name&gt; resetHarvestStats</code>.</li>
+        <li><b>waterSource</b> - <code>rain</code> (Normalfall) oder <code>other</code>, siehe <code>set &lt;name&gt; waterSource</code>. Fällt beim nächsten <code>barrelEmpty</code> automatisch auf <code>rain</code> zurück.</li>
+        <li><b>pumpedOther_total_l</b> - Insgesamt gefördertes Volumen aus Fremdwasser-Läufen. Bewusst getrennt von <code>pumpedRain_total_l</code>, damit der Abgleich gegen <code>harvest_total_l</code> und damit die Bestimmung von <code>roofArea</code> sauber bleibt.</li>
         <li><b>lastIbcFillRain_l</b> / <b>lastIbcFillMains_l</b> - Aufteilung des letzten Laufs. Nur gefüllt, wenn <code>mainsSupplyDevice</code> konfiguriert ist.</li>
         <li><b>barrelLevel_l</b> / <b>barrelLevel</b> / <b>barrelLevelAnchor</b> - Geschätzter Fass-Füllstand in Litern bzw. Prozent, und woher der Wert zuletzt verankert wurde (<code>barrelFull</code>, <code>barrelEmpty</code>, <code>float valve</code>) mit Zeitstempel. <code>barrelLevel_l</code> setzt <code>barrelUsableVolume</code> voraus; <code>barrelLevel</code> gibt es immer – ohne das Attribut als alte Simulation, mit ihm aus den Litern abgeleitet.</li>
         <li><b>wateringFlow_lpm</b> - Gelernte Entnahmerate beim Gießen in Litern pro Minute Ventil-Offenzeit. Gelernt wird nur, wenn ein volles Fass <b>allein durch Gießen</b> bis <code>barrelEmpty</code> leerläuft – kommt zwischendurch Wasser nach (Regen, IBC, Hauswasser), wird der Lauf verworfen. Erreicht die Bewässerung den Leer-Kontakt nie, greift stattdessen das gleichnamige <b>Attribut</b>; ohne beides bleibt es beim Pauschalabzug von 12 % je Ventil.</li>
