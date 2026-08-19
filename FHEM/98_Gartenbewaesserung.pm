@@ -11,6 +11,11 @@
 #
 ##############################################################################
 #
+# 1.0.55 - 2026-08-19  Neu: Entnahmerate je Kreis - valve<N>Flow_lpm. Jeder Kreis hat andere
+#                      Sprenger und nicht gleich viele, eine gemeinsame Rate ist deshalb bestenfalls
+#                      ein Mittelwert. Die Reihenfolge ist jetzt: Rate des Kreises, dann die
+#                      gelernte Gesamtrate, dann das Attribut wateringFlow_lpm, zuletzt der
+#                      Pauschalabzug.
 # 1.0.54 - 2026-08-19  Fix: Die Entnahme beim Giessen wurde mit einem Pauschalwert gebucht - 12 % der
 #                      nutzbaren Kapazitaet je Ventil, UNABHAENGIG von der Laufzeit. Ein Ventil mit
 #                      zwei Minuten kostete damit so viel wie eines mit zwanzig. In der Anlage des
@@ -372,6 +377,8 @@ sub Gartenbewaesserung_Initialize {
     $hash->{AttrList} =
         "valve1Device:textField valve2Device:textField valve3Device:textField valve4Device:textField " .
         "valve5Device:textField valve6Device:textField valve7Device:textField valve8Device:textField " .
+        "valve1Flow_lpm:textField valve2Flow_lpm:textField valve3Flow_lpm:textField valve4Flow_lpm:textField " .
+        "valve5Flow_lpm:textField valve6Flow_lpm:textField valve7Flow_lpm:textField valve8Flow_lpm:textField " .
         "valve1Name:textField valve2Name:textField valve3Name:textField valve4Name:textField " .
         "valve5Name:textField valve6Name:textField valve7Name:textField valve8Name:textField " .
         "pumpDevice:textField " .
@@ -438,7 +445,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.54';
+    $hash->{VERSION}    = '1.0.55';
 
     my $name = $a[0];
 
@@ -2183,7 +2190,7 @@ sub Gartenbewaesserung_FinishOrPauseCircuit {
 
     delete $hash->{HELPER}{valveCloseTimer};
     Gartenbewaesserung_ClearEndTime($hash);
-    Gartenbewaesserung_NoteValveDraw($hash);
+    Gartenbewaesserung_NoteValveDraw($hash, $circuitNum);
 
     readingsSingleUpdate($hash, "currentValve", "none", 1);
     readingsSingleUpdate($hash, "currentValveName", "none", 1);
@@ -2905,7 +2912,7 @@ sub Gartenbewaesserung_CloseValve {
         Gartenbewaesserung_SwitchDevice($name, $pumpDevice, "off");
     }
 
-    Gartenbewaesserung_NoteValveDraw($hash);
+    Gartenbewaesserung_NoteValveDraw($hash, $valveNum);
 
     # Check if we have remaining time (pause is needed)
     if(defined($hash->{HELPER}{valveRemainingTime}) && $hash->{HELPER}{valveRemainingTime} > 0) {
@@ -4292,7 +4299,7 @@ sub Gartenbewaesserung_ApplyBarrelFloatFloor {
 
 # One valve has just closed: book its draw and remember how long it was open.
 sub Gartenbewaesserung_NoteValveDraw {
-    my ($hash) = @_;
+    my ($hash, $valveNum) = @_;
     my $name = $hash->{NAME};
 
     my $opened = $hash->{HELPER}{valveOpenTime};
@@ -4303,14 +4310,21 @@ sub Gartenbewaesserung_NoteValveDraw {
 
     my $capacity = AttrVal($name, "barrelUsableVolume", 0);
     if($capacity > 0) {
-        # Gelernter Wert zuerst, dann das Attribut, erst dann der Pauschalabzug.
-        # Der Pauschalabzug ignoriert die Laufzeit vollstaendig und liegt bei
-        # laengeren Ventilen weit daneben - deshalb der Log-Hinweis.
-        my $rate = ReadingsVal($name, "wateringFlow_lpm", 0);
-        $rate = 0 if($rate !~ /^\d+(?:\.\d+)?$/);
-        if($rate <= 0) {
-            $rate = AttrVal($name, "wateringFlow_lpm", 0);
-            $rate = 0 if($rate !~ /^\d+(?:\.\d+)?$/);
+        # Vom Speziellen zum Allgemeinen: die Rate DIESES Kreises schlaegt die
+        # gemeinsame, denn jeder Kreis hat andere Sprenger und nicht gleich
+        # viele. Danach die gelernte Gesamtrate, dann das Attribut, zuletzt der
+        # Pauschalabzug - der ignoriert die Laufzeit und liegt bei laengeren
+        # Ventilen weit daneben, deshalb der Log-Hinweis.
+        my $rate = 0;
+        foreach my $candidate (
+            (defined($valveNum) && $valveNum =~ /^\d+$/)
+                ? AttrVal($name, "valve${valveNum}Flow_lpm", 0) : 0,
+            ReadingsVal($name, "wateringFlow_lpm", 0),
+            AttrVal($name, "wateringFlow_lpm", 0),
+        ) {
+            next if($candidate !~ /^\d+(?:\.\d+)?$/ || $candidate <= 0);
+            $rate = $candidate;
+            last;
         }
 
         my $drawn;
@@ -4319,9 +4333,11 @@ sub Gartenbewaesserung_NoteValveDraw {
         }
         else {
             $drawn = $capacity * 0.12;
+            my $which = (defined($valveNum) && $valveNum =~ /^\d+$/)
+                ? "valve${valveNum}Flow_lpm" : "wateringFlow_lpm";
             Log3 $name, 3, sprintf("%s: no watering flow rate known - deducting a flat %.0f l for "
-                . "%.1f min of valve time. Set attr wateringFlow_lpm for a level estimate that "
-                . "follows the actual run length.", $name, $drawn, $minutes);
+                . "%.1f min of valve time. Set attr %s for a level estimate that follows the "
+                . "actual run length.", $name, $drawn, $minutes, $which);
         }
         return if(Gartenbewaesserung_AdjustBarrelLevel($hash, -$drawn, "watering"));
     }
@@ -5750,7 +5766,20 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Die Ventilminuten stehen im Log zwischen <code>currentValve: 8</code> und
             <code>currentValve: none</code>.<br>
             Ohne beides zieht das Modul pauschal 12&nbsp;% der nutzbaren Kapazität je Ventil ab –
-            das alte Verhalten, das die Laufzeit ignoriert und im Log einen Hinweis hinterlässt.
+            das alte Verhalten, das die Laufzeit ignoriert und im Log einen Hinweis hinterlässt.<br>
+            Gilt für alle Kreise gemeinsam. Unterscheiden sie sich – andere Sprenger, unterschiedlich
+            viele –, ist <code>valve&lt;N&gt;Flow_lpm</code> der genauere Weg.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-valveNFlow_lpm"></a>
+            <b>valve1Flow_lpm</b> … <b>valve8Flow_lpm</b><br>
+            Typ: Zahl (Liter je Minute Offenzeit). Ohne Vorgabe deaktiviert.<br>
+            Entnahmerate eines <b>einzelnen</b> Kreises. Jeder Kreis hat andere Sprenger und nicht
+            gleich viele, eine gemeinsame Rate ist deshalb bestenfalls ein Mittelwert.<br>
+            Reihenfolge, in der die Füllstandsschätzung sucht: Rate dieses Kreises, dann das
+            gelernte Reading <code>wateringFlow_lpm</code>, dann das gleichnamige Attribut, zuletzt
+            der Pauschalabzug.<br>
+            <i>Bestimmen:</i> je Kreis einmal aus vollem Fass laufen lassen und die Restmenge
+            ablesen – <code>(barrelUsableVolume - Restmenge) ÷ Ventilminuten</code>.
         </li>
         <li><a id="Gartenbewaesserung-attr-roofArea"></a>
             <b>roofArea</b><br>
