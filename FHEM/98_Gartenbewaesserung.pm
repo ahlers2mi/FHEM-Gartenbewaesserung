@@ -11,6 +11,17 @@
 #
 ##############################################################################
 #
+# 1.0.58 - 2026-08-19  Fix: Ein Neustart oder Modul-Reload mitten in einer Befuellung liess den
+#                      ganzen Lauf aus der Statistik fallen. Die Messung haengt an $hash->{HELPER},
+#                      und das ist reiner Arbeitsspeicher - nach dem Reload wusste das Modul nicht
+#                      mehr, dass gerade gefoerdert wird, und StopIBCFill stieg sofort wieder aus.
+#                      Weder Dauer noch Volumen wurden geschrieben, pumped_total_l blieb stehen.
+#                      Die Readings wissen es dagegen noch: ibcFilling und ibcFillStarted sind
+#                      persistent. Daraus wird der Lauf jetzt wieder aufgenommen, sofern der
+#                      Startzeitpunkt plausibel ist (nicht aelter als pumpMaxRuntime plus Reserve) -
+#                      sonst wuerde ein stehengebliebenes Reading spaeter eine absurde Laufzeit
+#                      buchen. Nachweis: 19.08. lief die Ernte von 09:57:47 bis 10:02:15, dazwischen
+#                      um 09:59:54 ein Reload - 250 l Ertrag ohne jede Spur in den Zaehlern.
 # 1.0.57 - 2026-08-19  Fix: Der Fass-leer-Refill aus dem IBC wurde nicht gemessen. Genau dieser
 #                      Weg startet bei LEEREM Fass und endet auf barrelFull, bewegt also die
 #                      bekannte barrelUsableVolume - er ist der einzige, aus dem sich
@@ -460,7 +471,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.57';
+    $hash->{VERSION}    = '1.0.58';
 
     my $name = $a[0];
 
@@ -4666,6 +4677,29 @@ sub Gartenbewaesserung_StopIBCFill {
     my $name = $hash->{NAME};
 
     RemoveInternalTimer($hash, "Gartenbewaesserung_IbcFullByLevel");
+
+    # Nach einem Neustart oder Modul-Reload mitten im Lauf ist HELPER leer - das
+    # ist reiner Arbeitsspeicher. Die Readings wissen es noch, also von dort
+    # aufsetzen, sonst faellt der ganze Lauf aus der Statistik. Nur mit
+    # Plausibilitaetsgrenze: ein stehengebliebenes ibcFilling wuerde sonst
+    # spaeter eine absurde Laufzeit buchen.
+    if(!$hash->{HELPER}{ibcFilling} && ReadingsVal($name, "ibcFilling", "no") eq "yes") {
+        my $stamp = ReadingsVal($name, "ibcFillStarted", "");
+        my $started = ($stamp =~ /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/)
+            ? time_str2num($stamp) : 0;
+        my $maxAge = (AttrVal($name, "pumpMaxRuntime", 20) + 10) * 60;
+        if($started && (int(time()) - $started) < $maxAge) {
+            $hash->{HELPER}{ibcFilling} = 1;
+            $hash->{HELPER}{ibcFillStartTime} = int($started);
+            Log3 $name, 3, "$name: picking up an IBC fill that was already running before the "
+                . "restart (started $stamp) - measured from the reading, not from memory";
+        }
+        elsif($started) {
+            Log3 $name, 3, "$name: stale ibcFilling from $stamp - too old to measure, discarding";
+            readingsSingleUpdate($hash, "ibcFilling", "no", 1);
+        }
+    }
+
     return if(!$hash->{HELPER}{ibcFilling});
 
     Gartenbewaesserung_RecordIbcFillRun($hash, $reason);
