@@ -11,6 +11,14 @@
 #
 ##############################################################################
 #
+# 1.0.57 - 2026-08-19  Fix: Der Fass-leer-Refill aus dem IBC wurde nicht gemessen. Genau dieser
+#                      Weg startet bei LEEREM Fass und endet auf barrelFull, bewegt also die
+#                      bekannte barrelUsableVolume - er ist der einzige, aus dem sich
+#                      ibcToBarrelFlow_lpm ueberhaupt lernen laesst. Der Aufruf fehlte auf beiden
+#                      Seiten: NoteIbcToBarrelStop im ibcToBarrelActive-Zweig von CheckBarrelFull
+#                      und beim Abbruch. Nachweis: 19.08. lief die Nachspeisung von 05:00:00 (Fass
+#                      leer) bis 05:10:20 (barrelFull) - zehneinhalb Minuten fuer 250 l, rund
+#                      24 l/min - und im Log steht dazu kein einziges Reading.
 # 1.0.56 - 2026-08-19  Neu: Die Entnahmerate wird jetzt AUF DEN KREIS gelernt, wenn zwischen den
 #                      beiden Ankern nur ein einziger Kreis gelaufen ist - dann steht das bewegte
 #                      Volumen fest und gehoert eindeutig ihm. Ergebnis landet im Reading
@@ -452,7 +460,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.56';
+    $hash->{VERSION}    = '1.0.57';
 
     my $name = $a[0];
 
@@ -3017,9 +3025,14 @@ sub Gartenbewaesserung_CheckBarrelFull {
         # otherwise the caller would pump it straight back up once the transfer ends.
         Gartenbewaesserung_NoteNonRainFill($hash, "IBC-to-barrel transfer");
         if($hash->{HELPER}{barrelEmptyRefilling}) {
+            # Dieser Weg beginnt bei leerem Fass und endet hier auf barrelFull -
+            # er hat also genau barrelUsableVolume bewegt und ist der einzige,
+            # aus dem sich die Schwerkraftrate lernen laesst. Der Aufruf fehlte.
+            Gartenbewaesserung_NoteIbcToBarrelStop($hash, "barrelFull");
             Gartenbewaesserung_StopBarrelEmptyRefill($hash);
         }
         else {
+            Gartenbewaesserung_NoteIbcToBarrelStop($hash, "barrelFull");
             Gartenbewaesserung_StopIBCtoBarrel($hash);
         }
         return;
