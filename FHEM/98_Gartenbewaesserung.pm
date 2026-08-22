@@ -11,6 +11,34 @@
 #
 ##############################################################################
 #
+# 1.0.62 - 2026-08-22  Fix: Nachlauf IBC -> Fass lief in ein volles Fass und entleerte
+#                      den IBC ueber den Fassueberlauf.
+#                      In der Nacht zum 22.08. stand das Ventil zweimal 20,0 min offen
+#                      (lastIbcToBarrelEnd: pauseEnd) statt der sonst ueblichen
+#                      0,2-12,1 min mit barrelFull. Rund 200 l gingen ungesehen ins
+#                      Fallrohr, der IBC war danach leer und der Zyklus blieb bei 2/3
+#                      stehen. Drei Fehler mussten dafuer zusammenkommen:
+#                      1. Die Uhr fuer wateringPauseInterval mass WANDZEIT statt
+#                         Giesszeit - ein Fass-leer-Nachfuellen setzte sie nicht zurueck.
+#                         Nach 12 min Nachfuellen stand sie auf 19 von 8 Minuten, das
+#                         Ventil bekam eine Laufzeit von NULL Minuten und stiess sofort
+#                         die naechste Pause an. Jetzt setzen StopBarrelEmptyRefill und
+#                         StopBarrelEmptyRefillPause lastPauseEnd.
+#                      2. Die Pause wurde gestartet, ohne zu fragen, ob das Fass ueber-
+#                         haupt Wasser braucht - es war voll. Neu: BarrelNeedsRefill;
+#                         bei barrelFull entfaellt die Pause und der Kreis laeuft weiter.
+#                         Das spart nebenbei 20 min Giesszeit je Fall.
+#                      3. Geschlossen wurde nur beim EREIGNIS barrelFull. War das Fass
+#                         beim Oeffnen schon voll, konnte dieses Ereignis nicht mehr
+#                         kommen. Neu: IbcToBarrelWatchdog prueft den ZUSTAND (erst nach
+#                         5 s, dann alle 30 s) und zieht ibcToBarrelDuration als harte
+#                         Grenze ein - das Attribut galt bisher nur fuer die Ernte.
+#                      Dazu die Lernfalle daneben: LearnWateringFlow lief, bevor ein noch
+#                      offenes Ventil abgerechnet war. 148 l wurden durch 2 statt 6,8 min
+#                      geteilt und dem falschen Kreis gutgeschrieben - valve1Flow_lpm 74
+#                      l/min, obwohl Kreis 2 gelaufen war. NoteOpenValveDrawTime bucht die
+#                      offene Ventilzeit jetzt vorher ein.
+#
 # 1.0.61 - 2026-08-19  Doku: die Luecken in der commandref geschlossen.
 #                      Ein Abgleich von AttrList, Set-Liste und allen readings*Update-Aufrufen
 #                      gegen die commandref ergab: die Set-Befehle sind vollstaendig, bei den
@@ -500,7 +528,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.61';
+    $hash->{VERSION}    = '1.0.62';
 
     my $name = $a[0];
 
@@ -813,6 +841,7 @@ sub Gartenbewaesserung_Notify {
                         AttrVal($name, "barrelUsableVolume", 0), "barrelFull", 1);
                     $hash->{HELPER}{drawMinutes} = 0;
                     delete $hash->{HELPER}{drawTainted};
+                    delete $hash->{HELPER}{drawBooked};
                     Gartenbewaesserung_CheckBarrelFull($hash);
                     # Barrel full after (or during) rain and idle -> harvest into the IBC
                     if(Gartenbewaesserung_HarvestDue($hash) &&
@@ -907,6 +936,13 @@ sub Gartenbewaesserung_Notify {
                     readingsSingleUpdate($hash, "barrelEmpty", "yes", 1);
                     # Emptied by watering alone? Then the accumulated valve time
                     # corresponds to a known volume - learn before anchoring.
+                    # Ein Ventil, das JETZT noch offen ist, wurde noch nicht
+                    # abgerechnet: NoteValveDraw laeuft erst beim Schliessen. Ohne
+                    # das fehlen seine Minuten in der Rechnung und sein Kreis in der
+                    # Zuordnung. Am 21.08.2026 wurden so 148 l durch 2 statt durch
+                    # 6,8 Minuten geteilt - valve1Flow_lpm 74 l/min, und das auch
+                    # noch auf dem falschen Kreis (gelaufen war Kreis 2).
+                    Gartenbewaesserung_NoteOpenValveDrawTime($hash);
                     Gartenbewaesserung_LearnWateringFlow($hash);
                     Gartenbewaesserung_SetBarrelLevel($hash, 0, "barrelEmpty", 1);
                     # Fremdwasser ist raus - ab jetzt gilt wieder der Normalfall.
@@ -2272,6 +2308,15 @@ sub Gartenbewaesserung_FinishOrPauseCircuit {
 
     # Check if we have remaining time (pause is needed)
     if(defined($hash->{HELPER}{valveRemainingTime}) && $hash->{HELPER}{valveRemainingTime} > 0) {
+        if(!Gartenbewaesserung_BarrelNeedsRefill($hash)) {
+            Log3 $name, 3, "$name: Circuit $circuitNum has remaining time, but the barrel is "
+                . "full - skipping the refill pause and carrying on";
+            $hash->{HELPER}{lastPauseEnd} = time();
+            InternalTimer(gettimeofday() + 2, sub {
+                Gartenbewaesserung_RunCircuit($hash, $circuitNum);
+            }, $hash);
+            return;
+        }
         Log3 $name, 4, "$name: Circuit $circuitNum has remaining time, starting pause";
         Gartenbewaesserung_StartCircuitPause($hash, $circuitNum);
         return;
@@ -2585,6 +2630,88 @@ sub Gartenbewaesserung_TimeUntilNextPause {
     my $remainingMinutes = $pauseInterval - $elapsedMinutes;
 
     return $remainingMinutes > 0 ? $remainingMinutes : 0;
+}
+
+##############################################################################
+# Braucht das Fass ueberhaupt Wasser?
+#
+# Eine Nachfuellpause ist ein Mittel, kein Zweck - sie soll dem Fass Zeit geben,
+# sich zu fuellen. Ist es schon voll, gibt es nichts zu warten: dann wird
+# weitergegossen, statt 20 Minuten Nacht zu verschenken UND das Ventil in ein
+# volles Fass zu oeffnen.
+#
+# Bewusst nur barrelFull, nicht barrelLevel gegen barrelFillThreshold: der
+# Fuellstand ist eine Schaetzung und haengt an den gelernten Ventilraten. Am
+# 21.08.2026 zeigte er 85 %, waehrend das Fass real fast leer war - haette man
+# ihm geglaubt, waere eine noetige Pause ausgefallen. barrelFull ist dagegen ein
+# physischer Kontakt. Im Zweifel lieber eine Pause zu viel als eine zu wenig.
+##############################################################################
+sub Gartenbewaesserung_BarrelNeedsRefill {
+    my ($hash) = @_;
+    return (ReadingsVal($hash->{NAME}, "barrelFull", "no") eq "yes") ? 0 : 1;
+}
+
+##############################################################################
+# Waechter fuer die Strecke IBC -> Fass.
+#
+# Zugemacht wurde bisher nur beim EREIGNIS barrelFull (CheckBarrelFull). War das
+# Fass beim Oeffnen schon voll, kann dieses Ereignis gar nicht mehr kommen - das
+# Ventil blieb dann bis zum Pausenende offen und der IBC lief ueber den
+# Fassueberlauf ins Fallrohr ab. Am 21.08.2026 zweimal 20,0 min statt der sonst
+# ueblichen 0,2-12,1 min; rund 200 l sind so verschwunden, unsichtbar, weil der
+# Ueberlauf in den Ablauf geht.
+#
+# Der Waechter prueft deshalb den ZUSTAND statt der Flanke und zieht zusaetzlich
+# ibcToBarrelDuration als harte Grenze ein - das Attribut galt bisher nur fuer
+# die Ernte-Richtung, auf die Pausen-Nachlaeufe wirkte es nie.
+##############################################################################
+sub Gartenbewaesserung_IbcToBarrelWatchdog {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    RemoveInternalTimer($hash, "Gartenbewaesserung_IbcToBarrelWatchdog");
+    my $start = $hash->{HELPER}{ibcToBarrelStartTime};
+    return if(!$start);
+
+    my $minutes = (int(time()) - $start) / 60;
+
+    if(ReadingsVal($name, "barrelFull", "no") eq "yes") {
+        Log3 $name, 3, sprintf("%s: IBC-to-barrel transfer is running into a FULL barrel "
+            . "(%.1f min) - stopping. No barrelFull event could arrive, the barrel was "
+            . "already full when the valve opened.", $name, $minutes);
+        Gartenbewaesserung_CheckBarrelFull($hash);
+        return;
+    }
+
+    my $limit = AttrVal($name, "ibcToBarrelDuration", 0);
+    if($limit > 0 && $minutes >= $limit) {
+        Log3 $name, 3, sprintf("%s: IBC-to-barrel transfer reached ibcToBarrelDuration "
+            . "(%.1f of %g min) without barrelFull - stopping", $name, $minutes, $limit);
+        Gartenbewaesserung_StopIbcToBarrelTransfer($hash, "maxDuration");
+        return;
+    }
+
+    InternalTimer(gettimeofday() + 30, "Gartenbewaesserung_IbcToBarrelWatchdog", $hash);
+}
+
+# Armaturen der Strecke zumachen, ohne den Pausenkontext anzutasten. Die Pause
+# laeuft weiter - kam in ihrer Zeit kein barrelFull, meldet das der
+# barrelFillTimeout, und das ist die ehrlichere Aussage als ein stiller Abbruch.
+sub Gartenbewaesserung_StopIbcToBarrelTransfer {
+    my ($hash, $reason) = @_;
+    my $name = $hash->{NAME};
+
+    Gartenbewaesserung_NoteIbcToBarrelStop($hash, $reason);
+
+    my $valve = AttrVal($name, "ibcToBarrelValveDevice", "");
+    Gartenbewaesserung_SwitchDevice($name, $valve, "off") if($valve ne "");
+    my $pump = AttrVal($name, "ibcToBarrelPumpDevice", "");
+    Gartenbewaesserung_SwitchDevice($name, $pump, "off") if($pump ne "");
+
+    delete $hash->{HELPER}{pauseSource}
+        if(($hash->{HELPER}{pauseSource} || "") eq "ibc");
+    delete $hash->{HELPER}{barrelEmptyRefillPauseSource}
+        if(($hash->{HELPER}{barrelEmptyRefillPauseSource} || "") eq "ibc");
 }
 
 ##############################################################################
@@ -2991,6 +3118,18 @@ sub Gartenbewaesserung_CloseValve {
 
     # Check if we have remaining time (pause is needed)
     if(defined($hash->{HELPER}{valveRemainingTime}) && $hash->{HELPER}{valveRemainingTime} > 0) {
+        # Pause nur, wenn das Fass sie braucht. Bei vollem Fass gibt es nichts
+        # nachzufuellen und nichts abzuwarten - dann laeuft der Kreis einfach
+        # weiter (siehe BarrelNeedsRefill).
+        if(!Gartenbewaesserung_BarrelNeedsRefill($hash)) {
+            Log3 $name, 3, "$name: Valve $valveNum has remaining time, but the barrel is "
+                . "full - skipping the refill pause and carrying on";
+            $hash->{HELPER}{lastPauseEnd} = time();
+            InternalTimer(gettimeofday() + 2, sub {
+                Gartenbewaesserung_OpenValve($hash, $valveNum);
+            }, $hash);
+            return;
+        }
         Log3 $name, 4, "$name: Valve $valveNum has remaining time, starting pause";
         Gartenbewaesserung_StartWateringPause($hash);
         return;
@@ -3535,6 +3674,15 @@ sub Gartenbewaesserung_StopBarrelEmptyRefillPause {
 
     readingsSingleUpdate($hash, "barrelLevel", Gartenbewaesserung_GetBarrelLevelAfterRefill($hash, 50), 1);
 
+    # Auch das hier war ein Nachfuellen - die Uhr fuer wateringPauseInterval muss
+    # deshalb neu anlaufen. Ohne das zaehlt sie WANDZEIT statt Giesszeit: am
+    # 21.08.2026 lag zwischen dem letzten Pausenende (22:49:28) und dem Weiter-
+    # giessen (23:08:29) ein 12-minuetiges Fass-leer-Nachfuellen. Die Uhr stand
+    # damit auf 19 min, das Ventil bekam eine Laufzeit von NULL Minuten, ging in
+    # derselben Sekunde wieder zu und stiess die naechste Pause an - in ein
+    # gerade eben vollgelaufenes Fass hinein.
+    $hash->{HELPER}{lastPauseEnd} = time();
+
     delete $hash->{HELPER}{barrelEmptyRefillPause};
     delete $hash->{HELPER}{barrelEmptyRefillPauseSource};
 
@@ -3839,6 +3987,11 @@ sub Gartenbewaesserung_StopBarrelEmptyRefill {
 
     delete $hash->{HELPER}{barrelEmptyRefilling};
     delete $hash->{HELPER}{barrelEmptyRefillSource};
+
+    # Auch das war ein Nachfuellen: die Uhr fuer wateringPauseInterval neu
+    # starten, sonst zaehlt sie Wandzeit statt Giesszeit (siehe
+    # StopBarrelEmptyRefillPause - dort steht die ausfuehrliche Begruendung).
+    $hash->{HELPER}{lastPauseEnd} = time();
 
     Gartenbewaesserung_ClearEndTime($hash);
 
@@ -4385,6 +4538,14 @@ sub Gartenbewaesserung_NoteValveDraw {
     my ($hash, $valveNum) = @_;
     my $name = $hash->{NAME};
 
+    # Beim Leermelden hat NoteOpenValveDrawTime die offene Ventilzeit bereits
+    # gebucht und SetBarrelLevel den Fuellstand auf 0 verankert. Hier ist dann
+    # nichts mehr zu tun - sonst zaehlten dieselben Minuten doppelt.
+    if(delete $hash->{HELPER}{drawBooked}) {
+        delete $hash->{HELPER}{valveOpenTime};
+        return;
+    }
+
     my $opened = $hash->{HELPER}{valveOpenTime};
     delete $hash->{HELPER}{valveOpenTime};
     my $minutes = $opened ? (int(time()) - $opened) / 60 : 0;
@@ -4437,6 +4598,35 @@ sub Gartenbewaesserung_NoteValveDraw {
     my $new = $current - 12;
     $new = 0 if($new < 0);
     readingsSingleUpdate($hash, "barrelLevel", $new, 1);
+}
+
+# Ein noch offenes Ventil in die Verbrauchsrechnung aufnehmen, ohne es zu
+# schliessen.
+sub Gartenbewaesserung_NoteOpenValveDrawTime {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    my $opened = $hash->{HELPER}{valveOpenTime};
+    return if(!$opened);
+
+    my $minutes = (int(time()) - $opened) / 60;
+    return if($minutes <= 0);
+
+    my $valveNum = ReadingsVal($name, "currentValve", "none");
+    $hash->{HELPER}{drawMinutes} = ($hash->{HELPER}{drawMinutes} || 0) + $minutes;
+    if($valveNum =~ /^\d+$/) {
+        $hash->{HELPER}{drawByValve}{$valveNum} =
+            ($hash->{HELPER}{drawByValve}{$valveNum} || 0) + $minutes;
+    }
+    # Die Zeit ist jetzt gebucht - NoteValveDraw darf sie beim Schliessen des
+    # Ventils nicht ein zweites Mal nehmen. Blosses Zuruecksetzen von
+    # valveOpenTime reicht nicht: NoteValveDraw faellt bei 0 Minuten in den
+    # Pauschalabzug von 12 % samt irrefuehrender Log-Zeile.
+    delete $hash->{HELPER}{valveOpenTime};
+    $hash->{HELPER}{drawBooked} = 1;
+
+    Log3 $name, 4, sprintf("%s: booked %.1f min of still-open valve %s before learning",
+        $name, $minutes, $valveNum);
 }
 
 # A full barrel emptied by watering alone tells us how much a minute of valve
@@ -4536,12 +4726,17 @@ sub Gartenbewaesserung_NoteIbcToBarrelStart {
     $hash->{HELPER}{ibcToBarrelStartTime} = int(time());
     $hash->{HELPER}{ibcToBarrelFromEmpty} =
         (ReadingsVal($hash->{NAME}, "barrelEmpty", "no") eq "yes") ? 1 : 0;
+    # Erster Blick schon nach 5 s: oeffnet die Strecke in ein volles Fass, sind
+    # das rund 1 l statt der 200 l von frueher. Danach reichen 30 s.
+    RemoveInternalTimer($hash, "Gartenbewaesserung_IbcToBarrelWatchdog");
+    InternalTimer(gettimeofday() + 5, "Gartenbewaesserung_IbcToBarrelWatchdog", $hash);
 }
 
 sub Gartenbewaesserung_NoteIbcToBarrelStop {
     my ($hash, $reason) = @_;
     my $name = $hash->{NAME};
 
+    RemoveInternalTimer($hash, "Gartenbewaesserung_IbcToBarrelWatchdog");
     my $start = $hash->{HELPER}{ibcToBarrelStartTime};
     my $fromEmpty = $hash->{HELPER}{ibcToBarrelFromEmpty};
     delete $hash->{HELPER}{ibcToBarrelStartTime};
@@ -5755,6 +5950,9 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             <b>ibcToBarrelDuration</b><br>
             Typ: Slider (1–60 Minuten). Standardwert: 15 Minuten.<br>
             Maximale Dauer des IBC→Fass-Transfers (wird durch Fass-voll-Sensor früh beendet).
+            Gilt seit v1.0.62 als <b>harte</b> Grenze für <i>jede</i> Übertragung in diese
+            Richtung, also auch für die Nachlaufphasen einer Bewässerungspause. Vorher endete
+            ein solcher Nachlauf nur beim Ereignis <code>barrelFull</code> oder mit der Pause.
         </li>
         <li><a id="Gartenbewaesserung-attr-moistureThreshold"></a>
             <b>moistureThreshold</b><br>
@@ -5766,12 +5964,18 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             <b>wateringPauseInterval</b><br>
             Typ: Slider (0–60 Minuten). Standardwert: 8 Minuten.<br>
             Abstand zwischen automatischen Bewässerungs-Pausen (Fass-Nachfüllpausen).
-            0 = Pausen deaktiviert.
+            0 = Pausen deaktiviert.<br>
+            Gezählt wird <b>Gießzeit</b>: jedes Nachfüllen des Fasses – auch das nach
+            <code>barrelEmpty</code> – setzt die Uhr zurück. Steht beim Fälligwerden einer
+            Pause <code>barrelFull</code> auf <code>yes</code>, entfällt sie ganz und der
+            Kreis läuft weiter: eine Pause ist ein Mittel zum Nachfüllen, kein Selbstzweck.
         </li>
         <li><a id="Gartenbewaesserung-attr-wateringPauseDuration"></a>
             <b>wateringPauseDuration</b><br>
             Typ: Slider (0–60 Minuten). Standardwert: 20 Minuten.<br>
             Dauer der automatischen Bewässerungs-Pause zum Nachfüllen des Fasses.
+            Obergrenze, kein Fixwert – meldet der Fass-voll-Sensor früher, endet die Pause
+            sofort. Die Übertragung selbst begrenzt zusätzlich <code>ibcToBarrelDuration</code>.
         </li>
         <li><a id="Gartenbewaesserung-attr-rainDurationForIBC"></a>
             <b>rainDurationForIBC</b><br>
