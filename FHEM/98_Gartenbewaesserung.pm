@@ -11,6 +11,45 @@
 #
 ##############################################################################
 #
+# 1.0.65 - 2026-08-23  Fix: Endlosrekursion, wenn der Fuellstand unter
+#                      barrelFillThreshold liegt und kein barrelFillValveDevice
+#                      konfiguriert ist.
+#                      NextValve sah den niedrigen Stand und rief FillBarrel, FillBarrel
+#                      fand kein Ventil und rief NextValve - ohne den Index zu erhoehen
+#                      und ohne Timer dazwischen. Die Kette lief damit in derselben
+#                      Sekunde tausendfach durch und blockierte FHEM komplett; im Log
+#                      stehen "Barrel level low, filling before valve 2" und "No barrel
+#                      fill valve configured" abwechselnd mit identischem Zeitstempel.
+#                      Der Kreis-Modus machte es schon richtig: FillBarrelForCircuit ruft
+#                      ohne Ventil RunCircuit, also den Verbraucher, nicht den Verteiler.
+#                      FillBarrel macht es jetzt genauso und oeffnet das anstehende
+#                      Ventil direkt.
+#                      Sofortmassnahme ohne Modul-Update: attr barrelFillThreshold 0 -
+#                      der Zweig ist ohne Fuellventil ohnehin wirkungslos.
+#
+# 1.0.64 - 2026-08-22  Neu: set <name> mainsFillIbc <liter>|<prozent>%|stop - den IBC
+#                      aus der Hauswasserleitung fuellen.
+#                      Das Fass ist der Trichter: Schwimmerventil laesst bis
+#                      barrelFloatLevel nach, Pumpe hebt es in den IBC, Ventil macht
+#                      wieder auf. Eine Runde bringt rund barrelFloatLevel Liter in
+#                      barrelFloatLevel/mainsFillFlow_lpm Minuten plus gut zwei Minuten
+#                      Pumpen - gemessen 81 l in ~21 min, also ~260 l/h.
+#                      Zweck ist NICHT, mit Leitungswasser zu giessen (mit 4,4 l/min
+#                      koennte der Zulauf das gar nicht, ein Giesskreis zieht das
+#                      Dreifache), sondern den Vorrat tagsueber aufzubauen, wenn das
+#                      Schwimmerventil hoerbar sein darf, und ihn nachts leise zu
+#                      verbrauchen.
+#                      Ohne eigenes Ventil: der Hahn bleibt offen, das Schwimmerventil
+#                      regelt, das Modul steuert nur die Pumpe. Kommt das Fass nicht auf
+#                      Schwimmerhoehe, bricht der Waechter nach der doppelten erwarteten
+#                      Nachlaufzeit ab statt endlos zu warten.
+#                      Giessen hat Vorrang - der Auftrag setzt aus und laeuft danach
+#                      weiter. Readings mainsFillIbcTarget/-Done/-State.
+#                      Dabei mitgenommen: RecordIbcFillRun liefert das bewegte Volumen
+#                      jetzt zurueck, statt dass der Aufrufer es aus lastIbcFillVolume_l
+#                      liest. Bei einem der beiden fruehen returns stuende dort noch der
+#                      Wert der VORIGEN Runde - der waere doppelt gebucht worden.
+#
 # 1.0.63 - 2026-08-22  Neu: attr mainsFillFlow_lpm - Leitungswasser-Zulauf mitrechnen.
 #                      Bisher stand der Fuellstand waehrend einer Stadtwasser-Befuellung
 #                      still: keiner der fuenf Buchungsanlaesse (Pumpe, IBC->Fass, Regen,
@@ -548,7 +587,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.63';
+    $hash->{VERSION}    = '1.0.65';
 
     my $name = $a[0];
 
@@ -645,6 +684,7 @@ sub Gartenbewaesserung_Set {
     my $list = "start:noArg stop:noArg " .
                "startCircuit:1,2,3,4,5,6,7,8 " .
                "startIBCFill:noArg stopIBCFill:noArg " .
+               "mainsFillIbc:textField " .
                "startIBCtoBarrel:noArg stopIBCtoBarrel:noArg " .
                "startValve:1,2,3,4,5,6,7,8 stopValve:noArg " .
                "resetPumpOverrunAlert:noArg " .
@@ -670,6 +710,16 @@ sub Gartenbewaesserung_Set {
     }
     elsif($cmd eq "stopIBCFill") {
         return Gartenbewaesserung_StopIBCFill($hash, "manual");
+    }
+    elsif($cmd eq "mainsFillIbc") {
+        my $spec = $args[0];
+        return "Usage: set $name mainsFillIbc <liter>|<prozent>%|stop" if(!defined($spec));
+        if(lc($spec) eq "stop" || $spec eq "0") {
+            return "no mains fill is running" if(!Gartenbewaesserung_MainsFillIbcActive($hash));
+            Gartenbewaesserung_MainsFillIbcStop($hash, "stopped by hand");
+            return undef;
+        }
+        return Gartenbewaesserung_MainsFillIbcStart($hash, $spec);
     }
     elsif($cmd eq "startIBCtoBarrel") {
         return Gartenbewaesserung_StartIBCtoBarrel($hash);
@@ -3171,8 +3221,21 @@ sub Gartenbewaesserung_FillBarrel {
 
     my $fillValve = AttrVal($name, "barrelFillValveDevice", "");
     if($fillValve eq "") {
-        Log3 $name, 2, "$name: No barrel fill valve configured";
-        Gartenbewaesserung_NextValve($hash);
+        # NICHT zurueck nach NextValve: dort steht der Index unveraendert, die
+        # Fuellstandspruefung faellt wieder gleich aus und ruft wieder hierher -
+        # eine Endlosrekursion ohne Timer, die FHEM in derselben Sekunde
+        # blockiert (in der Nacht zum 23.08.2026 genau so passiert). Der
+        # Kreis-Modus macht es schon richtig: FillBarrelForCircuit ruft ohne
+        # Ventil RunCircuit, also den Verbraucher statt des Verteilers.
+        Log3 $name, 2, "$name: No barrel fill valve configured, continuing with the valve";
+        my $queue = $hash->{HELPER}{wateringQueue};
+        my $index = $hash->{HELPER}{wateringIndex};
+        if(ref($queue) eq "ARRAY" && defined($index) && $index < scalar(@$queue)) {
+            Gartenbewaesserung_OpenValve($hash, $queue->[$index]);
+        }
+        else {
+            Gartenbewaesserung_FinishWatering($hash);
+        }
         return;
     }
 
@@ -4150,6 +4213,10 @@ sub Gartenbewaesserung_StopAll {
         Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "off");
     }
 
+    # "stop" heisst stop - auch eine laufende Leitungswasser-Befuellung. Die
+    # Runde selbst ist oben schon abgeschaltet worden, hier faellt der Auftrag.
+    Gartenbewaesserung_MainsFillIbcStop($hash, "stopped by hand");
+
     $hash->{HELPER}{watering} = 0;
     $hash->{HELPER}{barrelFilling} = 0;
     $hash->{HELPER}{circuitMode} = 0;
@@ -4889,11 +4956,11 @@ sub Gartenbewaesserung_RecordIbcFillRun {
     my $fromFull = $hash->{HELPER}{ibcFillFromFull};
     delete $hash->{HELPER}{ibcFillStartTime};
     delete $hash->{HELPER}{ibcFillFromFull};
-    return if(!$start);
+    return 0 if(!$start);
 
     $reason = "unknown" if(!defined($reason) || $reason eq "");
     my $minutes = (int(time()) - $start) / 60;
-    return if($minutes <= 0);
+    return 0 if($minutes <= 0);
 
     # Was the mains top-up available at any point during the run? Then the barrel
     # was refilled from the tap while the pump drained it, and the volume moved
@@ -5009,6 +5076,11 @@ sub Gartenbewaesserung_RecordIbcFillRun {
         # the float floor correct that within the same run.
         Gartenbewaesserung_AdjustBarrelLevel($hash, -$moved, "barrel->IBC");
     }
+
+    # Rueckgabe statt Reading: bei einem fruehen Ausstieg oben stuende in
+    # lastIbcFillVolume_l noch der Wert der VORIGEN Runde, und der Aufrufer
+    # wuerde ihn ein zweites Mal buchen.
+    return $moved;
 }
 
 ##############################################################################
@@ -5044,7 +5116,8 @@ sub Gartenbewaesserung_StopIBCFill {
 
     return if(!$hash->{HELPER}{ibcFilling});
 
-    Gartenbewaesserung_RecordIbcFillRun($hash, $reason);
+    Gartenbewaesserung_MainsFillIbcNote($hash,
+        Gartenbewaesserung_RecordIbcFillRun($hash, $reason));
 
     my $ibcValve = AttrVal($name, "ibcFillValveDevice", "");
     if($ibcValve ne "") {
@@ -5074,6 +5147,188 @@ sub Gartenbewaesserung_StopIBCFill {
     Log3 $name, 3, "$name: IBC filling stopped";
 
     return undef;
+}
+
+##############################################################################
+# IBC aus der Hauswasserleitung fuellen - "set <name> mainsFillIbc <liter>"
+#
+# Das Fass ist der Trichter: das Schwimmerventil laesst Leitungswasser bis zur
+# Schwimmerhoehe nach, die Pumpe hebt es in den IBC, das Ventil macht wieder
+# auf. Eine Runde bringt rund barrelFloatLevel Liter und dauert
+# barrelFloatLevel/mainsFillFlow_lpm Minuten Nachlaufen plus gut zwei Minuten
+# Pumpen - in der Anlage des Autors 81 l in etwa 21 Minuten, also ~260 l/h.
+#
+# Sinn der Sache ist NICHT, Leitungswasser zu giessen (das koennte die Leitung
+# mit 4,4 l/min ohnehin nicht: ein Giesskreis zieht das Dreifache). Sinn ist,
+# den Vorrat tagsueber aufzubauen, wenn das Schwimmerventil hoerbar sein darf,
+# und ihn nachts leise zu verbrauchen.
+#
+# Bewusst ohne eigenes Ventil: der Hahn bleibt waehrenddessen offen, das
+# Schwimmerventil regelt. Das Modul steuert nur die Pumpe. Ist der Hahn zu,
+# kommt das Fass nie auf Schwimmerhoehe - dann bricht der Waechter unten ab,
+# statt endlos zu warten.
+##############################################################################
+sub Gartenbewaesserung_MainsFillIbcActive {
+    my ($hash) = @_;
+    my $t = ReadingsVal($hash->{NAME}, "mainsFillIbcTarget", 0);
+    return ($t =~ /^\d+(?:\.\d+)?$/ && $t > 0) ? 1 : 0;
+}
+
+sub Gartenbewaesserung_MainsFillIbcStart {
+    my ($hash, $spec) = @_;
+    my $name = $hash->{NAME};
+
+    return "Usage: set $name mainsFillIbc <liter>|<prozent>%|stop"
+        if(!defined($spec) || $spec !~ /^(\d+(?:\.\d+)?)\s*(%?)$/);
+    my ($value, $pct) = ($1, $2);
+
+    my $capacity = AttrVal($name, "ibcUsableVolume", 0);
+    return "attr ibcUsableVolume is not set - no idea how big the IBC is" if($capacity <= 0);
+    return "attr ibcFillValveDevice is not set" if(AttrVal($name, "ibcFillValveDevice", "") eq "");
+    return "attr pumpDevice is not set"         if(AttrVal($name, "pumpDevice", "") eq "");
+
+    my $target = $pct ? ($capacity * $value / 100) : $value;
+    return "target must be greater than 0" if($target <= 0);
+
+    # Nicht mehr vornehmen, als noch hineinpasst.
+    my $level = ReadingsVal($name, "ibcLevel_l", "");
+    my $room  = ($level =~ /^-?\d+(?:\.\d+)?$/) ? ($capacity - $level) : $capacity;
+    my $capped = "";
+    if($room <= 0) {
+        return "IBC is already full according to the level estimate";
+    }
+    if($target > $room) {
+        $capped = sprintf(" (capped from %.0f l - only %.0f l fit)", $target, $room);
+        $target = $room;
+    }
+
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, "mainsFillIbcTarget", sprintf("%.0f", $target));
+    readingsBulkUpdate($hash, "mainsFillIbcDone", "0");
+    readingsBulkUpdate($hash, "mainsFillIbcState", "waiting for barrel");
+    readingsEndUpdate($hash, 1);
+    $hash->{HELPER}{mainsFillIbcWaitSince} = int(time());
+
+    my $hint = "";
+    if(Gartenbewaesserung_MainsSupplyState($hash) eq "off") {
+        $hint = " - NOTE: mainsSupply reads 'off', open the tap or nothing will arrive";
+    }
+    # Ohne Schwimmerhoehe gibt es kein Startsignal fuer eine Runde ausser dem
+    # Fass-voll-Kontakt - und den erreicht ein Schwimmerventil nie.
+    elsif(AttrVal($name, "barrelFloatLevel", 0) <= 0) {
+        $hint = " - NOTE: attr barrelFloatLevel is not set, so a round can only start on the "
+              . "barrel-full contact, which a float valve never reaches";
+    }
+    my $rate = AttrVal($name, "mainsFillFlow_lpm", 0);
+    my $eta = ($rate =~ /^\d+(?:\.\d+)?$/ && $rate > 0)
+        ? sprintf(", roughly %.0f min at %s l/min", $target / $rate, $rate) : "";
+
+    Log3 $name, 3, sprintf("%s: mains fill of the IBC started - target %.0f l%s%s",
+        $name, $target, $capped, $hint);
+    Gartenbewaesserung_MainsFillIbcTick($hash);
+    return sprintf("filling the IBC from the mains: %.0f l%s%s%s", $target, $capped, $eta, $hint);
+}
+
+sub Gartenbewaesserung_MainsFillIbcStop {
+    my ($hash, $reason) = @_;
+    my $name = $hash->{NAME};
+
+    return undef if(!Gartenbewaesserung_MainsFillIbcActive($hash));
+
+    my $done = ReadingsVal($name, "mainsFillIbcDone", 0);
+    delete $hash->{HELPER}{mainsFillIbcWaitSince};
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, "mainsFillIbcTarget", "0");
+    readingsBulkUpdate($hash, "mainsFillIbcState", $reason);
+    readingsEndUpdate($hash, 1);
+
+    Log3 $name, 3, "$name: mains fill of the IBC ended ($reason) after $done l";
+    return undef;
+}
+
+# Eine Foerderrunde ist durch - anschreiben und schauen, ob noch eine folgt.
+sub Gartenbewaesserung_MainsFillIbcNote {
+    my ($hash, $volume) = @_;
+    my $name = $hash->{NAME};
+
+    return if(!Gartenbewaesserung_MainsFillIbcActive($hash));
+    return if(!defined($volume) || $volume !~ /^\d+(?:\.\d+)?$/ || $volume <= 0);
+
+    my $done = ReadingsVal($name, "mainsFillIbcDone", 0);
+    $done = 0 if($done !~ /^\d+(?:\.\d+)?$/);
+    $done += $volume;
+    readingsSingleUpdate($hash, "mainsFillIbcDone", sprintf("%.0f", $done), 1);
+    $hash->{HELPER}{mainsFillIbcWaitSince} = int(time());
+
+    my $target = ReadingsVal($name, "mainsFillIbcTarget", 0);
+    Log3 $name, 3, sprintf("%s: mains fill round done, %.0f of %s l in the IBC",
+        $name, $done, $target);
+    Gartenbewaesserung_MainsFillIbcStop($hash, "done") if($done >= $target);
+}
+
+sub Gartenbewaesserung_MainsFillIbcTick {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    return if(!Gartenbewaesserung_MainsFillIbcActive($hash));
+
+    if(ReadingsVal($name, "ibcFull", "no") eq "yes") {
+        Gartenbewaesserung_MainsFillIbcStop($hash, "ibcFull");
+        return;
+    }
+
+    # Giessen hat Vorrang. Nicht abbrechen, nur aussetzen - danach geht es
+    # weiter. Die Wartezeit-Uhr laeuft dabei nicht mit, sonst wuerde ein langer
+    # Giesszyklus den Waechter ausloesen.
+    if($hash->{HELPER}{watering} || $hash->{HELPER}{circuitMode}
+    || $hash->{HELPER}{pauseActive} || $hash->{HELPER}{ibcToBarrelActive}
+    || $hash->{HELPER}{barrelEmptyRefillPause}) {
+        readingsSingleUpdate($hash, "mainsFillIbcState", "suspended - watering", 1)
+            if(ReadingsVal($name, "mainsFillIbcState", "") ne "suspended - watering");
+        $hash->{HELPER}{mainsFillIbcWaitSince} = int(time());
+        return;
+    }
+
+    # Laeuft die Pumpe schon, ist nichts zu tun - StopIBCFill meldet sich.
+    if($hash->{HELPER}{ibcFilling}) {
+        readingsSingleUpdate($hash, "mainsFillIbcState", "pumping", 1)
+            if(ReadingsVal($name, "mainsFillIbcState", "") ne "pumping");
+        return;
+    }
+
+    # Lohnt sich eine Runde schon? Der Fass-voll-Kontakt zaehlt immer, sonst
+    # der mitgerechnete Stand gegen die Schwimmerhoehe.
+    my $float = AttrVal($name, "barrelFloatLevel", 0);
+    my $level = ReadingsVal($name, "barrelLevel_l", "");
+    my $ready = (ReadingsVal($name, "barrelFull", "no") eq "yes") ? 1 : 0;
+    $ready = 1 if(!$ready && $float > 0 && $level =~ /^-?\d+(?:\.\d+)?$/ && $level >= $float - 2);
+
+    if(!$ready) {
+        readingsSingleUpdate($hash, "mainsFillIbcState", "waiting for barrel", 1)
+            if(ReadingsVal($name, "mainsFillIbcState", "") ne "waiting for barrel");
+
+        # Waechter: kommt kein Wasser, kommt das Fass nie auf Hoehe. Statt
+        # endlos zu warten, nach der doppelten erwarteten Nachlaufzeit abbrechen
+        # - meist ist dann schlicht der Hahn zu.
+        my $since = $hash->{HELPER}{mainsFillIbcWaitSince} || int(time());
+        $hash->{HELPER}{mainsFillIbcWaitSince} = $since;
+        my $rate = AttrVal($name, "mainsFillFlow_lpm", 0);
+        my $limit = ($rate =~ /^\d+(?:\.\d+)?$/ && $rate > 0 && $float > 0)
+            ? (2 * $float / $rate + 10) : 60;
+        if((int(time()) - $since) / 60 >= $limit) {
+            Log3 $name, 3, sprintf("%s: barrel did not reach the float level within %.0f min - "
+                . "is the mains tap open? Stopping the mains fill.", $name, $limit);
+            Gartenbewaesserung_MainsFillIbcStop($hash, "no water - tap closed?");
+        }
+        return;
+    }
+
+    my $err = Gartenbewaesserung_StartIBCFill($hash, 1);
+    if($err) {
+        Log3 $name, 3, "$name: mains fill cannot pump right now ($err) - trying again next minute";
+        return;
+    }
+    readingsSingleUpdate($hash, "mainsFillIbcState", "pumping", 1);
 }
 
 ##############################################################################
@@ -5650,6 +5905,7 @@ sub Gartenbewaesserung_CheckSchedule {
 
     # Einziger Taktgeber, der im Betrieb zuverlaessig laeuft (60 s).
     Gartenbewaesserung_MainsFillTick($hash);
+    Gartenbewaesserung_MainsFillIbcTick($hash);
 
     my ($sec, $min, $hour, $mday, $mon, $year, $wday) = localtime(time);
     my $currentTime = sprintf("%02d:%02d", $hour, $min);
@@ -5874,6 +6130,26 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>stop</b> - Stoppt sofort alle laufenden Operationen (Bewässerung, Pumpen, Ventile)</li>
         <li><b>startCircuit &lt;1-8&gt;</b> - Startet einen einzelnen Bewässerungskreis (mit voller Logik: Fass-Check, Pumpe, Ventil, <b>automatischen Pausen</b>). Perfekt für externe Steuerung z.B. vom Gewächshaus</li>
         <li><b>startIBCFill</b> - Startet manuelle IBC-Befüllung aus dem Fass (mit Pumpe)</li>
+        <li><b>mainsFillIbc &lt;liter&gt;|&lt;prozent&gt;%|stop</b> - Füllt den IBC aus der
+            <b>Hauswasserleitung</b>, bis die angegebene Menge drin ist.<br>
+            Das Fass ist dabei der Trichter: das Schwimmerventil lässt Leitungswasser bis
+            <code>barrelFloatLevel</code> nach, die Pumpe hebt es in den IBC, das Ventil macht
+            wieder auf. Eine Runde bringt rund <code>barrelFloatLevel</code> Liter und dauert
+            <code>barrelFloatLevel</code>/<code>mainsFillFlow_lpm</code> Minuten Nachlaufen plus
+            gut zwei Minuten Pumpen.<br>
+            <b>Der Wasserhahn muss offen sein</b> – das Modul steuert nur die Pumpe, geregelt
+            wird über das Schwimmerventil. Kommt das Fass nicht auf Schwimmerhöhe, bricht der
+            Auftrag nach der doppelten erwarteten Nachlaufzeit ab
+            (<code>mainsFillIbcState: no water - tap closed?</code>).<br>
+            Eine Bewässerung hat Vorrang: der Auftrag setzt so lange aus
+            (<code>suspended - watering</code>) und läuft danach weiter. <code>set stop</code>
+            und <code>set … mainsFillIbc stop</code> brechen ihn ab.<br>
+            Gedacht ist das nicht zum Gießen mit Leitungswasser – dafür ist der Zulauf viel zu
+            schwach – sondern um den Vorrat tagsüber aufzubauen, wenn das Schwimmerventil
+            hörbar sein darf, und ihn nachts leise zu verbrauchen.<br>
+            Beispiele: <code>set bewaesserung mainsFillIbc 600</code>,
+            <code>set bewaesserung mainsFillIbc 50%</code>,
+            <code>set bewaesserung mainsFillIbc stop</code></li>
         <li><b>stopIBCFill</b> - Stoppt IBC-Befüllung</li>
         <li><b>startIBCtoBarrel</b> - Lässt Wasser vom IBC zurück ins Fass laufen (Schwerkraft oder Pumpe)</li>
         <li><b>stopIBCtoBarrel</b> - Stoppt IBC zu Fass Transfer</li>
@@ -6485,6 +6761,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>rainCollectionAlert</b> - <code>yes</code>/<code>no</code>; <code>yes</code>, wenn mindestens <code>rainCollectionCheckAmount</code> mm Regen fiel, ohne dass Fass/IBC innerhalb von <code>rainCollectionCheckDelay</code> Minuten Wasser meldeten (Zulauf/Dachrinne/Filter prüfen). Reset automatisch bei der nächsten Füllstands-Reaktion.</li>
         <li><b>rainSinceHarvest_mm</b> - Regenmenge (mm) seit der letzten IBC-Befuellung. Steuert zusammen mit <code>ibcFillRainAmount</code>, wann geerntet wird, und wird beim Start einer Befuellung auf 0 gesetzt - eine neue Ernte braucht daher immer neuen Regen.</li>
         <li><b>mainsSupply</b> - <code>on</code>/<code>off</code>; Zustand der Hauswasserzufuhr laut <code>mainsSupplyDevice</code>. Mit <code>mainsFillFlow_lpm</code> lässt das Modul <code>barrelLevel_l</code> währenddessen mitsteigen.</li>
+        <li><b>mainsFillIbcTarget</b> / <b>mainsFillIbcDone</b> / <b>mainsFillIbcState</b> - Auftrag, Fortschritt und Lage einer Befüllung per <code>set … mainsFillIbc</code>. <code>Target</code> auf <code>0</code> heißt: kein Auftrag aktiv, und <code>State</code> hält dann fest, warum er endete (<code>done</code>, <code>ibcFull</code>, <code>no water - tap closed?</code>, <code>stopped by hand</code>).</li>
         <li><b>lastIbcFillSource</b> - <code>rain</code> (Hauswasser war zu, reines Regenwasser), <code>mixed</code> (Hauswasser offen, Leitungswasser lief mit), <code>other</code> (angesagtes Fremdwasser, siehe <code>set &lt;name&gt; waterSource</code>) oder <code>unknown</code> (kein <code>mainsSupplyDevice</code> gesetzt).</li>
         <li><b>pumped_total_l</b> / <b>pumpedRain_total_l</b> / <b>mains_total_l</b> - Insgesamt vom Fass in den IBC gefördertes Volumen, aufgeteilt in Regen- und Leitungswasseranteil. <code>pumpedRain_total_l</code> lässt sich direkt gegen <code>harvest_total_l</code> halten: Weichen die Werte dauerhaft voneinander ab, stimmt <code>roofArea</code> nicht. Läufe mit offener Hauswasserzufuhr steuern ihren Regenanteil nur bei, wenn <code>barrelFloatLevel</code> gesetzt ist. Zurücksetzen mit <code>set &lt;name&gt; resetHarvestStats</code>.</li>
         <li><b>waterSource</b> - <code>rain</code> (Normalfall) oder <code>other</code>, siehe <code>set &lt;name&gt; waterSource</code>. Fällt beim nächsten <code>barrelEmpty</code> automatisch auf <code>rain</code> zurück.</li>
