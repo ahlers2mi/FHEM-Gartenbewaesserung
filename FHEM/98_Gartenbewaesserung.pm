@@ -11,6 +11,22 @@
 #
 ##############################################################################
 #
+# 1.0.65 - 2026-08-23  Fix: Endlosrekursion, wenn der Fuellstand unter
+#                      barrelFillThreshold liegt und kein barrelFillValveDevice
+#                      konfiguriert ist.
+#                      NextValve sah den niedrigen Stand und rief FillBarrel, FillBarrel
+#                      fand kein Ventil und rief NextValve - ohne den Index zu erhoehen
+#                      und ohne Timer dazwischen. Die Kette lief damit in derselben
+#                      Sekunde tausendfach durch und blockierte FHEM komplett; im Log
+#                      stehen "Barrel level low, filling before valve 2" und "No barrel
+#                      fill valve configured" abwechselnd mit identischem Zeitstempel.
+#                      Der Kreis-Modus machte es schon richtig: FillBarrelForCircuit ruft
+#                      ohne Ventil RunCircuit, also den Verbraucher, nicht den Verteiler.
+#                      FillBarrel macht es jetzt genauso und oeffnet das anstehende
+#                      Ventil direkt.
+#                      Sofortmassnahme ohne Modul-Update: attr barrelFillThreshold 0 -
+#                      der Zweig ist ohne Fuellventil ohnehin wirkungslos.
+#
 # 1.0.64 - 2026-08-22  Neu: set <name> mainsFillIbc <liter>|<prozent>%|stop - den IBC
 #                      aus der Hauswasserleitung fuellen.
 #                      Das Fass ist der Trichter: Schwimmerventil laesst bis
@@ -571,7 +587,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.64';
+    $hash->{VERSION}    = '1.0.65';
 
     my $name = $a[0];
 
@@ -3205,8 +3221,21 @@ sub Gartenbewaesserung_FillBarrel {
 
     my $fillValve = AttrVal($name, "barrelFillValveDevice", "");
     if($fillValve eq "") {
-        Log3 $name, 2, "$name: No barrel fill valve configured";
-        Gartenbewaesserung_NextValve($hash);
+        # NICHT zurueck nach NextValve: dort steht der Index unveraendert, die
+        # Fuellstandspruefung faellt wieder gleich aus und ruft wieder hierher -
+        # eine Endlosrekursion ohne Timer, die FHEM in derselben Sekunde
+        # blockiert (in der Nacht zum 23.08.2026 genau so passiert). Der
+        # Kreis-Modus macht es schon richtig: FillBarrelForCircuit ruft ohne
+        # Ventil RunCircuit, also den Verbraucher statt des Verteilers.
+        Log3 $name, 2, "$name: No barrel fill valve configured, continuing with the valve";
+        my $queue = $hash->{HELPER}{wateringQueue};
+        my $index = $hash->{HELPER}{wateringIndex};
+        if(ref($queue) eq "ARRAY" && defined($index) && $index < scalar(@$queue)) {
+            Gartenbewaesserung_OpenValve($hash, $queue->[$index]);
+        }
+        else {
+            Gartenbewaesserung_FinishWatering($hash);
+        }
         return;
     }
 
