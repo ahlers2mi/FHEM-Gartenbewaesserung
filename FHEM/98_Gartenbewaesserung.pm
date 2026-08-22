@@ -11,6 +11,26 @@
 #
 ##############################################################################
 #
+# 1.0.63 - 2026-08-22  Neu: attr mainsFillFlow_lpm - Leitungswasser-Zulauf mitrechnen.
+#                      Bisher stand der Fuellstand waehrend einer Stadtwasser-Befuellung
+#                      still: keiner der fuenf Buchungsanlaesse (Pumpe, IBC->Fass, Regen,
+#                      Ventil, Anker) trifft zu. Der einzige Ansatz dafuer war
+#                      ApplyBarrelFloatFloor, ein SPRUNG auf barrelFloatLevel - und der lief
+#                      im Betrieb nie: aufgerufen wird er nur aus UpdateSensorReadings, und
+#                      das passiert bloss beim Define, bei "set refreshSensors" und beim
+#                      Aendern eines Sensor-Attributs. Am 22.08. war der einzige Lauf um
+#                      11:26:01, da stand barrelEmpty noch auf yes und die Funktion stieg
+#                      genau deswegen aus - der Fuellstand blieb 20 Minuten auf 0, waehrend
+#                      real 81 l einliefen.
+#                      Jetzt: MainsFillTick im 60-s-Takt aus CheckSchedule (der einzige
+#                      Timer, der zuverlaessig laeuft). Mit gesetzter Rate steigt der Pegel
+#                      mit, gedeckelt auf barrelFloatLevel - ueber ein Schwimmerventil steigt
+#                      er nur bis zur Schwimmerhoehe, stur weiterzuzaehlen wuerde ein volles
+#                      Fass vortaeuschen, das es nie gibt. Ohne Rate bleibt es beim Sprung,
+#                      der damit aber erstmals ueberhaupt ausgefuehrt wird.
+#                      Laeuft ein anderer Transport, ruht der Ticker - der hat seine eigene
+#                      Buchhaltung, sonst zaehlte dasselbe Wasser zweimal.
+#
 # 1.0.62 - 2026-08-22  Fix: Nachlauf IBC -> Fass lief in ein volles Fass und entleerte
 #                      den IBC ueber den Fassueberlauf.
 #                      In der Nacht zum 22.08. stand das Ventil zweimal 20,0 min offen
@@ -499,7 +519,7 @@ sub Gartenbewaesserung_Initialize {
         "barrelUsableVolume:textField barrelFloatLevel:textField " .
         "wateringFlow_lpm:textField " .
         "ibcUsableVolume:textField ibcFullFromLevel:0,1 " .
-        "mainsSupplyDevice:textField " .
+        "mainsSupplyDevice:textField mainsFillFlow_lpm:textField " .
         "mainsSupplyActiveValue:textField mainsSupplyInactiveValue:textField " .
         "runoffCoefficient:textField " .
         "pumpStartDelay:slider,-30,1,30 " .
@@ -528,7 +548,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.62';
+    $hash->{VERSION}    = '1.0.63';
 
     my $name = $a[0];
 
@@ -4514,6 +4534,71 @@ sub Gartenbewaesserung_AdjustBarrelLevel {
 
 # With the mains open and nothing drawing, the barrel cannot sit below the level
 # the float valve holds it at.
+# Zulauf aus der Hauswasserleitung mitrechnen.
+#
+# Bis v1.0.62 kannte das Modul dafuer nur ApplyBarrelFloatFloor: einen SPRUNG
+# auf barrelFloatLevel. Der hatte zwei Loecher. Erstens lief er ausschliesslich
+# in UpdateSensorReadings, und das wird nur beim Define, bei "set refreshSensors"
+# und beim Aendern eines Sensor-Attributs aufgerufen - im laufenden Betrieb also
+# nie. Zweitens war er ein Sprung: der Fuellstand stand auf 0 und waere dann
+# schlagartig auf die Schwimmerhoehe gegangen, statt mitzusteigen.
+#
+# Mit mainsFillFlow_lpm steigt er jetzt mit der gemessenen Rate. Der Deckel ist
+# barrelFloatLevel: ueber ein Schwimmerventil steigt der Pegel nur bis zur
+# Schwimmerhoehe, nicht bis zum Rand - stur weiterzuzaehlen wuerde ein volles
+# Fass vortaeuschen, das es nie gibt. Ohne die Rate bleibt es beim alten Sprung,
+# der jetzt wenigstens regelmaessig geprueft wird.
+sub Gartenbewaesserung_MainsFillTick {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    my $rate = AttrVal($name, "mainsFillFlow_lpm", 0);
+    $rate = 0 if($rate !~ /^\d+(?:\.\d+)?$/);
+    if($rate <= 0) {
+        delete $hash->{HELPER}{mainsFillSince};
+        Gartenbewaesserung_ApplyBarrelFloatFloor($hash);
+        return;
+    }
+
+    my $capacity = AttrVal($name, "barrelUsableVolume", 0);
+    return if($capacity <= 0);
+
+    if(Gartenbewaesserung_MainsSupplyState($hash) ne "on") {
+        delete $hash->{HELPER}{mainsFillSince};
+        return;
+    }
+
+    # Laeuft gerade ein anderer Transport, hat der seine eigene Buchhaltung -
+    # sonst zaehlte dasselbe Wasser zweimal.
+    if($hash->{HELPER}{watering}   || $hash->{HELPER}{circuitMode}
+    || $hash->{HELPER}{ibcFilling} || $hash->{HELPER}{ibcToBarrelActive}
+    || $hash->{HELPER}{barrelFilling} || $hash->{HELPER}{pauseActive}) {
+        delete $hash->{HELPER}{mainsFillSince};
+        return;
+    }
+
+    my $float = AttrVal($name, "barrelFloatLevel", 0);
+    my $cap = ($float > 0 && $float < $capacity) ? $float : $capacity;
+
+    my $now = int(time());
+    my $since = $hash->{HELPER}{mainsFillSince};
+    $hash->{HELPER}{mainsFillSince} = $now;
+    # Erster Durchlauf: nur den Startpunkt merken. Kostet die angefangene
+    # Minute, ist aber ehrlicher, als eine unbekannte Vorlaufzeit gutzuschreiben.
+    return if(!$since || $now <= $since);
+
+    my $level = ReadingsVal($name, "barrelLevel_l", "");
+    return if($level !~ /^-?\d+(?:\.\d+)?$/ || $level >= $cap);
+
+    my $add = $rate * ($now - $since) / 60;
+    $add = $cap - $level if($level + $add > $cap);
+    return if($add <= 0);
+
+    Gartenbewaesserung_AdjustBarrelLevel($hash, $add, "mains supply");
+    # Dieses Wasser kam nicht vom Dach - eine daraus gelernte Giessrate waere falsch.
+    $hash->{HELPER}{drawTainted} = 1;
+}
+
 sub Gartenbewaesserung_ApplyBarrelFloatFloor {
     my ($hash) = @_;
     my $name = $hash->{NAME};
@@ -5563,6 +5648,9 @@ sub Gartenbewaesserung_CheckSchedule {
     return if(IsDisabled($name));
     return if(AttrVal($name, "manualMode", 0));
 
+    # Einziger Taktgeber, der im Betrieb zuverlaessig laeuft (60 s).
+    Gartenbewaesserung_MainsFillTick($hash);
+
     my ($sec, $min, $hour, $mday, $mon, $year, $wday) = localtime(time);
     my $currentTime = sprintf("%02d:%02d", $hour, $min);
 
@@ -6320,6 +6408,21 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Werte, an denen <code>mainsSupplyDevice</code> „Zufuhr offen“ bzw. „Zufuhr zu“ erkennt.
             Nur nötig, wenn das Gerät eigene Begriffe verwendet.
         </li>
+        <li><a id="Gartenbewaesserung-attr-mainsFillFlow_lpm"></a>
+            <b>mainsFillFlow_lpm</b><br>
+            Typ: Text (Liter pro Minute). Ohne Angabe: kein Mitrechnen.<br>
+            Zulaufrate der Hauswasserleitung ins Fass. Steht <code>mainsSupply</code> auf
+            <code>on</code> und läuft gerade kein anderer Transport, steigt
+            <code>barrelLevel_l</code> im Minutentakt mit dieser Rate – sonst bliebe der
+            Füllstand während einer Leitungswasser-Befüllung auf seinem alten Wert stehen.<br>
+            Begrenzt wird auf <code>barrelFloatLevel</code>, ersatzweise auf
+            <code>barrelUsableVolume</code>: über ein Schwimmerventil steigt der Pegel nur bis
+            zur Schwimmerhöhe. Ohne dieses Attribut bleibt es beim bisherigen Verhalten – einem
+            Sprung auf <code>barrelFloatLevel</code>.<br>
+            Messen: Wasserzähler ablesen, Hahn auf, nach ein paar Minuten wieder ablesen. Der
+            Wert ist deutlich kleiner als der Nenndurchfluss der Leitung – in der Anlage des
+            Autors 4,4 l/min bei geschätzten 12 l/min Zuleitung.
+        </li>
         <li><a id="Gartenbewaesserung-attr-barrelFullSensorActiveValue"></a>
             <b>barrelFullSensorActiveValue</b><br>
             Typ: textField. Standardwert: automatisch.<br>
@@ -6381,7 +6484,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>rainSinceFill_mm</b> - Regenmenge (mm) seit der letzten erkannten Füllstands-Reaktion von Fass/IBC. Grundlage der Sammel-Überwachung; wird bei einer Füllstands-Reaktion auf 0 zurückgesetzt.</li>
         <li><b>rainCollectionAlert</b> - <code>yes</code>/<code>no</code>; <code>yes</code>, wenn mindestens <code>rainCollectionCheckAmount</code> mm Regen fiel, ohne dass Fass/IBC innerhalb von <code>rainCollectionCheckDelay</code> Minuten Wasser meldeten (Zulauf/Dachrinne/Filter prüfen). Reset automatisch bei der nächsten Füllstands-Reaktion.</li>
         <li><b>rainSinceHarvest_mm</b> - Regenmenge (mm) seit der letzten IBC-Befuellung. Steuert zusammen mit <code>ibcFillRainAmount</code>, wann geerntet wird, und wird beim Start einer Befuellung auf 0 gesetzt - eine neue Ernte braucht daher immer neuen Regen.</li>
-        <li><b>mainsSupply</b> - <code>on</code>/<code>off</code>; Zustand der Hauswasserzufuhr laut <code>mainsSupplyDevice</code>.</li>
+        <li><b>mainsSupply</b> - <code>on</code>/<code>off</code>; Zustand der Hauswasserzufuhr laut <code>mainsSupplyDevice</code>. Mit <code>mainsFillFlow_lpm</code> lässt das Modul <code>barrelLevel_l</code> währenddessen mitsteigen.</li>
         <li><b>lastIbcFillSource</b> - <code>rain</code> (Hauswasser war zu, reines Regenwasser), <code>mixed</code> (Hauswasser offen, Leitungswasser lief mit), <code>other</code> (angesagtes Fremdwasser, siehe <code>set &lt;name&gt; waterSource</code>) oder <code>unknown</code> (kein <code>mainsSupplyDevice</code> gesetzt).</li>
         <li><b>pumped_total_l</b> / <b>pumpedRain_total_l</b> / <b>mains_total_l</b> - Insgesamt vom Fass in den IBC gefördertes Volumen, aufgeteilt in Regen- und Leitungswasseranteil. <code>pumpedRain_total_l</code> lässt sich direkt gegen <code>harvest_total_l</code> halten: Weichen die Werte dauerhaft voneinander ab, stimmt <code>roofArea</code> nicht. Läufe mit offener Hauswasserzufuhr steuern ihren Regenanteil nur bei, wenn <code>barrelFloatLevel</code> gesetzt ist. Zurücksetzen mit <code>set &lt;name&gt; resetHarvestStats</code>.</li>
         <li><b>waterSource</b> - <code>rain</code> (Normalfall) oder <code>other</code>, siehe <code>set &lt;name&gt; waterSource</code>. Fällt beim nächsten <code>barrelEmpty</code> automatisch auf <code>rain</code> zurück.</li>
