@@ -237,6 +237,34 @@ scenario("J  Foerderrate nur als ATTRIBUT gesetzt, Reading fehlt (v1.0.69)");
     is(Gartenbewaesserung_FlowRate($leer, "ibcToBarrelFlow_lpm"), 0, "ohne beides: 0, nichts erfunden");
 }
 
+scenario("K  Manuelles startIBCtoBarrel wird abgerechnet (v1.0.70)");
+{
+    my $h = build();
+    Gartenbewaesserung_SetIbcLevel($h, 400, "test", 1);
+    Gartenbewaesserung_SetBarrelLevel($h, 100, "test", 1);
+    Gartenbewaesserung_StartIBCtoBarrel($h);
+    is(relay("POWER5"), "ON", "Ventil offen");
+    main::advance(5 * 60);
+    sens("barrelFull", "yes");                       # Fass wird voll -> Ende
+
+    is(rd("lastIbcToBarrelEnd"), "barrelFull", "Ende protokolliert");
+    ok_true(rd("lastIbcToBarrelDuration") >= 4.9 && rd("lastIbcToBarrelDuration") <= 5.2,
+            "Dauer ~5 min (ist: " . rd("lastIbcToBarrelDuration") . ")");
+    # 5 min x 12,2 l/min = 61 l muessen vom IBC abgehen
+    ok_true(rd("ibcLevel_l") >= 330 && rd("ibcLevel_l") <= 345,
+            "IBC von 400 auf ~339 gebucht (ist: " . rd("ibcLevel_l") . ")");
+}
+
+scenario("L  Manueller Transfer in ein volles Fass: Waechter greift (v1.0.70)");
+{
+    my $h = build();
+    sens("barrelFull", "yes");                       # schon voll VOR dem Start
+    Gartenbewaesserung_StartIBCtoBarrel($h);
+    is(relay("POWER5"), "ON", "Ventil geht erstmal auf");
+    main::advance(60);
+    is(relay("POWER5"), "OFF", "Waechter macht binnen 60 s zu");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);

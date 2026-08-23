@@ -11,6 +11,18 @@
 #
 ##############################################################################
 #
+# 1.0.70 - 2026-08-23  Fix: drei von vier Wegen IBC->Fass wurden nie abgerechnet.
+#                      Nur die Giess-Pause rief Start UND Stop. Es fehlten:
+#                      NoteIbcToBarrelStart in StartIBCtoBarrel (beide Zweige) und in
+#                      HandleBarrelEmpty, NoteIbcToBarrelStop in EndCircuitPause.
+#                      Folge: kein lastIbcToBarrel*, keine Buchung auf ibcLevel_l und
+#                      barrelLevel_l, keine gelernte Schwerkraftrate - und der Waechter
+#                      aus v1.0.62 wurde nicht scharf, weil er in NoteIbcToBarrelStart
+#                      armiert wird. Am 23.08. lief ein manueller Transfer von 7 min
+#                      voellig unbemerkt: ibcLevel_l stand danach unveraendert auf 390.
+#                      Der Stop sitzt jetzt zentral in StopIBCtoBarrel, damit auch der
+#                      eigene Dauer-Timer und "set stopIBCtoBarrel" abrechnen.
+#
 # 1.0.69 - 2026-08-23  Fix: Foerderraten fallen auf das gleichnamige Attribut zurueck.
 #                      ibcFillFlow_lpm und ibcToBarrelFlow_lpm wurden nur als Reading
 #                      gelesen. Gelernt werden sie aber nur aus vollstaendigen Laeufen,
@@ -638,7 +650,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.69';
+    $hash->{VERSION}    = '1.0.70';
 
     my $name = $a[0];
 
@@ -2571,6 +2583,10 @@ sub Gartenbewaesserung_EndCircuitPause {
         }
     }
     elsif($pauseSource eq "ibc") {
+        # Fehlte hier, im Gegensatz zu EndWateringPause - deshalb wurde eine
+        # Kreis-Pause nie abgerechnet.
+        Gartenbewaesserung_NoteIbcToBarrelStop($hash, "pauseEnd");
+
         my $ibcToBarrelValve = AttrVal($name, "ibcToBarrelValveDevice", "");
         if($ibcToBarrelValve ne "") {
             Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "off");
@@ -4037,6 +4053,7 @@ sub Gartenbewaesserung_HandleBarrelEmpty {
             $hash->{HELPER}{barrelEmptyRefilling} = 1;
             $hash->{HELPER}{barrelEmptyRefillSource} = "ibc";
             $hash->{HELPER}{ibcToBarrelActive} = 1;
+            Gartenbewaesserung_NoteIbcToBarrelStart($hash);
 
             if($ibcToBarrelPump ne "") {
                 # Ordering follows pumpStartDelay (positive = pump first, negative/zero
@@ -5502,6 +5519,7 @@ sub Gartenbewaesserung_StartIBCtoBarrel {
 
         # Mark active up front so StopIBCtoBarrel can always tear both devices down
         $hash->{HELPER}{ibcToBarrelActive} = 1;
+        Gartenbewaesserung_NoteIbcToBarrelStart($hash);
         readingsBeginUpdate($hash);
         readingsBulkUpdate($hash, "ibcToBarrelActive", "yes");
         readingsBulkUpdate($hash, "state", "ibc to barrel");
@@ -5548,6 +5566,7 @@ sub Gartenbewaesserung_StartIBCtoBarrel {
         # Gravity feed - no pump needed
         Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on");
         $hash->{HELPER}{ibcToBarrelActive} = 1;
+        Gartenbewaesserung_NoteIbcToBarrelStart($hash);
 
         # Set end time
         Gartenbewaesserung_SetEndTime($hash, $duration);
@@ -5573,10 +5592,16 @@ sub Gartenbewaesserung_StartIBCtoBarrel {
 # Stop IBC to Barrel
 ##############################################################################
 sub Gartenbewaesserung_StopIBCtoBarrel {
-    my ($hash) = @_;
+    my ($hash, $reason) = @_;
     my $name = $hash->{NAME};
 
     return if(!$hash->{HELPER}{ibcToBarrelActive});
+
+    # Zentral hier, damit JEDER Weg abgerechnet wird - auch der manuelle
+    # "set startIBCtoBarrel" und der eigene Dauer-Timer. CheckBarrelFull ruft
+    # vorher schon mit dem besseren Grund "barrelFull"; der zweite Aufruf faellt
+    # dann durch, weil NoteIbcToBarrelStop den Startzeitpunkt geloescht hat.
+    Gartenbewaesserung_NoteIbcToBarrelStop($hash, $reason || "stopped");
 
     my $ibcToBarrelValve = AttrVal($name, "ibcToBarrelValveDevice", "");
     if($ibcToBarrelValve ne "") {
