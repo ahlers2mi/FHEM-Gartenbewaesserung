@@ -33,6 +33,10 @@ sub build {
     setr("sens", "ibcEmpty", "no");
     setr("sens", "stadtwasser", $o{mains} // "off");
 
+    # Relais, die schon VOR dem Define an sind - simuliert einen Neustart
+    # mitten im Betrieb.
+    setr("relais", $_, "ON") for @{$o{relaysOn} || []};
+
     my $h = { NAME=>"bw", TYPE=>"Gartenbewaesserung", READINGS=>{}, HELPER=>{} };
     $defs{bw} = $h;
     my %a = (
@@ -196,6 +200,23 @@ scenario("G  Offenes Ventil wird vor dem Lernen abgerechnet (v1.0.62)");
     my $learned = rd("valve1Flow_lpm");
     ok_true($learned > 5 && $learned < 40,
             "gelernte Rate plausibel, nicht 148/kurz (ist: $learned)");
+}
+
+scenario("H  Neustart mitten im Pumpen: verwaiste Aktoren werden abgeschaltet (v1.0.68)");
+{
+    # Pumpe und Fass->IBC-Ventil waren vor dem Neustart an, das Reading ebenso.
+    my $h = build(mains => "on", relaysOn => ["POWER6", "POWER8"]);
+    is(relay("POWER8"), "OFF", "Pumpe abgeschaltet");
+    is(relay("POWER6"), "OFF", "Fass->IBC-Ventil abgeschaltet");
+    ok_true(rd("orphanShutdown") ne "(fehlt)", "orphanShutdown protokolliert");
+    ok_true((grep { /were still switched on after the restart/ } @main::LOG) > 0,
+            "Log nennt den Grund deutlich");
+}
+
+scenario("I  Ohne Waisen passiert nichts");
+{
+    my $h = build(mains => "on");
+    is(rd("orphanShutdown"), "(fehlt)", "kein orphanShutdown ohne Anlass");
 }
 
 print "\n";

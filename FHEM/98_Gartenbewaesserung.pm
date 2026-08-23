@@ -11,6 +11,25 @@
 #
 ##############################################################################
 #
+# 1.0.68 - 2026-08-23  Fix: nach einem Neustart liefen Pumpe und Ventil weiter, ohne
+#                      dass noch jemand zusieht.
+#                      HELPER ist Arbeitsspeicher - nach dem Neustart weiss das Modul
+#                      von nichts mehr, die Aktoren bleiben aber an. Damit sind BEIDE
+#                      Sicherungen weg: der Pumpen-Watchdog (pumpMaxRuntime) lebt in
+#                      HELPER, ein per defmod angelegtes Timeout-at ueberlebt den
+#                      Neustart ebenfalls nicht. Am 23.08. lief die Pumpe deshalb nach
+#                      einem Update-Neustart rund zehn Minuten trocken.
+#                      Neu AdoptOrStopOrphans, gerufen 5 s nach dem Define (im Define
+#                      selbst ist der Statefile noch nicht angewendet, die
+#                      Geraete-Readings waeren leer): schaltet alles ab, was noch laeuft,
+#                      und schreibt das Reading orphanShutdown.
+#                      Bewusst abschalten statt uebernehmen - das Modul kann nach dem
+#                      Start nicht wissen, ob im Fass noch Wasser steht. Ein
+#                      abgebrochener Lauf laesst sich neu starten, eine trockengelaufene
+#                      Pumpe nicht reparieren. Nur eine laufende IBC-Befuellung geht
+#                      ueber StopIBCFill, damit das gefoerderte Volumen noch verbucht
+#                      wird; abgeschaltet wird sie genauso.
+#
 # 1.0.67 - 2026-08-23  Doku: veraltete Versionsangabe aus der commandref entfernt.
 #                      Dort stand fest verdrahtet "Version: 1.0.28", also 38 Versionen
 #                      zu alt. Statt sie zu pflegen faellt sie weg - massgeblich sind
@@ -607,7 +626,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.67';
+    $hash->{VERSION}    = '1.0.68';
 
     my $name = $a[0];
 
@@ -672,6 +691,9 @@ sub Gartenbewaesserung_Define {
     InternalTimer(gettimeofday() + 5, sub {
         Gartenbewaesserung_UpdateSensorReadings($hash);
         Gartenbewaesserung_UpdateRainAmount($hash);
+        # Erst hier, nicht im Define: waehrend des Einlesens der fhem.cfg ist der
+        # Statefile noch nicht angewendet, die Geraete-Readings sind also leer.
+        Gartenbewaesserung_AdoptOrStopOrphans($hash);
     }, $hash);
 
     # Start timer for scheduled watering
@@ -5352,6 +5374,60 @@ sub Gartenbewaesserung_MainsFillIbcTick {
 }
 
 ##############################################################################
+# Nach Neustart oder Modul-Reload: Aktoren einsammeln, die noch laufen.
+#
+# $hash->{HELPER} ist reiner Arbeitsspeicher. Nach einem Neustart weiss das
+# Modul von nichts mehr - Pumpe und Ventile bleiben aber physisch an, und
+# damit hoert ihnen niemand mehr zu: der Pumpen-Watchdog (pumpMaxRuntime) ist
+# weg, ein per defmod angelegtes Timeout-at ebenfalls.
+#
+# Am 23.08.2026 lief die Pumpe deshalb nach einem Update-Neustart rund zehn
+# Minuten trocken weiter. Sie war um 10:07:36 fuer eine IBC-Befuellung
+# gestartet, im Fass standen 80 l - nach gut zwei Minuten war es leer.
+#
+# Bewusst abschalten statt uebernehmen: das Modul kann nach dem Start nicht
+# wissen, ob im Fass noch Wasser steht. Ein abgebrochener Lauf laesst sich
+# neu starten, eine trockengelaufene Pumpe nicht reparieren. Nur die
+# IBC-Befuellung geht ueber StopIBCFill, damit das bereits gefoerderte
+# Volumen noch verbucht wird (die Wiederaufnahme aus den Readings gibt es
+# dort seit v1.0.58) - abgeschaltet wird sie dabei genauso.
+##############################################################################
+sub Gartenbewaesserung_AdoptOrStopOrphans {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    # Laeuft im Modul selbst etwas, ist nichts verwaist.
+    return if($hash->{HELPER}{watering}      || $hash->{HELPER}{circuitMode}
+           || $hash->{HELPER}{ibcFilling}    || $hash->{HELPER}{ibcToBarrelActive}
+           || $hash->{HELPER}{barrelFilling} || $hash->{HELPER}{pauseActive}
+           || $hash->{HELPER}{barrelEmptyRefilling});
+
+    # Eine unterbrochene IBC-Befuellung zuerst: die kann sich noch selbst
+    # abrechnen, bevor die Armaturen zugehen.
+    if(ReadingsVal($name, "ibcFilling", "no") eq "yes") {
+        Log3 $name, 1, "$name: an IBC fill was still running before the restart - "
+            . "booking what it moved, then shutting it down";
+        Gartenbewaesserung_StopIBCFill($hash, "restart");
+    }
+
+    my @off;
+    foreach my $a ("pumpDevice", "ibcFillValveDevice", "ibcToBarrelValveDevice",
+                   "ibcToBarrelPumpDevice", "barrelFillValveDevice",
+                   map { "valve${_}Device" } (1..8)) {
+        my $def = AttrVal($name, $a, "");
+        next if($def eq "" || !Gartenbewaesserung_IsDeviceOn($name, $def));
+        Gartenbewaesserung_SwitchDevice($name, $def, "off");
+        push @off, $a;
+    }
+    return if(!@off);
+
+    Log3 $name, 1, sprintf("%s: %d actuator(s) were still switched on after the restart "
+        . "with nothing left watching them - switched off: %s",
+        $name, scalar(@off), join(", ", @off));
+    readingsSingleUpdate($hash, "orphanShutdown", TimeNow() . " " . join(",", @off), 1);
+}
+
+##############################################################################
 # Check if IBC is full
 ##############################################################################
 sub Gartenbewaesserung_CheckIBCFull {
@@ -6766,6 +6842,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>pumpOverrunAlert</b> - <code>yes</code>/<code>no</code>; wird auf <code>yes</code> gesetzt, wenn die Pumpe wegen überschrittener <code>pumpMaxRuntime</code> abgeschaltet wurde.</li>
         <li><b>barrelFillTimeoutAlert</b> - <code>yes</code>/<code>no</code>; wird auf <code>yes</code> gesetzt, wenn das Befüllventil länger als <code>barrelFillTimeout</code> Minuten offen war, ohne dass <code>barrelFull</code> auf <code>yes</code> ging (IBC vermutlich leer oder Wasserzufuhr gestört). Reset automatisch bei <code>barrelFull:yes</code> oder <code>raining:yes</code>.</li>
         <li><b>currentValve</b> - Aktuell aktives Ventil (1–8) oder <code>none</code>.</li>
+        <li><b>orphanShutdown</b> - Zeitpunkt und Liste der Aktoren, die nach einem Neustart noch eingeschaltet waren und vom Modul abgeschaltet wurden. Steht hier etwas, lief beim letzten Neustart eine Pumpe oder ein Ventil ohne Aufsicht weiter – der Eintrag bleibt stehen, bis es wieder passiert.</li>
         <li><b>phase</b> - Was das Modul gerade tut, im Klartext (<code>watering circuit 8</code>, <code>pause - refilling</code>, <code>idle</code> …). Feiner als <code>state</code> und vor allem zum Mitlesen im Log gedacht.</li>
         <li><b>barrelFull</b> / <b>barrelEmpty</b> - <code>yes</code>/<code>no</code> laut <code>barrelFullSensorDevice</code> bzw. <code>barrelEmptySensorDevice</code>, sonst <code>not configured</code>. Die beiden sind die einzigen <b>physischen</b> Aussagen über das Fass – alle Füllstandszahlen verankern sich an ihnen.</li>
         <li><b>ibcFull</b> / <b>ibcEmpty</b> - dasselbe für den IBC.</li>
