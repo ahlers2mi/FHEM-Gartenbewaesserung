@@ -11,6 +11,15 @@
 #
 ##############################################################################
 #
+# 1.0.67 - 2026-08-23  Doku: veraltete Versionsangabe aus der commandref entfernt.
+#                      Dort stand fest verdrahtet "Version: 1.0.28", also 38 Versionen
+#                      zu alt. Statt sie zu pflegen faellt sie weg - massgeblich sind
+#                      das Internal VERSION und "get <name> version".
+#                      Dazu t/cref.py: prueft die Set-/Get-Liste aus dem Quelltext gegen
+#                      die commandref-Anker, in beide Richtungen. Vorlage fuer die
+#                      Ankerform war 98_PoolControl.pm aus dem Repo FHEM-Pool, das
+#                      dieselbe Konvention benutzt.
+#
 # 1.0.66 - 2026-08-23  Doku: Anker fuer jeden Set- und Get-Befehl in der commandref.
 #                      FHEMWEB blendet zu einem im Dropdown gewaehlten Befehl den
 #                      passenden Absatz ein, wenn dort <a id="<TYPE>-set-<befehl>">
@@ -598,7 +607,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.66';
+    $hash->{VERSION}    = '1.0.67';
 
     my $name = $a[0];
 
@@ -6080,7 +6089,10 @@ sub Gartenbewaesserung_UpdateNotifyDev {
 <h3>Gartenbewaesserung</h3>
 <ul>
     <p>FHEM Modul für intelligente Gartenbewässerung mit bis zu 8 Ventilen, Regenwasserfass und IBC-Container.</p>
-    <p><b>Version: 1.0.28</b></p>
+    <p>Die laufende Version steht im Internal <code>VERSION</code> und unter
+    <code>get &lt;name&gt; version</code>. Hier stand sie frueher fest verdrahtet und
+    war zuletzt 38 Versionen alt - eine Zahl, die nicht mitwaechst, ist schlimmer
+    als keine.</p>
 
     <h4>Features</h4>
     <ul>
