@@ -11,6 +11,17 @@
 #
 ##############################################################################
 #
+# 1.0.72 - 2026-08-23  Doku: wann wateringPauseInterval ueberhaupt gebraucht wird.
+#                      Der einzige Zweck ist, die Pumpe abzuschalten, BEVOR das Fass
+#                      leerlaeuft. Schuetzt sich die Pumpe selbst (Tauchpumpe mit
+#                      Schwimmer, oder ein echter Leer-Kontakt als
+#                      barrelEmptySensorDevice), gehoert das Attribut auf 0 - dann
+#                      uebernimmt barrelEmpty, und Giesszeit geht dabei nicht verloren,
+#                      weil die Restminuten gesichert und fortgesetzt werden.
+#                      Dazu der Hinweis, dass ein fester Wert grob wird, sobald sich die
+#                      Kreise im Durchfluss unterscheiden: er muss auf den durstigsten
+#                      passen und unterbricht alle anderen zu frueh.
+#
 # 1.0.71 - 2026-08-23  Fix: Abpumpen ins IBC entwertet den Lauf fuer die Giessraten.
 #                      drawTainted markierte bisher nur Wasser, das DAZUKOMMT. Die
 #                      Pumpe Fass->IBC ist der einzige Weg, auf dem Wasser ANDERS
@@ -665,7 +676,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.71';
+    $hash->{VERSION}    = '1.0.72';
 
     my $name = $a[0];
 
@@ -6512,7 +6523,20 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Gezählt wird <b>Gießzeit</b>: jedes Nachfüllen des Fasses – auch das nach
             <code>barrelEmpty</code> – setzt die Uhr zurück. Steht beim Fälligwerden einer
             Pause <code>barrelFull</code> auf <code>yes</code>, entfällt sie ganz und der
-            Kreis läuft weiter: eine Pause ist ein Mittel zum Nachfüllen, kein Selbstzweck.
+            Kreis läuft weiter: eine Pause ist ein Mittel zum Nachfüllen, kein Selbstzweck.<br>
+            <b>Wann man das überhaupt braucht.</b> Der einzige Zweck ist, die Pumpe
+            abzuschalten, <i>bevor</i> das Fass leerläuft. Schützt sich die Pumpe selbst –
+            Tauchpumpe mit Schwimmerschalter, oder ein echter Leer-Kontakt als
+            <code>barrelEmptySensorDevice</code> – dann gehört dieses Attribut auf
+            <b>0</b>. Läuft das Fass dann mitten im Kreis leer, übernimmt
+            <code>barrelEmpty</code>: nachfüllen, weitermachen. Gießzeit geht dabei nicht
+            verloren, die Restminuten des Ventils werden gesichert und nach dem Nachfüllen
+            fortgesetzt.<br>
+            Ein fester Wert ist ohnehin grob, sobald sich die Kreise im Durchfluss
+            unterscheiden: er muss auf den durstigsten passen und unterbricht alle anderen
+            zu früh. In der Anlage des Autors reichen 148 l bei Kreis 1 (18,5 l/min) genau
+            8 Minuten, bei Kreis 3 (7,1 l/min) dagegen 21 – eine Pause nach 8 Minuten
+            unterbräche dort ein Fass, das noch zu zwei Dritteln voll ist.
         </li>
         <li><a id="Gartenbewaesserung-attr-wateringPauseDuration"></a>
             <b>wateringPauseDuration</b><br>
