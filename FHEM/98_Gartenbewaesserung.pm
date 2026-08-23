@@ -11,6 +11,18 @@
 #
 ##############################################################################
 #
+# 1.0.73 - 2026-08-23  Fix: MainsFillTick verlor je Minute den Nachkommaanteil.
+#                      Der Ticker addierte je Takt "rate * 60 s" und rueckte seinen
+#                      Startpunkt vor. SetBarrelLevel speichert aber ganze Liter, und
+#                      AdjustBarrelLevel rechnet vom GERUNDETEN Reading weiter - bei
+#                      4,4 l/min gingen damit jede Minute 0,4 l verloren. Im Log gut zu
+#                      sehen: der Pegel stieg in exakten 4er-Schritten (36, 40, 44 ...)
+#                      statt 4,4. Folge: das Fass galt rund zwei Minuten zu spaet als
+#                      voll, jeder mainsFillIbc-Zyklus dauerte entsprechend laenger.
+#                      Jetzt wird gegen einen Anker gerechnet (Zeitpunkt + Pegel beim
+#                      Start), der Rundungsfehler haeuft sich also nicht mehr an,
+#                      sondern bleibt bei hoechstens einem halben Liter.
+#
 # 1.0.72 - 2026-08-23  Doku: wann wateringPauseInterval ueberhaupt gebraucht wird.
 #                      Der einzige Zweck ist, die Pumpe abzuschalten, BEVOR das Fass
 #                      leerlaeuft. Schuetzt sich die Pumpe selbst (Tauchpumpe mit
@@ -676,7 +688,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.72';
+    $hash->{VERSION}    = '1.0.73';
 
     my $name = $a[0];
 
@@ -4730,7 +4742,7 @@ sub Gartenbewaesserung_MainsFillTick {
 
     my $rate = AttrVal($name, "mainsFillFlow_lpm", 0);
     if($rate <= 0) {
-        delete $hash->{HELPER}{mainsFillSince};
+        delete $hash->{HELPER}{mainsFillAnchor};
         Gartenbewaesserung_ApplyBarrelFloatFloor($hash);
         return;
     }
@@ -4739,7 +4751,7 @@ sub Gartenbewaesserung_MainsFillTick {
     return if($capacity <= 0);
 
     if(Gartenbewaesserung_MainsSupplyState($hash) ne "on") {
-        delete $hash->{HELPER}{mainsFillSince};
+        delete $hash->{HELPER}{mainsFillAnchor};
         return;
     }
 
@@ -4748,7 +4760,7 @@ sub Gartenbewaesserung_MainsFillTick {
     if($hash->{HELPER}{watering}   || $hash->{HELPER}{circuitMode}
     || $hash->{HELPER}{ibcFilling} || $hash->{HELPER}{ibcToBarrelActive}
     || $hash->{HELPER}{barrelFilling} || $hash->{HELPER}{pauseActive}) {
-        delete $hash->{HELPER}{mainsFillSince};
+        delete $hash->{HELPER}{mainsFillAnchor};
         return;
     }
 
@@ -4756,17 +4768,29 @@ sub Gartenbewaesserung_MainsFillTick {
     my $cap = ($float > 0 && $float < $capacity) ? $float : $capacity;
 
     my $now = int(time());
-    my $since = $hash->{HELPER}{mainsFillSince};
-    $hash->{HELPER}{mainsFillSince} = $now;
-    # Erster Durchlauf: nur den Startpunkt merken. Kostet die angefangene
-    # Minute, ist aber ehrlicher, als eine unbekannte Vorlaufzeit gutzuschreiben.
-    return if(!$since || $now <= $since);
-
     my $level = ReadingsVal($name, "barrelLevel_l", "");
-    return if($level !~ /^-?\d+(?:\.\d+)?$/ || $level >= $cap);
+    return if($level !~ /^-?\d+(?:\.\d+)?$/);
 
-    my $add = $rate * ($now - $since) / 60;
-    $add = $cap - $level if($level + $add > $cap);
+    # Anker statt Schrittweite. Frueher wurde je Takt "rate * 60 s" addiert und
+    # der Startpunkt vorgerueckt - aber SetBarrelLevel speichert ganze Liter, und
+    # AdjustBarrelLevel rechnet vom GERUNDETEN Reading weiter. Bei 4,4 l/min ging
+    # damit jede Minute 0,4 l verloren: der Pegel stieg sichtbar in 4er-Schritten
+    # statt 4,4, und das Fass galt rund zwei Minuten zu spaet als voll.
+    # Jetzt wird gegen den Anker gerechnet, der Rundungsfehler haeuft sich also
+    # nicht mehr an, sondern bleibt bei hoechstens einem halben Liter.
+    # Erster Durchlauf: nur den Anker setzen. Kostet die angefangene Minute, ist
+    # aber ehrlicher, als eine unbekannte Vorlaufzeit gutzuschreiben - wann der
+    # Hahn wirklich aufging, weiss das Modul nicht.
+    my $anchor = $hash->{HELPER}{mainsFillAnchor};
+    if(!defined($anchor) || ref($anchor) ne "HASH") {
+        $hash->{HELPER}{mainsFillAnchor} = { t => $now, l => $level };
+        return;
+    }
+    return if($now <= $anchor->{t} || $level >= $cap);
+
+    my $soll = $anchor->{l} + $rate * ($now - $anchor->{t}) / 60;
+    $soll = $cap if($soll > $cap);
+    my $add = $soll - $level;
     return if($add <= 0);
 
     Gartenbewaesserung_AdjustBarrelLevel($hash, $add, "mains supply");
