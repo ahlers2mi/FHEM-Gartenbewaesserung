@@ -159,9 +159,15 @@ scenario("E  Stadtwasser hebt den Fuellstand, gedeckelt auf barrelFloatLevel (v1
 {
     my $h = build(mains => "on");
     Gartenbewaesserung_SetBarrelLevel($h, 0, "test", 1);
-    main::advance(10 * 60);                         # 10 min x 4,4 l/min = 44 l
-    my $l = rd("barrelLevel_l");
-    ok_true($l >= 35 && $l <= 50, "nach 10 min etwa 44 l (ist: $l)");
+    main::advance(60);                              # erster Takt setzt nur den Anker
+    main::advance(5 * 60);
+    my $a = rd("barrelLevel_l");
+    main::advance(10 * 60);
+    my $b = rd("barrelLevel_l");
+    # Steigung statt Absolutwert: der Rundungsfehler haeufte sich frueher an und
+    # machte aus 4,4 l/min sichtbare 4,0. Zehn Minuten muessen 44 l bringen.
+    ok_true(($b - $a) >= 43 && ($b - $a) <= 45,
+            "10 weitere Minuten bringen 44 l, nicht 40 (ist: " . ($b - $a) . ")");
     main::advance(60 * 60);
     is(rd("barrelLevel_l"), 81, "gedeckelt auf die Schwimmerhoehe");
 }
