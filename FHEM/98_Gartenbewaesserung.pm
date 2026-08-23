@@ -11,6 +11,21 @@
 #
 ##############################################################################
 #
+# 1.0.71 - 2026-08-23  Fix: Abpumpen ins IBC entwertet den Lauf fuer die Giessraten.
+#                      drawTainted markierte bisher nur Wasser, das DAZUKOMMT. Die
+#                      Pumpe Fass->IBC ist der einzige Weg, auf dem Wasser ANDERS
+#                      abgeht als durch ein Ventil - und LearnWateringFlow rechnet
+#                      stur das ganze Fassvolumen der Ventilzeit zu.
+#                      Am 23.08.: Kreis 3 lief 11 min und verbrauchte 78 l, danach
+#                      hob die Pumpe die restlichen 70 l in den IBC. Gelernt wurden
+#                      148/11 = 13,5 l/min statt der tatsaechlichen 7,1 - Faktor
+#                      knapp zwei daneben, und der falsche Wert stand danach im
+#                      Reading.
+#                      Jetzt wird aus so einem Lauf gar nichts gelernt statt etwas
+#                      Falsches. Die Foerderrate der Pumpe bleibt unberuehrt:
+#                      RecordIbcFillRun lernt ueber $complete (voll -> leer, ohne
+#                      Stadtwasser) und liest drawTainted nirgends.
+#
 # 1.0.70 - 2026-08-23  Fix: drei von vier Wegen IBC->Fass wurden nie abgerechnet.
 #                      Nur die Giess-Pause rief Start UND Stop. Es fehlten:
 #                      NoteIbcToBarrelStart in StartIBCtoBarrel (beide Zweige) und in
@@ -650,7 +665,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.70';
+    $hash->{VERSION}    = '1.0.71';
 
     my $name = $a[0];
 
@@ -4496,6 +4511,18 @@ sub Gartenbewaesserung_StartIBCFill {
     # Mark as filling immediately so StopIBCFill can always tear both devices
     # down - even if the fill is stopped during the pump/valve delay window.
     $hash->{HELPER}{ibcFilling} = 1;
+
+    # Ab hier taugt der Lauf nicht mehr zum Lernen einer GIESSRATE. drawTainted
+    # markierte bisher nur Wasser, das DAZUKOMMT (Regen, IBC, Stadtwasser). Die
+    # Pumpe ist der einzige Weg, auf dem Wasser ANDERS ABGEHT als durch ein
+    # Ventil - und LearnWateringFlow rechnet blind das ganze Fassvolumen der
+    # Ventilzeit zu. Am 23.08. lief Kreis 3 elf Minuten (78 l), danach hob die
+    # Pumpe die restlichen 70 l in den IBC; gelernt wurden 148/11 = 13,5 l/min
+    # statt der tatsaechlichen 7,1.
+    # Die Foerderrate der Pumpe selbst ist davon nicht betroffen: die lernt
+    # RecordIbcFillRun ueber $complete (voll -> leer, ohne Stadtwasser) und
+    # sieht drawTainted gar nicht an.
+    $hash->{HELPER}{drawTainted} = 1;
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "ibcFilling", "yes");
     readingsBulkUpdate($hash, "ibcFillStarted", TimeNow());

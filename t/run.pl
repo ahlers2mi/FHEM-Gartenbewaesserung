@@ -265,6 +265,25 @@ scenario("L  Manueller Transfer in ein volles Fass: Waechter greift (v1.0.70)");
     is(relay("POWER5"), "OFF", "Waechter macht binnen 60 s zu");
 }
 
+scenario("M  Giessen, dann Rest abpumpen: keine falsche Giessrate (v1.0.71)");
+{
+    # wie am 23.08.: Pausenintervall aus, Kreis laeuft in einem Stueck durch
+    my $h = build(attr => { wateringPauseInterval => 0 });
+    sens("barrelFull", "yes");                        # Anker, Taint geloescht
+    Gartenbewaesserung_StartCircuit($h, 3);
+    main::advance(11 * 60 + 30);                      # valve3Duration + Luft
+    is(rd("currentValve"), "none", "Kreis 3 fertig");
+    my $vorher = rd("valve3Flow_lpm");
+
+    Gartenbewaesserung_StartIBCFill($h, 1);           # Rest hochpumpen
+    main::advance(120);
+    sens("barrelEmpty", "yes");                       # Pumpe macht das Fass leer
+
+    is(rd("valve3Flow_lpm"), $vorher, "valve3Flow_lpm unveraendert, nichts Falsches gelernt");
+    ok_true(rd("wateringFlow_lpm") eq "(fehlt)", "auch keine Sammelrate erfunden");
+    ok_true(rd("lastIbcFillVolume_l") ne "(fehlt)", "der Pumpenlauf wird trotzdem verbucht");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);

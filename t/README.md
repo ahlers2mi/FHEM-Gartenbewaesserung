@@ -60,6 +60,7 @@ Abgedeckt:
 | J | Förderrate nur als Attribut — Reading hat Vorrang, ohne beides 0 (v1.0.69) |
 | K | Manuelles `startIBCtoBarrel` wird abgerechnet (v1.0.70) |
 | L | Manueller Transfer in ein volles Fass — Wächter greift (v1.0.70) |
+| M | Gießen, dann Rest abpumpen — keine falsche Gießrate gelernt (v1.0.71) |
 
 ### Fallstricke beim Erweitern
 
