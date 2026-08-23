@@ -11,6 +11,26 @@
 #
 ##############################################################################
 #
+# 1.0.67 - 2026-08-23  Doku: veraltete Versionsangabe aus der commandref entfernt.
+#                      Dort stand fest verdrahtet "Version: 1.0.28", also 38 Versionen
+#                      zu alt. Statt sie zu pflegen faellt sie weg - massgeblich sind
+#                      das Internal VERSION und "get <name> version".
+#                      Dazu t/cref.py: prueft die Set-/Get-Liste aus dem Quelltext gegen
+#                      die commandref-Anker, in beide Richtungen. Vorlage fuer die
+#                      Ankerform war 98_PoolControl.pm aus dem Repo FHEM-Pool, das
+#                      dieselbe Konvention benutzt.
+#
+# 1.0.66 - 2026-08-23  Doku: Anker fuer jeden Set- und Get-Befehl in der commandref.
+#                      FHEMWEB blendet zu einem im Dropdown gewaehlten Befehl den
+#                      passenden Absatz ein, wenn dort <a id="<TYPE>-set-<befehl>">
+#                      steht. Die 64 Attribute hatten ihre Anker laengst
+#                      (<a id="Gartenbewaesserung-attr-...">), die 17 Set- und drei
+#                      Get-Befehle nicht - dort blieb das Hilfefeld leer.
+#                      Beim Setzen gegengeprueft: Set-Liste aus dem Quelltext gegen die
+#                      commandref. Keine Luecke in beide Richtungen, alle 17 sind
+#                      dokumentiert und es gibt keinen Eintrag ohne Befehl.
+#                      Reine Dokumentation, kein Verhalten geaendert.
+#
 # 1.0.65 - 2026-08-23  Fix: Endlosrekursion, wenn der Fuellstand unter
 #                      barrelFillThreshold liegt und kein barrelFillValveDevice
 #                      konfiguriert ist.
@@ -587,7 +607,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.65';
+    $hash->{VERSION}    = '1.0.67';
 
     my $name = $a[0];
 
@@ -6069,7 +6089,10 @@ sub Gartenbewaesserung_UpdateNotifyDev {
 <h3>Gartenbewaesserung</h3>
 <ul>
     <p>FHEM Modul für intelligente Gartenbewässerung mit bis zu 8 Ventilen, Regenwasserfass und IBC-Container.</p>
-    <p><b>Version: 1.0.28</b></p>
+    <p>Die laufende Version steht im Internal <code>VERSION</code> und unter
+    <code>get &lt;name&gt; version</code>. Hier stand sie frueher fest verdrahtet und
+    war zuletzt 38 Versionen alt - eine Zahl, die nicht mitwaechst, ist schlimmer
+    als keine.</p>
 
     <h4>Features</h4>
     <ul>
@@ -6126,11 +6149,11 @@ sub Gartenbewaesserung_UpdateNotifyDev {
     <a id="Gartenbewaesserung-set"></a>
     <h4>Set-Befehle</h4>
     <ul>
-        <li><b>start</b> - Startet den kompletten Bewässerungszyklus mit allen aktiven Ventilen</li>
-        <li><b>stop</b> - Stoppt sofort alle laufenden Operationen (Bewässerung, Pumpen, Ventile)</li>
-        <li><b>startCircuit &lt;1-8&gt;</b> - Startet einen einzelnen Bewässerungskreis (mit voller Logik: Fass-Check, Pumpe, Ventil, <b>automatischen Pausen</b>). Perfekt für externe Steuerung z.B. vom Gewächshaus</li>
-        <li><b>startIBCFill</b> - Startet manuelle IBC-Befüllung aus dem Fass (mit Pumpe)</li>
-        <li><b>mainsFillIbc &lt;liter&gt;|&lt;prozent&gt;%|stop</b> - Füllt den IBC aus der
+        <li><a id="Gartenbewaesserung-set-start"></a><b>start</b> - Startet den kompletten Bewässerungszyklus mit allen aktiven Ventilen</li>
+        <li><a id="Gartenbewaesserung-set-stop"></a><b>stop</b> - Stoppt sofort alle laufenden Operationen (Bewässerung, Pumpen, Ventile)</li>
+        <li><a id="Gartenbewaesserung-set-startCircuit"></a><b>startCircuit &lt;1-8&gt;</b> - Startet einen einzelnen Bewässerungskreis (mit voller Logik: Fass-Check, Pumpe, Ventil, <b>automatischen Pausen</b>). Perfekt für externe Steuerung z.B. vom Gewächshaus</li>
+        <li><a id="Gartenbewaesserung-set-startIBCFill"></a><b>startIBCFill</b> - Startet manuelle IBC-Befüllung aus dem Fass (mit Pumpe)</li>
+        <li><a id="Gartenbewaesserung-set-mainsFillIbc"></a><b>mainsFillIbc &lt;liter&gt;|&lt;prozent&gt;%|stop</b> - Füllt den IBC aus der
             <b>Hauswasserleitung</b>, bis die angegebene Menge drin ist.<br>
             Das Fass ist dabei der Trichter: das Schwimmerventil lässt Leitungswasser bis
             <code>barrelFloatLevel</code> nach, die Pumpe hebt es in den IBC, das Ventil macht
@@ -6150,14 +6173,14 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Beispiele: <code>set bewaesserung mainsFillIbc 600</code>,
             <code>set bewaesserung mainsFillIbc 50%</code>,
             <code>set bewaesserung mainsFillIbc stop</code></li>
-        <li><b>stopIBCFill</b> - Stoppt IBC-Befüllung</li>
-        <li><b>startIBCtoBarrel</b> - Lässt Wasser vom IBC zurück ins Fass laufen (Schwerkraft oder Pumpe)</li>
-        <li><b>stopIBCtoBarrel</b> - Stoppt IBC zu Fass Transfer</li>
-        <li><b>startValve &lt;1-8&gt;</b> - Startet ein einzelnes Ventil manuell (ohne Automatik)</li>
-        <li><b>stopValve</b> - Stoppt das aktuell laufende Ventil</li>
-        <li><b>resetPumpOverrunAlert</b> - Setzt das Reading <code>pumpOverrunAlert</code> manuell auf <code>no</code> zurück</li>
-        <li><b>resetHarvestStats</b> - Setzt die Ertrags- und Fördermengen-Summen zurück</li>
-        <li><b>waterSource rain|other</b> - Sagt dem Modul, dass gerade Wasser im Fass steht, das
+        <li><a id="Gartenbewaesserung-set-stopIBCFill"></a><b>stopIBCFill</b> - Stoppt IBC-Befüllung</li>
+        <li><a id="Gartenbewaesserung-set-startIBCtoBarrel"></a><b>startIBCtoBarrel</b> - Lässt Wasser vom IBC zurück ins Fass laufen (Schwerkraft oder Pumpe)</li>
+        <li><a id="Gartenbewaesserung-set-stopIBCtoBarrel"></a><b>stopIBCtoBarrel</b> - Stoppt IBC zu Fass Transfer</li>
+        <li><a id="Gartenbewaesserung-set-startValve"></a><b>startValve &lt;1-8&gt;</b> - Startet ein einzelnes Ventil manuell (ohne Automatik)</li>
+        <li><a id="Gartenbewaesserung-set-stopValve"></a><b>stopValve</b> - Stoppt das aktuell laufende Ventil</li>
+        <li><a id="Gartenbewaesserung-set-resetPumpOverrunAlert"></a><b>resetPumpOverrunAlert</b> - Setzt das Reading <code>pumpOverrunAlert</code> manuell auf <code>no</code> zurück</li>
+        <li><a id="Gartenbewaesserung-set-resetHarvestStats"></a><b>resetHarvestStats</b> - Setzt die Ertrags- und Fördermengen-Summen zurück</li>
+        <li><a id="Gartenbewaesserung-set-waterSource"></a><b>waterSource rain|other</b> - Sagt dem Modul, dass gerade Wasser im Fass steht, das
         <b>nicht vom Dach</b> kommt – Poolwasser abgelassen, eine andere Tonne umgefüllt, was auch
         immer. Solange <code>other</code> gilt: die Ernte startet allein bei vollem Fass (ohne auf
         Regen zu warten – sonst bliebe das Wasser stehen), das geförderte Volumen zählt in
@@ -6170,18 +6193,18 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         auszuschalten, nicht einzuschalten.<br>
         Den Füllstand zieht man bei Bedarf mit <code>set &lt;name&gt; barrelLevel</code> nach; nötig
         ist es nicht, der nächste Kontakt verankert ihn ohnehin.</li>
-        <li><b>ibcLevel &lt;liter&gt;</b> bzw. <b>ibcLevel &lt;prozent&gt;%</b> - Verankert die Füllstandsschätzung des IBC auf einem abgelesenen Wert. Das ist der genaueste Eingriff, den es gibt: die Schätzung rechnet ab hier neu weiter und die bis dahin aufgelaufene Drift ist weg. Ohne Prozentzeichen wird die Zahl als Liter verstanden. Setzt <code>ibcUsableVolume</code> voraus.</li>
-        <li><b>barrelLevel &lt;liter&gt;</b> bzw. <b>barrelLevel &lt;prozent&gt;%</b> - Dasselbe für das Fass. Das Fass verankert sich normalerweise mehrmals täglich von selbst an <code>barrelFull</code> oder <code>barrelEmpty</code>; dieser Befehl ist für den Anfang, solange noch kein Kontakt gemeldet hat. Setzt <code>barrelUsableVolume</code> voraus.</li>
-        <li><b>refreshSensors</b> - Liest alle konfigurierten Sensor-Readings sofort neu ein und aktualisiert die Readings (z. B. nach Neustart oder Gerätetausch)</li>
-        <li><b>validate</b> - Prüft die komplette Konfiguration und zeigt Fehler, Warnungen und Infos an</li>
+        <li><a id="Gartenbewaesserung-set-ibcLevel"></a><b>ibcLevel &lt;liter&gt;</b> bzw. <b>ibcLevel &lt;prozent&gt;%</b> - Verankert die Füllstandsschätzung des IBC auf einem abgelesenen Wert. Das ist der genaueste Eingriff, den es gibt: die Schätzung rechnet ab hier neu weiter und die bis dahin aufgelaufene Drift ist weg. Ohne Prozentzeichen wird die Zahl als Liter verstanden. Setzt <code>ibcUsableVolume</code> voraus.</li>
+        <li><a id="Gartenbewaesserung-set-barrelLevel"></a><b>barrelLevel &lt;liter&gt;</b> bzw. <b>barrelLevel &lt;prozent&gt;%</b> - Dasselbe für das Fass. Das Fass verankert sich normalerweise mehrmals täglich von selbst an <code>barrelFull</code> oder <code>barrelEmpty</code>; dieser Befehl ist für den Anfang, solange noch kein Kontakt gemeldet hat. Setzt <code>barrelUsableVolume</code> voraus.</li>
+        <li><a id="Gartenbewaesserung-set-refreshSensors"></a><b>refreshSensors</b> - Liest alle konfigurierten Sensor-Readings sofort neu ein und aktualisiert die Readings (z. B. nach Neustart oder Gerätetausch)</li>
+        <li><a id="Gartenbewaesserung-set-validate"></a><b>validate</b> - Prüft die komplette Konfiguration und zeigt Fehler, Warnungen und Infos an</li>
     </ul>
 
     <a id="Gartenbewaesserung-get"></a>
     <h4>Get-Befehle</h4>
     <ul>
-        <li><b>status</b> - Zeigt den aktuellen Status aller Komponenten</li>
-        <li><b>config</b> - Zeigt die komplette Konfiguration übersichtlich an</li>
-        <li><b>version</b> - Zeigt die Modulversion an</li>
+        <li><a id="Gartenbewaesserung-get-status"></a><b>status</b> - Zeigt den aktuellen Status aller Komponenten</li>
+        <li><a id="Gartenbewaesserung-get-config"></a><b>config</b> - Zeigt die komplette Konfiguration übersichtlich an</li>
+        <li><a id="Gartenbewaesserung-get-version"></a><b>version</b> - Zeigt die Modulversion an</li>
     </ul>
 
     <a id="Gartenbewaesserung-attr"></a>
