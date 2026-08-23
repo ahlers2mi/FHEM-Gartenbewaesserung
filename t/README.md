@@ -55,6 +55,8 @@ Abgedeckt:
 | E | Stadtwasser hebt den Füllstand, gedeckelt auf `barrelFloatLevel` (v1.0.63) |
 | F | `mainsFillIbc` dreht Runden bis zum Ziel (v1.0.64) |
 | G | Offenes Ventil wird vor dem Lernen abgerechnet (v1.0.62) |
+| H | Neustart mitten im Pumpen — verwaiste Aktoren werden abgeschaltet (v1.0.68) |
+| I | Ohne Waisen passiert nichts (Gegenprobe zu H) |
 
 ### Fallstricke beim Erweitern
 
