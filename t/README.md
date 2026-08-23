@@ -57,6 +57,7 @@ Abgedeckt:
 | G | Offenes Ventil wird vor dem Lernen abgerechnet (v1.0.62) |
 | H | Neustart mitten im Pumpen — verwaiste Aktoren werden abgeschaltet (v1.0.68) |
 | I | Ohne Waisen passiert nichts (Gegenprobe zu H) |
+| J | Förderrate nur als Attribut — Reading hat Vorrang, ohne beides 0 (v1.0.69) |
 
 ### Fallstricke beim Erweitern
 

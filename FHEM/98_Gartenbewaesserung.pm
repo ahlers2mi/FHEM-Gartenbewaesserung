@@ -11,6 +11,17 @@
 #
 ##############################################################################
 #
+# 1.0.69 - 2026-08-23  Fix: Foerderraten fallen auf das gleichnamige Attribut zurueck.
+#                      ibcFillFlow_lpm und ibcToBarrelFlow_lpm wurden nur als Reading
+#                      gelesen. Gelernt werden sie aber nur aus vollstaendigen Laeufen,
+#                      und ein Statefile-Rueckfall kostet sie wieder - am 23.08. war
+#                      ibcToBarrelFlow_lpm schlicht weg. Folge: das Modul rechnet die
+#                      Fuellstaende waehrend eines Transports nicht mit, und die
+#                      watertank-Kachel steht still, obwohl das Rohr leuchtet.
+#                      Neu FlowRate(): Reading zuerst, dann Attribut - dieselbe
+#                      Reihenfolge wie bei wateringFlow_lpm und valve<N>Flow_lpm, die
+#                      das laengst so machen. Beide Namen sind jetzt in der AttrList.
+#
 # 1.0.68 - 2026-08-23  Fix: nach einem Neustart liefen Pumpe und Ventil weiter, ohne
 #                      dass noch jemand zusieht.
 #                      HELPER ist Arbeitsspeicher - nach dem Neustart weiss das Modul
@@ -596,6 +607,7 @@ sub Gartenbewaesserung_Initialize {
         "roofArea:textField " .
         "barrelUsableVolume:textField barrelFloatLevel:textField " .
         "wateringFlow_lpm:textField " .
+        "ibcFillFlow_lpm:textField ibcToBarrelFlow_lpm:textField " .
         "ibcUsableVolume:textField ibcFullFromLevel:0,1 " .
         "mainsSupplyDevice:textField mainsFillFlow_lpm:textField " .
         "mainsSupplyActiveValue:textField mainsSupplyInactiveValue:textField " .
@@ -626,7 +638,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.68';
+    $hash->{VERSION}    = '1.0.69';
 
     my $name = $a[0];
 
@@ -4662,7 +4674,6 @@ sub Gartenbewaesserung_MainsFillTick {
     my $name = $hash->{NAME};
 
     my $rate = AttrVal($name, "mainsFillFlow_lpm", 0);
-    $rate = 0 if($rate !~ /^\d+(?:\.\d+)?$/);
     if($rate <= 0) {
         delete $hash->{HELPER}{mainsFillSince};
         Gartenbewaesserung_ApplyBarrelFloatFloor($hash);
@@ -4706,6 +4717,25 @@ sub Gartenbewaesserung_MainsFillTick {
     Gartenbewaesserung_AdjustBarrelLevel($hash, $add, "mains supply");
     # Dieses Wasser kam nicht vom Dach - eine daraus gelernte Giessrate waere falsch.
     $hash->{HELPER}{drawTainted} = 1;
+}
+
+# Foerderrate holen: gelerntes Reading zuerst, dann das gleichnamige Attribut.
+#
+# Gelernt wird nur aus vollstaendigen Laeufen, und Readings ueberleben einen
+# harten Abschuss nicht immer - am 23.08.2026 war ibcToBarrelFlow_lpm nach zwei
+# Statefile-Rueckfaellen schlicht weg. Ohne Rate rechnet das Modul die
+# Fuellstaende nicht mit und die watertank-Kachel steht still, obwohl das Rohr
+# leuchtet. Das Attribut ist der Boden darunter: einmal gesetzt, bleibt es.
+# Dieselbe Reihenfolge wie bei wateringFlow_lpm und valve<N>Flow_lpm.
+sub Gartenbewaesserung_FlowRate {
+    my ($hash, $which) = @_;
+    my $name = $hash->{NAME};
+
+    foreach my $v (ReadingsVal($name, $which, 0), AttrVal($name, $which, 0)) {
+        next if($v !~ /^\d+(?:\.\d+)?$/ || $v <= 0);
+        return $v;
+    }
+    return 0;
 }
 
 sub Gartenbewaesserung_ApplyBarrelFloatFloor {
@@ -4880,8 +4910,7 @@ sub Gartenbewaesserung_ArmIbcFullByLevel {
 
     my $capacity = AttrVal($name, "ibcUsableVolume", 0);
     my $level    = ReadingsVal($name, "ibcLevel_l", "");
-    my $rate     = ReadingsVal($name, "ibcFillFlow_lpm", 0);
-    $rate = 0 if($rate !~ /^\d+(?:\.\d+)?$/);
+    my $rate     = Gartenbewaesserung_FlowRate($hash, "ibcFillFlow_lpm");
     return if($capacity <= 0 || $rate <= 0 || $level !~ /^-?\d+(?:\.\d+)?$/);
 
     my $headroom = $capacity - $level;
@@ -4945,7 +4974,7 @@ sub Gartenbewaesserung_NoteIbcToBarrelStop {
     # exactly barrelUsableVolume - the same trick that measures the pump, applied
     # to the gravity side.
     my $volume = AttrVal($name, "barrelUsableVolume", 0);
-    my $rate   = ReadingsVal($name, "ibcToBarrelFlow_lpm", 0);
+    my $rate   = Gartenbewaesserung_FlowRate($hash, "ibcToBarrelFlow_lpm");
     $rate = 0 if($rate !~ /^\d+(?:\.\d+)?$/);
 
     my $moved = 0;
@@ -5025,7 +5054,7 @@ sub Gartenbewaesserung_RecordIbcFillRun {
 
     my $volume = AttrVal($name, "barrelUsableVolume", 0);
     my $float  = AttrVal($name, "barrelFloatLevel", 0);
-    my $rate   = ReadingsVal($name, "ibcFillFlow_lpm", 0);
+    my $rate   = Gartenbewaesserung_FlowRate($hash, "ibcFillFlow_lpm");
     $rate = 0 if($rate !~ /^\d+(?:\.\d+)?$/);
 
     # A run from a full barrel down to empty moved a known volume - but only
@@ -6586,6 +6615,17 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             von außen, ebenso wie <code>set &lt;name&gt; ibcLevel</code>.<br>
             Voraussetzungen: <code>ibcUsableVolume</code>, ein gesetzter Anker und eine gelernte
             Förderrate. Fehlt eines davon, passiert nichts.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-ibcFillFlow_lpm"></a>
+            <b>ibcFillFlow_lpm</b> / <b>ibcToBarrelFlow_lpm</b><br>
+            Typ: Text (Liter pro Minute). Ohne Angabe: nur der gelernte Wert.<br>
+            Rückfallebene für die beiden Förderraten – Pumpe Fass→IBC und Schwerkraft
+            IBC→Fass. Gelesen wird zuerst das gleichnamige <b>Reading</b>, das das Modul
+            aus vollständigen Läufen lernt; erst wenn das fehlt, greift dieses Attribut.<br>
+            Nötig, weil gelernt nur aus vollständigen Läufen wird (Fass voll → leer bzw.
+            leer → voll) und ein Statefile-Rückfall das Reading wieder kosten kann. Ohne
+            Rate rechnet das Modul die Füllstände während eines Transports nicht mit, und
+            die <code>watertank</code>-Kachel steht still, obwohl das Rohr leuchtet.
         </li>
         <li><a id="Gartenbewaesserung-attr-wateringFlow_lpm"></a>
             <b>wateringFlow_lpm</b><br>

@@ -219,6 +219,24 @@ scenario("I  Ohne Waisen passiert nichts");
     is(rd("orphanShutdown"), "(fehlt)", "kein orphanShutdown ohne Anlass");
 }
 
+scenario("J  Foerderrate nur als ATTRIBUT gesetzt, Reading fehlt (v1.0.69)");
+{
+    my $h = build(attr => { ibcToBarrelFlow_lpm => 12.2 });
+    # bewusst KEIN Reading setzen - genau die Lage vom 23.08.
+    main::readingsSingleUpdate($h, "ibcToBarrelFlow_lpm", "", 0);
+    delete $h->{READINGS}{ibcToBarrelFlow_lpm};
+    is(Gartenbewaesserung_FlowRate($h, "ibcToBarrelFlow_lpm"), 12.2, "Attribut greift");
+
+    # und das Reading schlaegt das Attribut, wenn es da ist
+    main::readingsSingleUpdate($h, "ibcToBarrelFlow_lpm", 14.3, 0);
+    is(Gartenbewaesserung_FlowRate($h, "ibcToBarrelFlow_lpm"), 14.3, "Reading hat Vorrang");
+
+    # Achtung: der Standardaufbau SETZT das Attribut - fuer diesen Fall leeren.
+    my $leer = build(attr => { ibcToBarrelFlow_lpm => "" });
+    delete $leer->{READINGS}{ibcToBarrelFlow_lpm};
+    is(Gartenbewaesserung_FlowRate($leer, "ibcToBarrelFlow_lpm"), 0, "ohne beides: 0, nichts erfunden");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);
