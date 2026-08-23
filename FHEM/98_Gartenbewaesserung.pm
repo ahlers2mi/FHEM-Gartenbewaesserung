@@ -11,6 +11,55 @@
 #
 ##############################################################################
 #
+# 1.0.72 - 2026-08-23  Doku: wann wateringPauseInterval ueberhaupt gebraucht wird.
+#                      Der einzige Zweck ist, die Pumpe abzuschalten, BEVOR das Fass
+#                      leerlaeuft. Schuetzt sich die Pumpe selbst (Tauchpumpe mit
+#                      Schwimmer, oder ein echter Leer-Kontakt als
+#                      barrelEmptySensorDevice), gehoert das Attribut auf 0 - dann
+#                      uebernimmt barrelEmpty, und Giesszeit geht dabei nicht verloren,
+#                      weil die Restminuten gesichert und fortgesetzt werden.
+#                      Dazu der Hinweis, dass ein fester Wert grob wird, sobald sich die
+#                      Kreise im Durchfluss unterscheiden: er muss auf den durstigsten
+#                      passen und unterbricht alle anderen zu frueh.
+#
+# 1.0.71 - 2026-08-23  Fix: Abpumpen ins IBC entwertet den Lauf fuer die Giessraten.
+#                      drawTainted markierte bisher nur Wasser, das DAZUKOMMT. Die
+#                      Pumpe Fass->IBC ist der einzige Weg, auf dem Wasser ANDERS
+#                      abgeht als durch ein Ventil - und LearnWateringFlow rechnet
+#                      stur das ganze Fassvolumen der Ventilzeit zu.
+#                      Am 23.08.: Kreis 3 lief 11 min und verbrauchte 78 l, danach
+#                      hob die Pumpe die restlichen 70 l in den IBC. Gelernt wurden
+#                      148/11 = 13,5 l/min statt der tatsaechlichen 7,1 - Faktor
+#                      knapp zwei daneben, und der falsche Wert stand danach im
+#                      Reading.
+#                      Jetzt wird aus so einem Lauf gar nichts gelernt statt etwas
+#                      Falsches. Die Foerderrate der Pumpe bleibt unberuehrt:
+#                      RecordIbcFillRun lernt ueber $complete (voll -> leer, ohne
+#                      Stadtwasser) und liest drawTainted nirgends.
+#
+# 1.0.70 - 2026-08-23  Fix: drei von vier Wegen IBC->Fass wurden nie abgerechnet.
+#                      Nur die Giess-Pause rief Start UND Stop. Es fehlten:
+#                      NoteIbcToBarrelStart in StartIBCtoBarrel (beide Zweige) und in
+#                      HandleBarrelEmpty, NoteIbcToBarrelStop in EndCircuitPause.
+#                      Folge: kein lastIbcToBarrel*, keine Buchung auf ibcLevel_l und
+#                      barrelLevel_l, keine gelernte Schwerkraftrate - und der Waechter
+#                      aus v1.0.62 wurde nicht scharf, weil er in NoteIbcToBarrelStart
+#                      armiert wird. Am 23.08. lief ein manueller Transfer von 7 min
+#                      voellig unbemerkt: ibcLevel_l stand danach unveraendert auf 390.
+#                      Der Stop sitzt jetzt zentral in StopIBCtoBarrel, damit auch der
+#                      eigene Dauer-Timer und "set stopIBCtoBarrel" abrechnen.
+#
+# 1.0.69 - 2026-08-23  Fix: Foerderraten fallen auf das gleichnamige Attribut zurueck.
+#                      ibcFillFlow_lpm und ibcToBarrelFlow_lpm wurden nur als Reading
+#                      gelesen. Gelernt werden sie aber nur aus vollstaendigen Laeufen,
+#                      und ein Statefile-Rueckfall kostet sie wieder - am 23.08. war
+#                      ibcToBarrelFlow_lpm schlicht weg. Folge: das Modul rechnet die
+#                      Fuellstaende waehrend eines Transports nicht mit, und die
+#                      watertank-Kachel steht still, obwohl das Rohr leuchtet.
+#                      Neu FlowRate(): Reading zuerst, dann Attribut - dieselbe
+#                      Reihenfolge wie bei wateringFlow_lpm und valve<N>Flow_lpm, die
+#                      das laengst so machen. Beide Namen sind jetzt in der AttrList.
+#
 # 1.0.68 - 2026-08-23  Fix: nach einem Neustart liefen Pumpe und Ventil weiter, ohne
 #                      dass noch jemand zusieht.
 #                      HELPER ist Arbeitsspeicher - nach dem Neustart weiss das Modul
@@ -596,6 +645,7 @@ sub Gartenbewaesserung_Initialize {
         "roofArea:textField " .
         "barrelUsableVolume:textField barrelFloatLevel:textField " .
         "wateringFlow_lpm:textField " .
+        "ibcFillFlow_lpm:textField ibcToBarrelFlow_lpm:textField " .
         "ibcUsableVolume:textField ibcFullFromLevel:0,1 " .
         "mainsSupplyDevice:textField mainsFillFlow_lpm:textField " .
         "mainsSupplyActiveValue:textField mainsSupplyInactiveValue:textField " .
@@ -626,7 +676,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.68';
+    $hash->{VERSION}    = '1.0.72';
 
     my $name = $a[0];
 
@@ -2559,6 +2609,10 @@ sub Gartenbewaesserung_EndCircuitPause {
         }
     }
     elsif($pauseSource eq "ibc") {
+        # Fehlte hier, im Gegensatz zu EndWateringPause - deshalb wurde eine
+        # Kreis-Pause nie abgerechnet.
+        Gartenbewaesserung_NoteIbcToBarrelStop($hash, "pauseEnd");
+
         my $ibcToBarrelValve = AttrVal($name, "ibcToBarrelValveDevice", "");
         if($ibcToBarrelValve ne "") {
             Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "off");
@@ -4025,6 +4079,7 @@ sub Gartenbewaesserung_HandleBarrelEmpty {
             $hash->{HELPER}{barrelEmptyRefilling} = 1;
             $hash->{HELPER}{barrelEmptyRefillSource} = "ibc";
             $hash->{HELPER}{ibcToBarrelActive} = 1;
+            Gartenbewaesserung_NoteIbcToBarrelStart($hash);
 
             if($ibcToBarrelPump ne "") {
                 # Ordering follows pumpStartDelay (positive = pump first, negative/zero
@@ -4467,6 +4522,18 @@ sub Gartenbewaesserung_StartIBCFill {
     # Mark as filling immediately so StopIBCFill can always tear both devices
     # down - even if the fill is stopped during the pump/valve delay window.
     $hash->{HELPER}{ibcFilling} = 1;
+
+    # Ab hier taugt der Lauf nicht mehr zum Lernen einer GIESSRATE. drawTainted
+    # markierte bisher nur Wasser, das DAZUKOMMT (Regen, IBC, Stadtwasser). Die
+    # Pumpe ist der einzige Weg, auf dem Wasser ANDERS ABGEHT als durch ein
+    # Ventil - und LearnWateringFlow rechnet blind das ganze Fassvolumen der
+    # Ventilzeit zu. Am 23.08. lief Kreis 3 elf Minuten (78 l), danach hob die
+    # Pumpe die restlichen 70 l in den IBC; gelernt wurden 148/11 = 13,5 l/min
+    # statt der tatsaechlichen 7,1.
+    # Die Foerderrate der Pumpe selbst ist davon nicht betroffen: die lernt
+    # RecordIbcFillRun ueber $complete (voll -> leer, ohne Stadtwasser) und
+    # sieht drawTainted gar nicht an.
+    $hash->{HELPER}{drawTainted} = 1;
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "ibcFilling", "yes");
     readingsBulkUpdate($hash, "ibcFillStarted", TimeNow());
@@ -4662,7 +4729,6 @@ sub Gartenbewaesserung_MainsFillTick {
     my $name = $hash->{NAME};
 
     my $rate = AttrVal($name, "mainsFillFlow_lpm", 0);
-    $rate = 0 if($rate !~ /^\d+(?:\.\d+)?$/);
     if($rate <= 0) {
         delete $hash->{HELPER}{mainsFillSince};
         Gartenbewaesserung_ApplyBarrelFloatFloor($hash);
@@ -4706,6 +4772,25 @@ sub Gartenbewaesserung_MainsFillTick {
     Gartenbewaesserung_AdjustBarrelLevel($hash, $add, "mains supply");
     # Dieses Wasser kam nicht vom Dach - eine daraus gelernte Giessrate waere falsch.
     $hash->{HELPER}{drawTainted} = 1;
+}
+
+# Foerderrate holen: gelerntes Reading zuerst, dann das gleichnamige Attribut.
+#
+# Gelernt wird nur aus vollstaendigen Laeufen, und Readings ueberleben einen
+# harten Abschuss nicht immer - am 23.08.2026 war ibcToBarrelFlow_lpm nach zwei
+# Statefile-Rueckfaellen schlicht weg. Ohne Rate rechnet das Modul die
+# Fuellstaende nicht mit und die watertank-Kachel steht still, obwohl das Rohr
+# leuchtet. Das Attribut ist der Boden darunter: einmal gesetzt, bleibt es.
+# Dieselbe Reihenfolge wie bei wateringFlow_lpm und valve<N>Flow_lpm.
+sub Gartenbewaesserung_FlowRate {
+    my ($hash, $which) = @_;
+    my $name = $hash->{NAME};
+
+    foreach my $v (ReadingsVal($name, $which, 0), AttrVal($name, $which, 0)) {
+        next if($v !~ /^\d+(?:\.\d+)?$/ || $v <= 0);
+        return $v;
+    }
+    return 0;
 }
 
 sub Gartenbewaesserung_ApplyBarrelFloatFloor {
@@ -4880,8 +4965,7 @@ sub Gartenbewaesserung_ArmIbcFullByLevel {
 
     my $capacity = AttrVal($name, "ibcUsableVolume", 0);
     my $level    = ReadingsVal($name, "ibcLevel_l", "");
-    my $rate     = ReadingsVal($name, "ibcFillFlow_lpm", 0);
-    $rate = 0 if($rate !~ /^\d+(?:\.\d+)?$/);
+    my $rate     = Gartenbewaesserung_FlowRate($hash, "ibcFillFlow_lpm");
     return if($capacity <= 0 || $rate <= 0 || $level !~ /^-?\d+(?:\.\d+)?$/);
 
     my $headroom = $capacity - $level;
@@ -4945,7 +5029,7 @@ sub Gartenbewaesserung_NoteIbcToBarrelStop {
     # exactly barrelUsableVolume - the same trick that measures the pump, applied
     # to the gravity side.
     my $volume = AttrVal($name, "barrelUsableVolume", 0);
-    my $rate   = ReadingsVal($name, "ibcToBarrelFlow_lpm", 0);
+    my $rate   = Gartenbewaesserung_FlowRate($hash, "ibcToBarrelFlow_lpm");
     $rate = 0 if($rate !~ /^\d+(?:\.\d+)?$/);
 
     my $moved = 0;
@@ -5025,7 +5109,7 @@ sub Gartenbewaesserung_RecordIbcFillRun {
 
     my $volume = AttrVal($name, "barrelUsableVolume", 0);
     my $float  = AttrVal($name, "barrelFloatLevel", 0);
-    my $rate   = ReadingsVal($name, "ibcFillFlow_lpm", 0);
+    my $rate   = Gartenbewaesserung_FlowRate($hash, "ibcFillFlow_lpm");
     $rate = 0 if($rate !~ /^\d+(?:\.\d+)?$/);
 
     # A run from a full barrel down to empty moved a known volume - but only
@@ -5473,6 +5557,7 @@ sub Gartenbewaesserung_StartIBCtoBarrel {
 
         # Mark active up front so StopIBCtoBarrel can always tear both devices down
         $hash->{HELPER}{ibcToBarrelActive} = 1;
+        Gartenbewaesserung_NoteIbcToBarrelStart($hash);
         readingsBeginUpdate($hash);
         readingsBulkUpdate($hash, "ibcToBarrelActive", "yes");
         readingsBulkUpdate($hash, "state", "ibc to barrel");
@@ -5519,6 +5604,7 @@ sub Gartenbewaesserung_StartIBCtoBarrel {
         # Gravity feed - no pump needed
         Gartenbewaesserung_SwitchDevice($name, $ibcToBarrelValve, "on");
         $hash->{HELPER}{ibcToBarrelActive} = 1;
+        Gartenbewaesserung_NoteIbcToBarrelStart($hash);
 
         # Set end time
         Gartenbewaesserung_SetEndTime($hash, $duration);
@@ -5544,10 +5630,16 @@ sub Gartenbewaesserung_StartIBCtoBarrel {
 # Stop IBC to Barrel
 ##############################################################################
 sub Gartenbewaesserung_StopIBCtoBarrel {
-    my ($hash) = @_;
+    my ($hash, $reason) = @_;
     my $name = $hash->{NAME};
 
     return if(!$hash->{HELPER}{ibcToBarrelActive});
+
+    # Zentral hier, damit JEDER Weg abgerechnet wird - auch der manuelle
+    # "set startIBCtoBarrel" und der eigene Dauer-Timer. CheckBarrelFull ruft
+    # vorher schon mit dem besseren Grund "barrelFull"; der zweite Aufruf faellt
+    # dann durch, weil NoteIbcToBarrelStop den Startzeitpunkt geloescht hat.
+    Gartenbewaesserung_NoteIbcToBarrelStop($hash, $reason || "stopped");
 
     my $ibcToBarrelValve = AttrVal($name, "ibcToBarrelValveDevice", "");
     if($ibcToBarrelValve ne "") {
@@ -6431,7 +6523,20 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Gezählt wird <b>Gießzeit</b>: jedes Nachfüllen des Fasses – auch das nach
             <code>barrelEmpty</code> – setzt die Uhr zurück. Steht beim Fälligwerden einer
             Pause <code>barrelFull</code> auf <code>yes</code>, entfällt sie ganz und der
-            Kreis läuft weiter: eine Pause ist ein Mittel zum Nachfüllen, kein Selbstzweck.
+            Kreis läuft weiter: eine Pause ist ein Mittel zum Nachfüllen, kein Selbstzweck.<br>
+            <b>Wann man das überhaupt braucht.</b> Der einzige Zweck ist, die Pumpe
+            abzuschalten, <i>bevor</i> das Fass leerläuft. Schützt sich die Pumpe selbst –
+            Tauchpumpe mit Schwimmerschalter, oder ein echter Leer-Kontakt als
+            <code>barrelEmptySensorDevice</code> – dann gehört dieses Attribut auf
+            <b>0</b>. Läuft das Fass dann mitten im Kreis leer, übernimmt
+            <code>barrelEmpty</code>: nachfüllen, weitermachen. Gießzeit geht dabei nicht
+            verloren, die Restminuten des Ventils werden gesichert und nach dem Nachfüllen
+            fortgesetzt.<br>
+            Ein fester Wert ist ohnehin grob, sobald sich die Kreise im Durchfluss
+            unterscheiden: er muss auf den durstigsten passen und unterbricht alle anderen
+            zu früh. In der Anlage des Autors reichen 148 l bei Kreis 1 (18,5 l/min) genau
+            8 Minuten, bei Kreis 3 (7,1 l/min) dagegen 21 – eine Pause nach 8 Minuten
+            unterbräche dort ein Fass, das noch zu zwei Dritteln voll ist.
         </li>
         <li><a id="Gartenbewaesserung-attr-wateringPauseDuration"></a>
             <b>wateringPauseDuration</b><br>
@@ -6586,6 +6691,17 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             von außen, ebenso wie <code>set &lt;name&gt; ibcLevel</code>.<br>
             Voraussetzungen: <code>ibcUsableVolume</code>, ein gesetzter Anker und eine gelernte
             Förderrate. Fehlt eines davon, passiert nichts.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-ibcFillFlow_lpm"></a>
+            <b>ibcFillFlow_lpm</b> / <b>ibcToBarrelFlow_lpm</b><br>
+            Typ: Text (Liter pro Minute). Ohne Angabe: nur der gelernte Wert.<br>
+            Rückfallebene für die beiden Förderraten – Pumpe Fass→IBC und Schwerkraft
+            IBC→Fass. Gelesen wird zuerst das gleichnamige <b>Reading</b>, das das Modul
+            aus vollständigen Läufen lernt; erst wenn das fehlt, greift dieses Attribut.<br>
+            Nötig, weil gelernt nur aus vollständigen Läufen wird (Fass voll → leer bzw.
+            leer → voll) und ein Statefile-Rückfall das Reading wieder kosten kann. Ohne
+            Rate rechnet das Modul die Füllstände während eines Transports nicht mit, und
+            die <code>watertank</code>-Kachel steht still, obwohl das Rohr leuchtet.
         </li>
         <li><a id="Gartenbewaesserung-attr-wateringFlow_lpm"></a>
             <b>wateringFlow_lpm</b><br>

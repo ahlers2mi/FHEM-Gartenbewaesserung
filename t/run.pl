@@ -219,6 +219,71 @@ scenario("I  Ohne Waisen passiert nichts");
     is(rd("orphanShutdown"), "(fehlt)", "kein orphanShutdown ohne Anlass");
 }
 
+scenario("J  Foerderrate nur als ATTRIBUT gesetzt, Reading fehlt (v1.0.69)");
+{
+    my $h = build(attr => { ibcToBarrelFlow_lpm => 12.2 });
+    # bewusst KEIN Reading setzen - genau die Lage vom 23.08.
+    main::readingsSingleUpdate($h, "ibcToBarrelFlow_lpm", "", 0);
+    delete $h->{READINGS}{ibcToBarrelFlow_lpm};
+    is(Gartenbewaesserung_FlowRate($h, "ibcToBarrelFlow_lpm"), 12.2, "Attribut greift");
+
+    # und das Reading schlaegt das Attribut, wenn es da ist
+    main::readingsSingleUpdate($h, "ibcToBarrelFlow_lpm", 14.3, 0);
+    is(Gartenbewaesserung_FlowRate($h, "ibcToBarrelFlow_lpm"), 14.3, "Reading hat Vorrang");
+
+    # Achtung: der Standardaufbau SETZT das Attribut - fuer diesen Fall leeren.
+    my $leer = build(attr => { ibcToBarrelFlow_lpm => "" });
+    delete $leer->{READINGS}{ibcToBarrelFlow_lpm};
+    is(Gartenbewaesserung_FlowRate($leer, "ibcToBarrelFlow_lpm"), 0, "ohne beides: 0, nichts erfunden");
+}
+
+scenario("K  Manuelles startIBCtoBarrel wird abgerechnet (v1.0.70)");
+{
+    my $h = build();
+    Gartenbewaesserung_SetIbcLevel($h, 400, "test", 1);
+    Gartenbewaesserung_SetBarrelLevel($h, 100, "test", 1);
+    Gartenbewaesserung_StartIBCtoBarrel($h);
+    is(relay("POWER5"), "ON", "Ventil offen");
+    main::advance(5 * 60);
+    sens("barrelFull", "yes");                       # Fass wird voll -> Ende
+
+    is(rd("lastIbcToBarrelEnd"), "barrelFull", "Ende protokolliert");
+    ok_true(rd("lastIbcToBarrelDuration") >= 4.9 && rd("lastIbcToBarrelDuration") <= 5.2,
+            "Dauer ~5 min (ist: " . rd("lastIbcToBarrelDuration") . ")");
+    # 5 min x 12,2 l/min = 61 l muessen vom IBC abgehen
+    ok_true(rd("ibcLevel_l") >= 330 && rd("ibcLevel_l") <= 345,
+            "IBC von 400 auf ~339 gebucht (ist: " . rd("ibcLevel_l") . ")");
+}
+
+scenario("L  Manueller Transfer in ein volles Fass: Waechter greift (v1.0.70)");
+{
+    my $h = build();
+    sens("barrelFull", "yes");                       # schon voll VOR dem Start
+    Gartenbewaesserung_StartIBCtoBarrel($h);
+    is(relay("POWER5"), "ON", "Ventil geht erstmal auf");
+    main::advance(60);
+    is(relay("POWER5"), "OFF", "Waechter macht binnen 60 s zu");
+}
+
+scenario("M  Giessen, dann Rest abpumpen: keine falsche Giessrate (v1.0.71)");
+{
+    # wie am 23.08.: Pausenintervall aus, Kreis laeuft in einem Stueck durch
+    my $h = build(attr => { wateringPauseInterval => 0 });
+    sens("barrelFull", "yes");                        # Anker, Taint geloescht
+    Gartenbewaesserung_StartCircuit($h, 3);
+    main::advance(11 * 60 + 30);                      # valve3Duration + Luft
+    is(rd("currentValve"), "none", "Kreis 3 fertig");
+    my $vorher = rd("valve3Flow_lpm");
+
+    Gartenbewaesserung_StartIBCFill($h, 1);           # Rest hochpumpen
+    main::advance(120);
+    sens("barrelEmpty", "yes");                       # Pumpe macht das Fass leer
+
+    is(rd("valve3Flow_lpm"), $vorher, "valve3Flow_lpm unveraendert, nichts Falsches gelernt");
+    ok_true(rd("wateringFlow_lpm") eq "(fehlt)", "auch keine Sammelrate erfunden");
+    ok_true(rd("lastIbcFillVolume_l") ne "(fehlt)", "der Pumpenlauf wird trotzdem verbucht");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);
