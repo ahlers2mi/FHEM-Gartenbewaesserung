@@ -294,23 +294,51 @@ scenario("M  Giessen, dann Rest abpumpen: keine falsche Giessrate (v1.0.71)");
     ok_true(rd("lastIbcFillVolume_l") ne "(fehlt)", "der Pumpenlauf wird trotzdem verbucht");
 }
 
-scenario("N  Stadtwasser-Runde lernt die Pumpenrate aus barrelFloatLevel (v1.0.74)");
+scenario("N  Stadtwasser-Runde bei OFFENEM Hahn: Zulauf wird eingerechnet (v1.0.76)");
 {
-    # Der Filter setzt zu: die Pumpe schafft statt 34,2 nur noch 30,3 l/min.
-    # 81 l brauchen damit 2:40 statt 2:22. Bis v1.0.73 lernte nur ein Lauf aus
-    # dem VOLLEN Fass, und der braucht Regen - die Rate stand deshalb still.
+    # 81 l Schwimmerhoehe, 2:40 Laufzeit - aber der Hahn speist mit 4,4 l/min
+    # weiter. Bewegt wurden also 81 + 4,4 x 2,667 = 92,7 l, und die Pumpe
+    # schafft 92,7/2,667 = 34,8 l/min. Ohne den Zulauf-Term lernte das Modul
+    # 30,3 und haette eine gesunde Pumpe fuer verschlissen gehalten.
     my $h = build(mains => "on");
     main::readingsSingleUpdate($h, "barrelLevel_l", 81, 0);
     Gartenbewaesserung_StartIBCFill($h, 1, 1);        # Schwimmerhoehe -> leer
     main::advance(160);                               # 2:40
     sens("barrelEmpty", "yes");
 
-    is(rd("lastIbcFillVolume_l"), 81, "gebucht wird die gemessene Schwimmermenge");
+    my $vol = rd("lastIbcFillVolume_l");
+    ok_true($vol >= 92 && $vol <= 94, "gebucht: 81 + Zulauf = 93 l (ist: $vol)");
     my $neu = rd("ibcFillFlow_lpm");
-    # 81/2,667 = 30,4 gemessen, gedaempft 0,7*34,2 + 0,3*30,4 = 33,1
-    ok_true($neu > 32.5 && $neu < 33.6,
-            "Rate zieht nach unten nach: 34,2 -> $neu");
-    ok_true($neu < 34.2, "und bleibt unter dem alten Wert");
+    # gemessen 34,8, gedaempft 0,7*34,2 + 0,3*34,8 = 34,4
+    ok_true($neu > 34.2 && $neu < 34.7, "Rate bleibt oben: 34,2 -> $neu");
+    is(rd("lastIbcFillRain_l"), 0, "nichts davon zaehlt als Regen");
+}
+
+scenario("N2 Dieselbe Runde bei ZUGEDREHTEM Hahn lernt die kleinere Rate (v1.0.76)");
+{
+    # Gegenprobe: ohne Zulauf sind es wirklich nur 81 l in 2:40 = 30,4 l/min.
+    # Der Unterschied zwischen N und N2 ist genau die Zweideutigkeit, die aus
+    # dem Log allein nicht aufzuloesen war.
+    my $h = build(mains => "off");
+    main::readingsSingleUpdate($h, "barrelLevel_l", 81, 0);
+    Gartenbewaesserung_StartIBCFill($h, 1, 1);
+    main::advance(160);
+    sens("barrelEmpty", "yes");
+
+    is(rd("lastIbcFillVolume_l"), 81, "gebucht: nur die Schwimmermenge");
+    my $neu = rd("ibcFillFlow_lpm");
+    ok_true($neu > 32.8 && $neu < 33.4, "Rate zieht nach unten: 34,2 -> $neu");
+    is(rd("lastIbcFillRain_l"), 0, "und auch hier ist es kein Regen");
+}
+
+scenario("N3 Ein Wechsel am Stadtwasser kommt als Ereignis an (v1.0.76)");
+{
+    my $h = build(mains => "off");
+    is(rd("mainsSupply"), "off", "Ausgangslage");
+    sens("stadtwasser", "on");
+    is(rd("mainsSupply"), "on", "Aufdrehen wird sofort uebernommen");
+    sens("stadtwasser", "off");
+    is(rd("mainsSupply"), "off", "Zudrehen ebenso");
 }
 
 scenario("O  Schwimmer-Lauf ohne Trockenlauf lernt nichts (v1.0.74)");
