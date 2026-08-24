@@ -3,13 +3,34 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.47 - 2026-08-18
+#     Version 1.0.75 - 2026-08-24
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
 #     Automatische Füll-Pausen während Bewässerung
 #
 ##############################################################################
+#
+# 1.0.75 - 2026-08-24  Fix: der Nachkommaanteil ging bei JEDER Buchung verloren,
+#                      nicht nur beim Stadtwasser-Zulauf.
+#                      v1.0.73 hat das Symptom an einer Stelle behoben (Anker in
+#                      MainsFillTick), die Ursache lag aber tiefer: SetBarrelLevel
+#                      speichert ganze Liter, und AdjustBarrelLevel rechnet vom
+#                      GERUNDETEN Reading weiter. Jede wiederholte kleine Buchung
+#                      verliert damit ihren Bruchteil, und zwar systematisch in
+#                      dieselbe Richtung, weil der Bruchteil bei gleichartigen
+#                      Schritten immer gleich ist. Zweiter Betroffener: der Regen.
+#                      Bei roofArea 45 und runoffCoefficient 0.8 sind das 36 l je
+#                      mm; ein 0,2-mm-Kipp der Wippe bringt 7,2 l und wurde als 7
+#                      gebucht - 0,2 l je Kipp, ueber 10 mm Regen rund 10 l oder
+#                      knapp 3 % der Ernte, immer zu wenig.
+#                      Jetzt liegt der Rest in den versteckten Readings
+#                      .barrelLevelFrac / .ibcLevelFrac und geht in die naechste
+#                      Buchung ein. Die sichtbaren Readings bleiben ganzzahlig.
+#                      MainsFillTick liest den Stand seitdem exakt (neue Funktion
+#                      BarrelLevelExact), sonst zaehlte sein Anker doppelt.
+#                      Ausserdem: die Versionszeile im Dateikopf stand seit dem
+#                      18.08. auf 1.0.47.
 #
 # 1.0.74 - 2026-08-24  Gemessen wird am Fass, gerechnet nur noch als Rueckfall.
 #                      Jeder Durchfluss im System ist veraenderlich: die Schwerkraft
@@ -4677,8 +4698,12 @@ sub Gartenbewaesserung_SetIbcLevel {
     $liters = 0 if($liters < 0);
     $liters = $capacity if($liters > $capacity);
 
+    # Nachkommaanteil mitfuehren - siehe SetBarrelLevel. Hier fallen die Buchungen
+    # zwar gross aus (ein Fass je Transfer), aber der Fehler waere derselbe.
+    my $whole = sprintf("%.0f", $liters);
     readingsBeginUpdate($hash);
-    readingsBulkUpdate($hash, "ibcLevel_l", sprintf("%.0f", $liters));
+    readingsBulkUpdate($hash, "ibcLevel_l", $whole);
+    readingsBulkUpdate($hash, ".ibcLevelFrac", sprintf("%.3f", $liters - $whole));
     readingsBulkUpdate($hash, "ibcLevel_pct", sprintf("%.0f", 100 * $liters / $capacity));
     readingsBulkUpdate($hash, "ibcLevelAnchor", TimeNow() . " " . $reason) if($anchor);
     readingsEndUpdate($hash, 1);
@@ -4695,6 +4720,8 @@ sub Gartenbewaesserung_AdjustIbcLevel {
     my $level = ReadingsVal($name, "ibcLevel_l", "");
     return if($level !~ /^-?\d+(?:\.\d+)?$/);
 
+    my $frac = ReadingsVal($name, ".ibcLevelFrac", 0);
+    $level += $frac if($frac =~ /^-?\d+(?:\.\d+)?$/);
     Gartenbewaesserung_SetIbcLevel($hash, $level + $delta, $reason, 0);
     Log3 $name, 4, sprintf("%s: IBC level %+.0f l (%s) -> %s l",
         $name, $delta, $reason, ReadingsVal($name, "ibcLevel_l", "?"));
@@ -4724,11 +4751,29 @@ sub Gartenbewaesserung_SetBarrelLevel {
     $liters = 0 if($liters < 0);
     $liters = $capacity if($liters > $capacity);
 
+    # Der Nachkommaanteil wird mitgefuehrt statt weggeworfen. Das Reading bleibt
+    # in ganzen Litern (so liest es sich, so zeigt es die Kachel), der Rest liegt
+    # versteckt daneben und geht in die naechste Buchung ein. Ohne das verliert
+    # JEDE wiederholte kleine Buchung ihren Bruchteil, und zwar systematisch in
+    # dieselbe Richtung: der Stadtwasser-Zulauf stieg in 4er-Schritten statt 4,4
+    # (v1.0.73), und jeder 0,2-mm-Kipp der Regenwippe (7,2 l) wurde als 7 gebucht.
+    my $whole = sprintf("%.0f", $liters);
     readingsBeginUpdate($hash);
-    readingsBulkUpdate($hash, "barrelLevel_l", sprintf("%.0f", $liters));
+    readingsBulkUpdate($hash, "barrelLevel_l", $whole);
+    readingsBulkUpdate($hash, ".barrelLevelFrac", sprintf("%.3f", $liters - $whole));
     readingsBulkUpdate($hash, "barrelLevel", sprintf("%.0f", 100 * $liters / $capacity));
     readingsBulkUpdate($hash, "barrelLevelAnchor", TimeNow() . " " . $reason) if($anchor);
     readingsEndUpdate($hash, 1);
+}
+
+# Fuellstand einschliesslich des mitgefuehrten Bruchteils.
+sub Gartenbewaesserung_BarrelLevelExact {
+    my ($hash) = @_;
+    my $l = ReadingsVal($hash->{NAME}, "barrelLevel_l", "");
+    return undef if($l !~ /^-?\d+(?:\.\d+)?$/);
+    my $f = ReadingsVal($hash->{NAME}, ".barrelLevelFrac", 0);
+    $f = 0 if($f !~ /^-?\d+(?:\.\d+)?$/);
+    return $l + $f;
 }
 
 # Returns 1 when the litre estimate handled it, 0 when the caller should fall
@@ -4747,6 +4792,9 @@ sub Gartenbewaesserung_AdjustBarrelLevel {
     $hash->{HELPER}{drawTainted} = 1 if($delta > 0);
 
     return 1 if(!$delta);
+    # Vom EXAKTEN Stand aus weiterrechnen, nicht vom gerundeten Reading - sonst
+    # faellt der Bruchteil bei jeder Buchung wieder heraus.
+    $level = Gartenbewaesserung_BarrelLevelExact($hash) // $level;
     Gartenbewaesserung_SetBarrelLevel($hash, $level + $delta, $reason, 0);
     Log3 $name, 4, sprintf("%s: barrel level %+.0f l (%s) -> %s l",
         $name, $delta, $reason, ReadingsVal($name, "barrelLevel_l", "?"));
@@ -4801,8 +4849,10 @@ sub Gartenbewaesserung_MainsFillTick {
     my $cap = ($float > 0 && $float < $capacity) ? $float : $capacity;
 
     my $now = int(time());
-    my $level = ReadingsVal($name, "barrelLevel_l", "");
-    return if($level !~ /^-?\d+(?:\.\d+)?$/);
+    # Exakt lesen: AdjustBarrelLevel rechnet seit v1.0.75 den Bruchteil mit, ein
+    # $add gegen den GERUNDETEN Stand wuerde ihn also doppelt zaehlen.
+    my $level = Gartenbewaesserung_BarrelLevelExact($hash);
+    return if(!defined($level));
 
     # Anker statt Schrittweite. Frueher wurde je Takt "rate * 60 s" addiert und
     # der Startpunkt vorgerueckt - aber SetBarrelLevel speichert ganze Liter, und

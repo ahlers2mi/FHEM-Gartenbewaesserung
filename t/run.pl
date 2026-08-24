@@ -350,6 +350,37 @@ scenario("P  Leergelaufene Strecke: Buchung am Kopfraum gedeckelt (v1.0.74)");
             "IBC hoechstens um ein Fass gesunken (ist: " . rd("ibcLevel_l") . ")");
 }
 
+scenario("Q  Regen in Wippenschritten verliert keinen Nachkommaanteil (v1.0.75)");
+{
+    # roofArea 45 x runoff 0.8 = 36 l/mm. Ein 0,2-mm-Kipp bringt 7,2 l.
+    # Bis v1.0.74 wurde daraus jedes Mal 7 - 0,2 l je Kipp, immer nach unten.
+    my $h = build(attr => { roofArea => 45, runoffCoefficient => 0.8 });
+    Gartenbewaesserung_SetBarrelLevel($h, 0, "test", 1);
+    for my $i (1 .. 15) {                             # 15 Kippen = 3,0 mm = 108 l
+        setr("sens", "regen_mm", sprintf("%.1f", $i * 0.2));
+        Gartenbewaesserung_AdjustBarrelLevel($h, 0.2 * 45 * 0.8, "rain");
+    }
+    my $ist = rd("barrelLevel_l");
+    # exakt 108; v1.0.74 kommt auf 105 (15 x 7)
+    ok_true($ist >= 107 && $ist <= 109,
+            "15 Kippen a 7,2 l ergeben 108 l (ist: $ist)");
+}
+
+scenario("R  Anker und Bruchteil zaehlen nicht doppelt (v1.0.75)");
+{
+    # MainsFillTick rechnet gegen einen Anker, AdjustBarrelLevel fuehrt jetzt den
+    # Bruchteil mit. Wuerde der Tick den GERUNDETEN Stand lesen, kaeme der
+    # Bruchteil zweimal an und das Fass stiege zu schnell.
+    my $h = build(mains => "on", attr => { mainsFillFlow_lpm => 4.4 });
+    Gartenbewaesserung_SetBarrelLevel($h, 0, "test", 1);
+    main::advance(60);                                # erster Takt setzt nur den Anker
+    my $start = rd("barrelLevel_l");
+    main::advance(10 * 60);
+    my $zu = rd("barrelLevel_l") - $start;
+    ok_true($zu >= 43 && $zu <= 45,
+            "10 Minuten bringen 44 l, nicht mehr und nicht weniger (ist: $zu)");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);
