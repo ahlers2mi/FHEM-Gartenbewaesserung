@@ -3,7 +3,9 @@
 #     98_Gartenbewaesserung.pm
 #
 #     FHEM Modul für intelligente Gartenbewässerung mit IBC-Container
-#     Version 1.0.75 - 2026-08-24
+#     Die laufende Version ist der oberste Eintrag der Änderungsliste unten;
+#     Gartenbewaesserung_Version() liest sie von dort. Hier stand sie früher
+#     zusätzlich, und war zuletzt 28 Versionen alt.
 #
 #     Unterstützt MQTT2 Relay Boards (z.B. Tasmota)
 #     Dynamische Werte-Erkennung (on/off, true/false, 1/0, etc.)
@@ -29,8 +31,16 @@
 #                      Buchung ein. Die sichtbaren Readings bleiben ganzzahlig.
 #                      MainsFillTick liest den Stand seitdem exakt (neue Funktion
 #                      BarrelLevelExact), sonst zaehlte sein Anker doppelt.
-#                      Ausserdem: die Versionszeile im Dateikopf stand seit dem
-#                      18.08. auf 1.0.47.
+#                      Ausserdem: die Version wird nicht mehr von Hand gepflegt.
+#                      $hash->{VERSION} stand fest verdrahtet auf 1.0.73, die
+#                      Zeile im Dateikopf auf 1.0.47 - beide waren beim Anheben
+#                      vergessen worden, die commandref warnt seit laengerem
+#                      genau davor ("eine Zahl, die nicht mitwaechst, ist
+#                      schlimmer als keine"). Gartenbewaesserung_Version() liest
+#                      sie jetzt aus dem obersten Eintrag dieser Liste, die
+#                      ohnehin bei jeder Aenderung gepflegt wird. Der
+#                      Rueckfallwert $FALLBACK greift nur, wenn die Datei nicht
+#                      lesbar ist; dass er zur Liste passt, prueft t/cref.py.
 #
 # 1.0.74 - 2026-08-24  Gemessen wird am Fass, gerechnet nur noch als Rueckfall.
 #                      Jeder Durchfluss im System ist veraenderlich: die Schwerkraft
@@ -648,6 +658,38 @@ use warnings;
 use POSIX;
 
 ##############################################################################
+# Die laufende Version aus der Aenderungsliste im Dateikopf lesen.
+#
+# Fest verdrahtet stand sie hier schon zweimal falsch: erst 38 Versionen alt,
+# dann wieder zwei. Eine Zahl, die von Hand nachgezogen werden muss, wird
+# irgendwann vergessen - und eine falsche Version ist schlimmer als keine, weil
+# man ihr glaubt. Die Aenderungsliste wird dagegen bei jeder Aenderung ohnehin
+# gepflegt, sie ist also die einzige Quelle, die nicht veralten kann.
+#
+# Gelesen wird einmal beim Laden des Moduls, gesucht wird nur im Kopf. $FALLBACK
+# greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
+# gerade selbst geladen) oder die Liste ihr Format aendert.
+{
+    my $FALLBACK = '1.0.75';
+    my $cached;
+    sub Gartenbewaesserung_Version {
+        return $cached if(defined($cached));
+        $cached = $FALLBACK;
+        if(open(my $fh, "<", __FILE__)) {
+            my $lines = 0;
+            while(my $l = <$fh>) {
+                last if(++$lines > 80);
+                if($l =~ /^#\s*(\d+\.\d+\.\d+)\s+-\s+\d{4}-\d{2}-\d{2}/) {
+                    $cached = $1;      # der oberste Eintrag ist der neueste
+                    last;
+                }
+            }
+            close($fh);
+        }
+        return $cached;
+    }
+}
+
 sub Gartenbewaesserung_Initialize {
     my ($hash) = @_;
 
@@ -730,7 +772,7 @@ sub Gartenbewaesserung_Define {
 
     return "Usage: define <name> Gartenbewaesserung" if(@a != 2);
 
-    $hash->{VERSION}    = '1.0.73';
+    $hash->{VERSION}    = Gartenbewaesserung_Version();
 
     my $name = $a[0];
 
@@ -6439,9 +6481,12 @@ sub Gartenbewaesserung_UpdateNotifyDev {
 <ul>
     <p>FHEM Modul für intelligente Gartenbewässerung mit bis zu 8 Ventilen, Regenwasserfass und IBC-Container.</p>
     <p>Die laufende Version steht im Internal <code>VERSION</code> und unter
-    <code>get &lt;name&gt; version</code>. Hier stand sie frueher fest verdrahtet und
-    war zuletzt 38 Versionen alt - eine Zahl, die nicht mitwaechst, ist schlimmer
-    als keine.</p>
+    <code>get &lt;name&gt; version</code>. Sie wird seit v1.0.75 <b>aus dem obersten
+    Eintrag der Änderungsliste im Dateikopf gelesen</b> und nicht mehr von Hand
+    gepflegt. Vorher stand sie zweimal fest verdrahtet und war beide Male
+    vergessen worden - erst hier in der Beschreibung (38 Versionen alt), dann im
+    Code selbst (zwei Versionen). Eine Zahl, die nicht mitwächst, ist schlimmer
+    als keine, weil man ihr glaubt.</p>
 
     <h4>Features</h4>
     <ul>
