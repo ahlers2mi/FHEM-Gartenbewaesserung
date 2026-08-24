@@ -11,6 +11,27 @@
 #
 ##############################################################################
 #
+# 1.0.74 - 2026-08-24  Gemessen wird am Fass, gerechnet nur noch als Rueckfall.
+#                      Jeder Durchfluss im System ist veraenderlich: die Schwerkraft
+#                      IBC->Fass haengt am Fuellstand, Pumpe und Gieszkreise am
+#                      Verschmutzungsgrad des Filters. Fest ist allein, was ins Fass
+#                      passt. Daraus zwei Aenderungen.
+#                      (a) Dritter Messfall: eine Stadtwasser-Runde laeuft von der
+#                      Schwimmerhoehe bis zum Trockenlauf und bewegt damit ebenfalls
+#                      eine BEKANNTE Menge - barrelFloatLevel, am Wasserzaehler
+#                      gemessen. Sie lernt jetzt die Pumpenrate mit. Vorher konnte das
+#                      nur ein Lauf aus dem vollen Fass, und der braucht Regen: die
+#                      Rate stand deshalb fuenf Tage lang auf 34,2 l/min, waehrend die
+#                      Pumpe real nur noch 30,3 schaffte (verschmutzter Filter). Jede
+#                      Runde wurde dadurch um rund 11 l zu hoch gebucht.
+#                      (b) Ratenbasierte Buchungen werden am Fassmass gedeckelt. Ein
+#                      Transfer ins Fass kann nie mehr bewegen, als ins Fass passt -
+#                      in der Nacht zum 24.08. wurden dreimal 255 l in ein 148-l-Fass
+#                      gebucht, weil 20,1 min mit der (veralteten) Rate multipliziert
+#                      wurden. Fuer die Grafik bleiben die Raten unveraendert nutzbar,
+#                      auch bei unvollstaendigen Laeufen; nur die Buchhaltung haengt
+#                      jetzt an den Kontakten.
+#
 # 1.0.73 - 2026-08-23  Fix: MainsFillTick verlor je Minute den Nachkommaanteil.
 #                      Der Ticker addierte je Takt "rate * 60 s" und rueckte seinen
 #                      Startpunkt vor. SetBarrelLevel speichert aber ganze Liter, und
@@ -4487,7 +4508,7 @@ sub Gartenbewaesserung_StopCurrentValve {
 # Start IBC filling (from barrel with pump)
 ##############################################################################
 sub Gartenbewaesserung_StartIBCFill {
-    my ($hash, $manual) = @_;
+    my ($hash, $manual, $fromFloat) = @_;
     my $name = $hash->{NAME};
 
     # Don't start if watering is active
@@ -4560,9 +4581,21 @@ sub Gartenbewaesserung_StartIBCFill {
 
     # Measurement: remember when this run began and whether it started from a full
     # barrel. Only a full->empty run moves a known volume and can teach the rate.
+    #
+    # Zweiter bekannter Startpunkt: die Schwimmerhoehe. Eine Stadtwasser-Runde
+    # setzt genau dort an und pumpt bis zum Trockenlauf, bewegt also
+    # barrelFloatLevel - eine am Wasserzaehler gemessene Menge, nicht geschaetzt.
+    # Nur ein voller Lauf braucht Regen; ohne diesen zweiten Fall bliebe die
+    # Pumpenrate in trockenen Wochen unbemerkt stehen, waehrend der Filter zusetzt.
     $hash->{HELPER}{ibcFillStartTime} = int(time());
     $hash->{HELPER}{ibcFillFromFull}  = (ReadingsVal($name, "barrelFull", "no") eq "yes") ? 1 : 0;
+    $hash->{HELPER}{ibcFillFromFloat} = ($fromFloat && !$hash->{HELPER}{ibcFillFromFull}) ? 1 : 0;
     $hash->{HELPER}{ibcFillMainsAtStart} = Gartenbewaesserung_MainsSupplyState($hash);
+    # Obergrenze fuer eine ratenbasierte Buchung: mehr als drinsteht kann die
+    # Pumpe nicht herausholen.
+    my $lvlAtStart = ReadingsVal($name, "barrelLevel_l", "");
+    $hash->{HELPER}{ibcFillBarrelAtStart} =
+        ($lvlAtStart =~ /^-?\d+(?:\.\d+)?$/ && $lvlAtStart > 0) ? $lvlAtStart : undef;
     Gartenbewaesserung_ArmIbcFullByLevel($hash);
 
     if($pumpDevice ne "") {
@@ -5028,6 +5061,12 @@ sub Gartenbewaesserung_NoteIbcToBarrelStart {
     $hash->{HELPER}{ibcToBarrelStartTime} = int(time());
     $hash->{HELPER}{ibcToBarrelFromEmpty} =
         (ReadingsVal($hash->{NAME}, "barrelEmpty", "no") eq "yes") ? 1 : 0;
+    # Anfangsstand fuer den Buchungsdeckel: mehr als in das Fass hineinpasst kann
+    # kein Transfer bewegen. Waehrend eines Transfers giesst nichts, der Kopfraum
+    # aendert sich also nicht.
+    my $lvl = ReadingsVal($hash->{NAME}, "barrelLevel_l", "");
+    $hash->{HELPER}{ibcToBarrelBarrelAtStart} =
+        ($lvl =~ /^-?\d+(?:\.\d+)?$/) ? $lvl : undef;
     # Erster Blick schon nach 5 s: oeffnet die Strecke in ein volles Fass, sind
     # das rund 1 l statt der 200 l von frueher. Danach reichen 30 s.
     RemoveInternalTimer($hash, "Gartenbewaesserung_IbcToBarrelWatchdog");
@@ -5041,8 +5080,10 @@ sub Gartenbewaesserung_NoteIbcToBarrelStop {
     RemoveInternalTimer($hash, "Gartenbewaesserung_IbcToBarrelWatchdog");
     my $start = $hash->{HELPER}{ibcToBarrelStartTime};
     my $fromEmpty = $hash->{HELPER}{ibcToBarrelFromEmpty};
+    my $barrelAtStart = $hash->{HELPER}{ibcToBarrelBarrelAtStart};
     delete $hash->{HELPER}{ibcToBarrelStartTime};
     delete $hash->{HELPER}{ibcToBarrelFromEmpty};
+    delete $hash->{HELPER}{ibcToBarrelBarrelAtStart};
     return if(!$start);
 
     $reason = "unknown" if(!defined($reason) || $reason eq "");
@@ -5065,6 +5106,21 @@ sub Gartenbewaesserung_NoteIbcToBarrelStop {
     }
     elsif($rate > 0) {
         $moved = $rate * $minutes;
+        # Deckel: ins Fass passt nur, was noch Platz hat. Waehrend eines Transfers
+        # ist das Giessen gestoppt, der Kopfraum steht also fest. Ohne den Deckel
+        # bucht eine zu hohe Rate Wasser, das nie ankam - in der Nacht zum 24.08.
+        # dreimal 255 l in ein Fass, das 148 fasst, weil die Strecke leer lief und
+        # der Lauf bis maxDuration offen blieb.
+        if($volume > 0 && defined($barrelAtStart)) {
+            my $headroom = $volume - $barrelAtStart;
+            $headroom = 0 if($headroom < 0);
+            if($moved > $headroom) {
+                Log3 $name, 3, sprintf("%s: IBC->barrel booking capped at %.0f l "
+                    . "(rate would have given %.0f l in %.1f min - dry line or stale rate?)",
+                    $name, $headroom, $moved, $minutes);
+                $moved = $headroom;
+            }
+        }
     }
 
     readingsBeginUpdate($hash);
@@ -5104,8 +5160,12 @@ sub Gartenbewaesserung_RecordIbcFillRun {
 
     my $start = $hash->{HELPER}{ibcFillStartTime};
     my $fromFull = $hash->{HELPER}{ibcFillFromFull};
+    my $fromFloat = $hash->{HELPER}{ibcFillFromFloat};
+    my $barrelAtStart = $hash->{HELPER}{ibcFillBarrelAtStart};
     delete $hash->{HELPER}{ibcFillStartTime};
     delete $hash->{HELPER}{ibcFillFromFull};
+    delete $hash->{HELPER}{ibcFillFromFloat};
+    delete $hash->{HELPER}{ibcFillBarrelAtStart};
     return 0 if(!$start);
 
     $reason = "unknown" if(!defined($reason) || $reason eq "");
@@ -5140,12 +5200,40 @@ sub Gartenbewaesserung_RecordIbcFillRun {
     # without a mains top-up. With the float valve feeding, the pump also moves
     # everything that flowed in meanwhile, so the run is measured by the rate.
     my $complete = ($fromFull && $reason eq "barrelEmpty" && $volume > 0) ? 1 : 0;
+    # Zweiter bekannter Fall: Schwimmerhoehe bis Trockenlauf. Das ist die
+    # Stadtwasser-Runde, und barrelFloatLevel ist am Wasserzaehler gemessen.
+    # Der Fall ist ABSICHTLICH nicht an $source gebunden: bei einer solchen Runde
+    # steht der Hahn per Definition offen ($source ist immer "mixed"), das
+    # Schwimmerventil ist aber zu, solange das Fass auf Hoehe steht, und der
+    # Pumpenlauf ist zu kurz, als dass nennenswert nachliefe.
+    my $floatRun = (!$complete && $fromFloat && $reason eq "barrelEmpty"
+                    && $float > 0) ? 1 : 0;
     my $moved = 0;
     if($complete && $source ne "mixed") {
         $moved = $volume;
     }
+    elsif($floatRun) {
+        $moved = $float;
+    }
     elsif($rate > 0) {
         $moved = $rate * $minutes;
+        # Deckel: die Pumpe kann nicht mehr herausholen, als im Fass stand -
+        # plus dem, was das Schwimmerventil waehrend des Laufs nachliefern kann.
+        # Ohne das schreibt eine veraltete Rate stillschweigend Wasser gut, das
+        # es nie gab (Nacht zum 24.08.: 20,1 min x 12,7 = 255 l aus einem Fass,
+        # das 148 fasst).
+        my $ceiling = $barrelAtStart;
+        if(defined($ceiling)) {
+            my $inflow = AttrVal($name, "mainsFillFlow_lpm", 0);
+            $ceiling += $inflow * $minutes
+                if($source eq "mixed" && $inflow =~ /^\d+(?:\.\d+)?$/ && $inflow > 0);
+            if($moved > $ceiling) {
+                Log3 $name, 3, sprintf("%s: barrel->IBC booking capped at %.0f l "
+                    . "(rate would have given %.0f l in %.1f min - stale rate?)",
+                    $name, $ceiling, $moved, $minutes);
+                $moved = $ceiling;
+            }
+        }
     }
 
     # Split the moved volume into harvested rain and mains water. The float valve
@@ -5200,14 +5288,31 @@ sub Gartenbewaesserung_RecordIbcFillRun {
             $name, $moved, $minutes, $rainPart, $mainsPart);
     }
 
-    if($complete && $source ne "mixed") {
-        my $measured = $volume / $minutes;
-        # Damped average so a single odd run does not dominate
-        my $new = ($rate > 0) ? ($rate * 0.7 + $measured * 0.3) : $measured;
-        readingsBulkUpdate($hash, "ibcFillFlow_lpm", sprintf("%.1f", $new));
-        readingsBulkUpdate($hash, "lastIbcFillVolume_l", sprintf("%.0f", $volume));
-        Log3 $name, 3, sprintf("%s: complete barrel->IBC run: %.0f l in %.1f min "
-            . "= %.1f l/min (learned rate now %.1f)", $name, $volume, $minutes, $measured, $new);
+    # Beide Faelle mit bekannter Menge lernen die Pumpenrate: voll->leer ueber
+    # barrelUsableVolume, Schwimmer->leer ueber barrelFloatLevel. Nur so zieht die
+    # Rate den Filterverschleiss nach; ohne den zweiten Fall bleibt sie in einer
+    # regenlosen Woche stehen und bucht dauerhaft zu viel.
+    my $known = 0;
+    $known = $volume if($complete && $source ne "mixed");
+    $known = $float  if($floatRun);
+    if($known > 0) {
+        my $measured = $known / $minutes;
+        # Ausreisser-Bremse: ein Lauf, der nicht wirklich am gedachten Startpunkt
+        # begann (Fass noch nicht auf Hoehe, vorzeitig abgebrochen), liefert einen
+        # wilden Wert. Die Rate darf sich daran nicht verbiegen.
+        if($rate > 0 && ($measured > 2 * $rate || $measured < 0.4 * $rate)) {
+            Log3 $name, 3, sprintf("%s: barrel->IBC run gives %.1f l/min against a "
+                . "learned %.1f - implausible, rate left untouched", $name, $measured, $rate);
+        }
+        else {
+            # Damped average so a single odd run does not dominate
+            my $new = ($rate > 0) ? ($rate * 0.7 + $measured * 0.3) : $measured;
+            readingsBulkUpdate($hash, "ibcFillFlow_lpm", sprintf("%.1f", $new));
+            Log3 $name, 3, sprintf("%s: %s barrel->IBC run: %.0f l in %.1f min "
+                . "= %.1f l/min (learned rate now %.1f)",
+                $name, $complete ? "complete" : "float-level", $known, $minutes, $measured, $new);
+        }
+        readingsBulkUpdate($hash, "lastIbcFillVolume_l", sprintf("%.0f", $known));
     }
     else {
         # Partial or mains-fed run - estimate from the learned rate if we have one
@@ -5473,7 +5578,9 @@ sub Gartenbewaesserung_MainsFillIbcTick {
         return;
     }
 
-    my $err = Gartenbewaesserung_StartIBCFill($hash, 1);
+    # Dritter Parameter: dieser Lauf startet auf der Schwimmerhoehe (siehe oben,
+    # $ready) und bewegt damit eine bekannte Menge.
+    my $err = Gartenbewaesserung_StartIBCFill($hash, 1, 1);
     if($err) {
         Log3 $name, 3, "$name: mains fill cannot pump right now ($err) - trying again next minute";
         return;
@@ -6722,10 +6829,16 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Rückfallebene für die beiden Förderraten – Pumpe Fass→IBC und Schwerkraft
             IBC→Fass. Gelesen wird zuerst das gleichnamige <b>Reading</b>, das das Modul
             aus vollständigen Läufen lernt; erst wenn das fehlt, greift dieses Attribut.<br>
-            Nötig, weil gelernt nur aus vollständigen Läufen wird (Fass voll → leer bzw.
-            leer → voll) und ein Statefile-Rückfall das Reading wieder kosten kann. Ohne
+            Nötig, weil nur aus Läufen mit <b>bekannter Menge</b> gelernt wird (siehe unten)
+            und ein Statefile-Rückfall das Reading wieder kosten kann. Ohne
             Rate rechnet das Modul die Füllstände während eines Transports nicht mit, und
-            die <code>watertank</code>-Kachel steht still, obwohl das Rohr leuchtet.
+            die <code>watertank</code>-Kachel steht still, obwohl das Rohr leuchtet.<br>
+            <b>Wofür die Raten taugen und wofür nicht:</b> jeder Durchfluss der Anlage ist
+            veränderlich – die Schwerkraft IBC→Fass hängt am Füllstand des IBC, Pumpe und
+            Gießkreise am Verschmutzungsgrad des Filters. Für die <b>Darstellung</b> reichen
+            sie trotzdem, auch bei unvollständigen Läufen. Für die <b>Buchhaltung</b> zählt
+            nur, was an den Fass-Kontakten gemessen wurde; eine ratenbasierte Buchung wird
+            deshalb seit v1.0.74 am Fassmaß gedeckelt und kann kein Wasser mehr erfinden.
         </li>
         <li><a id="Gartenbewaesserung-attr-wateringFlow_lpm"></a>
             <b>wateringFlow_lpm</b><br>
@@ -7013,7 +7126,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>ibcToBarrelFlow_lpm</b> / <b>lastIbcToBarrelVolume_l</b> - Gelernte Rate der Schwerkraftrichtung IBC&nbsp;&rarr;&nbsp;Fass und die daraus geschätzte Menge des letzten Rücklaufs. Gelernt wird nur aus Läufen, die bei leerem Fass beginnen und mit <code>barrelFull</code> enden – die haben <code>barrelUsableVolume</code> bewegt.</li>
         <li><b>lastIbcToBarrelDuration</b> / <b>lastIbcToBarrelEnd</b> - Dauer (Minuten) und Endgrund (<code>barrelFull</code>, <code>pauseEnd</code>) des letzten Laufs IBC&nbsp;&rarr;&nbsp;Fass, einschließlich der Schwerkraft-Nachspeisung während einer Gießpause.</li>
         <li><b>lastIbcFillDuration</b> / <b>lastIbcFillEnd</b> / <b>lastIbcFillVolume_l</b> - Dauer (Minuten), Endgrund (<code>barrelEmpty</code>, <code>ibcFull</code>, <code>watering</code>, <code>rainStopped</code>, <code>ibcToBarrel</code>, <code>manual</code>) und bewegtes Volumen der letzten Befüllung Fass&nbsp;&rarr;&nbsp;IBC.</li>
-        <li><b>ibcFillFlow_lpm</b> - Gelernte Förderrate in Litern pro Minute. Wird nur aus vollständigen Läufen (volles Fass bis <code>barrelEmpty</code>) fortgeschrieben und gedämpft gemittelt, sinkt also automatisch mit, wenn der Filter zusetzt. Setzt <code>barrelUsableVolume</code> voraus.</li>
+        <li><b>ibcFillFlow_lpm</b> - Gelernte Förderrate in Litern pro Minute, gedämpft gemittelt, sinkt also automatisch mit, wenn der Filter zusetzt. Fortgeschrieben wird sie aus den beiden Läufen mit <b>bekannter Menge</b>: aus dem vollen Fass bis <code>barrelEmpty</code> (das sind <code>barrelUsableVolume</code>, braucht aber Regen) und – seit v1.0.74 – aus einer Stadtwasser-Runde von der Schwimmerhöhe bis <code>barrelEmpty</code> (das sind <code>barrelFloatLevel</code>). Ohne den zweiten Fall bliebe die Rate in einer regenlosen Woche stehen, während die Pumpe längst langsamer geworden ist. Ein Wert, der mehr als das Doppelte oder weniger als 40&nbsp;% des bisherigen ergäbe, wird verworfen statt gelernt.</li>
         <li><b>harvest_today_l</b> / <b>harvest_month_l</b> / <b>harvest_year_l</b> / <b>harvest_total_l</b> - Aufgefangene Regenwassermenge in Litern (heute, laufender Monat, laufendes Jahr, seit Inbetriebnahme). Berechnet als <code>Regenmenge (mm) × roofArea × runoffCoefficient</code>; nur aktiv, wenn <code>roofArea</code> gesetzt ist. Die Perioden-Zähler starten bei Tages-, Monats- bzw. Jahreswechsel automatisch neu, <code>harvest_total_l</code> läuft weiter. Zurücksetzen mit <code>set &lt;name&gt; resetHarvestStats</code>.<br>
             <i>Grenze:</i> Der Wert beziffert, was am Fallrohr ankommt. Was bei vollem Fass überläuft, kann nicht abgezogen werden – die tatsächlich gespeicherte Menge liegt also darunter.</li>
     </ul>

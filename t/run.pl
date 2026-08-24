@@ -256,9 +256,13 @@ scenario("K  Manuelles startIBCtoBarrel wird abgerechnet (v1.0.70)");
     is(rd("lastIbcToBarrelEnd"), "barrelFull", "Ende protokolliert");
     ok_true(rd("lastIbcToBarrelDuration") >= 4.9 && rd("lastIbcToBarrelDuration") <= 5.2,
             "Dauer ~5 min (ist: " . rd("lastIbcToBarrelDuration") . ")");
-    # 5 min x 12,2 l/min = 61 l muessen vom IBC abgehen
-    ok_true(rd("ibcLevel_l") >= 330 && rd("ibcLevel_l") <= 345,
-            "IBC von 400 auf ~339 gebucht (ist: " . rd("ibcLevel_l") . ")");
+    # Die Rate haette 5 min x 12,2 = 61 l ergeben. Ins Fass passen aber nur
+    # 148 - 100 = 48 l, und waehrend eines Transfers giesst nichts. Bis v1.0.73
+    # wurden die 61 gebucht - 13 l, die es nie gab. Seit v1.0.74 deckelt die
+    # Buchung am Fassmass.
+    ok_true(rd("ibcLevel_l") >= 348 && rd("ibcLevel_l") <= 356,
+            "IBC von 400 auf ~352 gebucht, am Kopfraum gedeckelt (ist: "
+            . rd("ibcLevel_l") . ")");
 }
 
 scenario("L  Manueller Transfer in ein volles Fass: Waechter greift (v1.0.70)");
@@ -288,6 +292,62 @@ scenario("M  Giessen, dann Rest abpumpen: keine falsche Giessrate (v1.0.71)");
     is(rd("valve3Flow_lpm"), $vorher, "valve3Flow_lpm unveraendert, nichts Falsches gelernt");
     ok_true(rd("wateringFlow_lpm") eq "(fehlt)", "auch keine Sammelrate erfunden");
     ok_true(rd("lastIbcFillVolume_l") ne "(fehlt)", "der Pumpenlauf wird trotzdem verbucht");
+}
+
+scenario("N  Stadtwasser-Runde lernt die Pumpenrate aus barrelFloatLevel (v1.0.74)");
+{
+    # Der Filter setzt zu: die Pumpe schafft statt 34,2 nur noch 30,3 l/min.
+    # 81 l brauchen damit 2:40 statt 2:22. Bis v1.0.73 lernte nur ein Lauf aus
+    # dem VOLLEN Fass, und der braucht Regen - die Rate stand deshalb still.
+    my $h = build(mains => "on");
+    main::readingsSingleUpdate($h, "barrelLevel_l", 81, 0);
+    Gartenbewaesserung_StartIBCFill($h, 1, 1);        # Schwimmerhoehe -> leer
+    main::advance(160);                               # 2:40
+    sens("barrelEmpty", "yes");
+
+    is(rd("lastIbcFillVolume_l"), 81, "gebucht wird die gemessene Schwimmermenge");
+    my $neu = rd("ibcFillFlow_lpm");
+    # 81/2,667 = 30,4 gemessen, gedaempft 0,7*34,2 + 0,3*30,4 = 33,1
+    ok_true($neu > 32.5 && $neu < 33.6,
+            "Rate zieht nach unten nach: 34,2 -> $neu");
+    ok_true($neu < 34.2, "und bleibt unter dem alten Wert");
+}
+
+scenario("O  Schwimmer-Lauf ohne Trockenlauf lernt nichts (v1.0.74)");
+{
+    # Vorzeitig beendet - die bewegte Menge ist unbekannt, also darf die Rate
+    # sich nicht verbiegen. Ein Test, der sonst nur die Gutwetterseite prueft.
+    my $h = build(mains => "on");
+    main::readingsSingleUpdate($h, "barrelLevel_l", 81, 0);
+    Gartenbewaesserung_StartIBCFill($h, 1, 1);
+    main::advance(40);
+    Gartenbewaesserung_StopIBCFill($h, "stopped by hand");
+
+    is(rd("ibcFillFlow_lpm"), "34.2", "Rate unveraendert");
+    ok_true(rd("lastIbcFillVolume_l") ne "81", "und die 81 werden nicht gebucht");
+}
+
+scenario("P  Leergelaufene Strecke: Buchung am Kopfraum gedeckelt (v1.0.74)");
+{
+    # Die Nacht zum 24.08.: Transferventil 20 min offen, IBC gibt nichts mehr
+    # her, Ende auf maxDuration. 20,1 x 12,7 = 255 l wurden in ein 148-l-Fass
+    # gebucht - dreimal hintereinander.
+    my $h = build(attr => { ibcToBarrelDuration => 20 });
+    Gartenbewaesserung_SetIbcLevel($h, 500, "test", 1);
+    Gartenbewaesserung_SetBarrelLevel($h, 0, "test", 1);
+    Gartenbewaesserung_StartIBCtoBarrel($h);
+    main::advance(20 * 60 + 30);                      # laeuft in maxDuration
+
+    # Der Dauer-Timer meldet "stopped", der Pausen-Pfad "maxDuration" - beiden
+    # gemeinsam ist, dass der Fass-voll-Kontakt NIE kam. Genau das ist das
+    # Kennzeichen eines Laufs, dessen Menge niemand gemessen hat.
+    ok_true(rd("lastIbcToBarrelEnd") ne "barrelFull",
+            "Kontakt nie erreicht (Ende: " . rd("lastIbcToBarrelEnd") . ")");
+    my $gebucht = rd("lastIbcToBarrelVolume_l");
+    ok_true($gebucht <= 148,
+            "nie mehr als ins Fass passt (ist: $gebucht, Rate haette 244 ergeben)");
+    ok_true(rd("ibcLevel_l") >= 352,
+            "IBC hoechstens um ein Fass gesunken (ist: " . rd("ibcLevel_l") . ")");
 }
 
 print "\n";
