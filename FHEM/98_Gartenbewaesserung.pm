@@ -13,6 +13,31 @@
 #
 ##############################################################################
 #
+# 1.0.76 - 2026-08-24  Der Zulauf wird eingerechnet statt das Lernen abzuschalten,
+#                      und sein Wechsel kommt endlich als Ereignis an.
+#                      Bei offenem Hahn speist das Schwimmerventil waehrend eines
+#                      Pumpenlaufs weiter. Es liefert nur mainsFillFlow_lpm gegen
+#                      ein Vielfaches davon aus der Pumpe, haelt also nie mit -
+#                      aber ueber einen Lauf summiert es sich auf gut zehn Liter.
+#                      Bisher wurde ein Lauf mit offenem Hahn deshalb gar nicht
+#                      ausgewertet. In einer Trockenperiode, in der der Hahn offen
+#                      bleiben MUSS, heisst das: nie wieder eine frische
+#                      Pumpenrate. Jetzt geht der Zulauf als Term in Menge und
+#                      Rate ein - dieselbe Rechnung, die der Buchungsdeckel aus
+#                      v1.0.74 schon benutzt.
+#                      Damit sind auch die beiden Lesarten der Abendlaeufe vom
+#                      23.08. sauber getrennt: 81 l in 2:40 heisst bei offenem
+#                      Hahn eine Pumpe mit rund 34,8 l/min, bei zugedrehtem eine
+#                      mit 30,3. Bisher lernte das Modul in beiden Faellen 30,3.
+#                      Dazu die Ereignis-Seite: mainsSupplyDevice stand nicht in
+#                      der Sensorliste von UpdateNotifyDev, der Wechsel kam also
+#                      nur zufaellig an - naemlich wenn dasselbe Geraet auch
+#                      barrelEmptySensorDevice war. Und das Reading mainsSupply
+#                      schrieb ausschliesslich UpdateSensorReadings, die im
+#                      Betrieb praktisch nie laeuft: am 23.08. stand dort ab
+#                      20:11 "on", waehrend der Hahn seit 20:58 zu war. Beides
+#                      behoben, der Zulauf-Anker wird beim Wechsel verworfen.
+#
 # 1.0.75 - 2026-08-24  Fix: der Nachkommaanteil ging bei JEDER Buchung verloren,
 #                      nicht nur beim Stadtwasser-Zulauf.
 #                      v1.0.73 hat das Symptom an einer Stelle behoben (Anker in
@@ -670,7 +695,7 @@ use POSIX;
 # greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
 # gerade selbst geladen) oder die Liste ihr Format aendert.
 {
-    my $FALLBACK = '1.0.75';
+    my $FALLBACK = '1.0.76';
     my $cached;
     sub Gartenbewaesserung_Version {
         return $cached if(defined($cached));
@@ -1127,6 +1152,26 @@ sub Gartenbewaesserung_Notify {
                 elsif(Gartenbewaesserung_CheckSensorInactive($name, $event, $barrelReading,
                       AttrVal($name, "barrelFullSensorInactiveValue", ""))) {
                     readingsSingleUpdate($hash, "barrelFull", "no", 1);
+                }
+            }
+        }
+
+        # Stadtwasser-Zulauf. Der Zustand wurde bisher nur beim Nachfragen
+        # gelesen - das Reading mainsSupply schrieb ausschliesslich
+        # UpdateSensorReadings, und die laeuft im Betrieb praktisch nie. Auf dem
+        # Dashboard stand deshalb stundenlang "on", waehrend der Hahn zu war.
+        my $mainsDef = AttrVal($name, "mainsSupplyDevice", "");
+        if($mainsDef ne "") {
+            my ($mainsDev, $mainsReading) = Gartenbewaesserung_ParseDevice($mainsDef);
+            $mainsReading = "state" if($mainsReading eq "");
+            if($devName eq $mainsDev && $event =~ /^\Q$mainsReading\E:/) {
+                my $jetzt = Gartenbewaesserung_MainsSupplyState($hash);
+                if($jetzt ne "" && $jetzt ne ReadingsVal($name, "mainsSupply", "")) {
+                    readingsSingleUpdate($hash, "mainsSupply", $jetzt, 1);
+                    Log3 $name, 3, "$name: mains supply is now $jetzt";
+                    # Der Zulauf-Anker gilt nicht mehr: beim naechsten Takt wird
+                    # er auf dem dann gueltigen Pegel neu gesetzt.
+                    delete $hash->{HELPER}{mainsFillAnchor};
                 }
             }
         }
@@ -5300,12 +5345,24 @@ sub Gartenbewaesserung_RecordIbcFillRun {
     # Pumpenlauf ist zu kurz, als dass nennenswert nachliefe.
     my $floatRun = (!$complete && $fromFloat && $reason eq "barrelEmpty"
                     && $float > 0) ? 1 : 0;
+
+    # Bei offenem Hahn speist das Schwimmerventil waehrend des Laufs weiter.
+    # Es liefert nur mainsFillFlow_lpm gegen ein Vielfaches davon aus der Pumpe,
+    # haelt also nie mit - aber ueber einen Lauf summiert es sich auf gut zehn
+    # Liter, und die fehlten bisher sowohl in der Menge als auch in der daraus
+    # gelernten Rate. Bis v1.0.75 wurde ein Lauf mit offenem Hahn deshalb gar
+    # nicht ausgewertet; in einer Trockenperiode, in der der Hahn offen bleiben
+    # MUSS, hiess das: nie wieder eine frische Pumpenrate.
+    my $inflow = AttrVal($name, "mainsFillFlow_lpm", 0);
+    $inflow = 0 if($inflow !~ /^\d+(?:\.\d+)?$/ || $source ne "mixed");
+    my $topUp = $inflow * $minutes;
+
     my $moved = 0;
-    if($complete && $source ne "mixed") {
-        $moved = $volume;
+    if($complete) {
+        $moved = $volume + $topUp;
     }
     elsif($floatRun) {
-        $moved = $float;
+        $moved = $float + $topUp;
     }
     elsif($rate > 0) {
         $moved = $rate * $minutes;
@@ -5337,7 +5394,17 @@ sub Gartenbewaesserung_RecordIbcFillRun {
     my $rainPart  = 0;
     my $mainsPart = 0;
     if($moved > 0) {
-        if($source eq "mixed") {
+        if($floatRun) {
+            # Ein Lauf, der auf der Schwimmerhoehe beginnt, hebt per Definition
+            # Leitungswasser: bis dorthin fuellt nur das Schwimmerventil, Regen
+            # ginge darueber hinaus bis zum Fass-voll-Kontakt. Das gilt auch,
+            # wenn der Hahn inzwischen zu ist und $source deshalb "rain" sagt -
+            # sonst landeten diese Liter in pumpedRain_total_l und verzerrten den
+            # Dachflaechen-Abgleich.
+            $rainPart  = 0;
+            $mainsPart = ($source eq "other") ? 0 : $moved;
+        }
+        elsif($source eq "mixed") {
             if($fromFull && $volume > 0 && $float > 0 && $float < $volume) {
                 $rainPart = $volume - $float;
                 $rainPart = $moved if($rainPart > $moved);
@@ -5374,19 +5441,14 @@ sub Gartenbewaesserung_RecordIbcFillRun {
         }
     }
 
-    if($complete && $source eq "mixed" && $moved > 0) {
-        Log3 $name, 3, sprintf("%s: barrel->IBC run with mains open: %.0f l in %.1f min "
-            . "(%.0f l rain, %.0f l mains) - rate not learned from this run",
-            $name, $moved, $minutes, $rainPart, $mainsPart);
-    }
-
     # Beide Faelle mit bekannter Menge lernen die Pumpenrate: voll->leer ueber
-    # barrelUsableVolume, Schwimmer->leer ueber barrelFloatLevel. Nur so zieht die
+    # barrelUsableVolume, Schwimmer->leer ueber barrelFloatLevel - jeweils plus
+    # dem, was der Hahn waehrend des Laufs nachgeliefert hat. Nur so zieht die
     # Rate den Filterverschleiss nach; ohne den zweiten Fall bleibt sie in einer
     # regenlosen Woche stehen und bucht dauerhaft zu viel.
     my $known = 0;
-    $known = $volume if($complete && $source ne "mixed");
-    $known = $float  if($floatRun);
+    $known = $volume + $topUp if($complete);
+    $known = $float  + $topUp if($floatRun);
     if($known > 0) {
         my $measured = $known / $minutes;
         # Ausreisser-Bremse: ein Lauf, der nicht wirklich am gedachten Startpunkt
@@ -6441,11 +6503,15 @@ sub Gartenbewaesserung_UpdateNotifyDev {
     my @devices;
     
     # Collect all sensor device names
+    # mainsSupplyDevice gehoert dazu: der Zulauf geht in Fuellstand, Buchung und
+    # gelernte Pumpenrate ein, sein Wechsel muss also ankommen. Bisher fehlte er
+    # hier und das Ereignis kam nur zufaellig an - naemlich dann, wenn dasselbe
+    # Geraet auch als barrelEmptySensorDevice eingetragen war.
     my @sensorAttrs = qw(
         barrelFullSensorDevice barrelEmptySensorDevice
         ibcFullSensorDevice ibcEmptySensorDevice
         rainSensorDevice moistureSensorDevice
-        rainAmountDevice
+        rainAmountDevice mainsSupplyDevice
     );
     
     foreach my $attr (@sensorAttrs) {
@@ -7221,7 +7287,8 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>ibcToBarrelFlow_lpm</b> / <b>lastIbcToBarrelVolume_l</b> - Gelernte Rate der Schwerkraftrichtung IBC&nbsp;&rarr;&nbsp;Fass und die daraus geschätzte Menge des letzten Rücklaufs. Gelernt wird nur aus Läufen, die bei leerem Fass beginnen und mit <code>barrelFull</code> enden – die haben <code>barrelUsableVolume</code> bewegt.</li>
         <li><b>lastIbcToBarrelDuration</b> / <b>lastIbcToBarrelEnd</b> - Dauer (Minuten) und Endgrund (<code>barrelFull</code>, <code>pauseEnd</code>) des letzten Laufs IBC&nbsp;&rarr;&nbsp;Fass, einschließlich der Schwerkraft-Nachspeisung während einer Gießpause.</li>
         <li><b>lastIbcFillDuration</b> / <b>lastIbcFillEnd</b> / <b>lastIbcFillVolume_l</b> - Dauer (Minuten), Endgrund (<code>barrelEmpty</code>, <code>ibcFull</code>, <code>watering</code>, <code>rainStopped</code>, <code>ibcToBarrel</code>, <code>manual</code>) und bewegtes Volumen der letzten Befüllung Fass&nbsp;&rarr;&nbsp;IBC.</li>
-        <li><b>ibcFillFlow_lpm</b> - Gelernte Förderrate in Litern pro Minute, gedämpft gemittelt, sinkt also automatisch mit, wenn der Filter zusetzt. Fortgeschrieben wird sie aus den beiden Läufen mit <b>bekannter Menge</b>: aus dem vollen Fass bis <code>barrelEmpty</code> (das sind <code>barrelUsableVolume</code>, braucht aber Regen) und – seit v1.0.74 – aus einer Stadtwasser-Runde von der Schwimmerhöhe bis <code>barrelEmpty</code> (das sind <code>barrelFloatLevel</code>). Ohne den zweiten Fall bliebe die Rate in einer regenlosen Woche stehen, während die Pumpe längst langsamer geworden ist. Ein Wert, der mehr als das Doppelte oder weniger als 40&nbsp;% des bisherigen ergäbe, wird verworfen statt gelernt.</li>
+        <li><b>ibcFillFlow_lpm</b> - Gelernte Förderrate in Litern pro Minute, gedämpft gemittelt, sinkt also automatisch mit, wenn der Filter zusetzt. Fortgeschrieben wird sie aus den beiden Läufen mit <b>bekannter Menge</b>: aus dem vollen Fass bis <code>barrelEmpty</code> (das sind <code>barrelUsableVolume</code>, braucht aber Regen) und – seit v1.0.74 – aus einer Stadtwasser-Runde von der Schwimmerhöhe bis <code>barrelEmpty</code> (das sind <code>barrelFloatLevel</code>). Ohne den zweiten Fall bliebe die Rate in einer regenlosen Woche stehen, während die Pumpe längst langsamer geworden ist. Ein Wert, der mehr als das Doppelte oder weniger als 40&nbsp;% des bisherigen ergäbe, wird verworfen statt gelernt.<br>
+            Steht der Hahn dabei offen, kommt <code>mainsFillFlow_lpm × Laufzeit</code> als Zulauf hinzu (seit v1.0.76). Das Schwimmerventil liefert nur einen Bruchteil dessen, was die Pumpe nimmt, hält also nie mit – über einen Lauf summiert es sich aber auf gut zehn Liter, und ohne diesen Term hielte das Modul eine gesunde Pumpe für verschlissen. Für die Statistik gilt: was von der Schwimmerhöhe abwärts gepumpt wird, ist <b>immer</b> Leitungswasser und wird nie als Ernte gebucht – bis dorthin füllt nur das Ventil, Regen ginge darüber hinaus bis zum Fass-voll-Kontakt.</li>
         <li><b>harvest_today_l</b> / <b>harvest_month_l</b> / <b>harvest_year_l</b> / <b>harvest_total_l</b> - Aufgefangene Regenwassermenge in Litern (heute, laufender Monat, laufendes Jahr, seit Inbetriebnahme). Berechnet als <code>Regenmenge (mm) × roofArea × runoffCoefficient</code>; nur aktiv, wenn <code>roofArea</code> gesetzt ist. Die Perioden-Zähler starten bei Tages-, Monats- bzw. Jahreswechsel automatisch neu, <code>harvest_total_l</code> läuft weiter. Zurücksetzen mit <code>set &lt;name&gt; resetHarvestStats</code>.<br>
             <i>Grenze:</i> Der Wert beziffert, was am Fallrohr ankommt. Was bei vollem Fass überläuft, kann nicht abgezogen werden – die tatsächlich gespeicherte Menge liegt also darunter.</li>
     </ul>
