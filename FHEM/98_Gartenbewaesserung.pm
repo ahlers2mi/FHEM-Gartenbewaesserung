@@ -13,6 +13,30 @@
 #
 ##############################################################################
 #
+# 1.0.77 - 2026-08-25  Fix: der Buchungsdeckel kannte nur das Ziel, nicht die Quelle.
+#                      v1.0.74 begrenzt einen Transfer auf das, was ins Fass passt.
+#                      Was in der QUELLE steht, hat er nie geprueft. Am 25.08. lief
+#                      um 05:07 ein Nachfuellen aus einem IBC, der laut ibcLevel_l
+#                      seit dem Vorabend auf 0 stand: 20,1 min x 15,6 l/min = 314 l,
+#                      gedeckelt auf den Kopfraum von 148 - und diese 148 l wurden
+#                      gebucht. Das Fass sprang auf 100 %, obwohl real nur die rund
+#                      80 l vom Schwimmerventil drin waren. Der Wert bleibt dabei
+#                      haengen: 148 liegt ueber barrelFloatLevel, also hebt ihn auch
+#                      MainsFillTick nicht mehr an, und nur ein echter Kontakt kann
+#                      ihn noch verankern.
+#                      Jetzt wird zusaetzlich am Vorrat gedeckelt - eine Strecke
+#                      liefert nie mehr, als die Quelle hat.
+#
+#                      Zweiter, davon unabhaengiger Fund: der Zweig "Fass leer ->
+#                      aus dem IBC nachfuellen" in HandleBarrelEmpty hat den
+#                      Fass-Füll-Waechter nie armiert. Deshalb kam nach 12 Minuten
+#                      ohne barrelFull kein barrelFillTimeoutAlert, kein "IBC leer",
+#                      und d_ibc_leer blieb auf off - in der naechsten Nacht waere
+#                      derselbe Leerlauf wieder ungemeldet geblieben. Armiert wird
+#                      bewusst nur der IBC-Zweig: ueber das Schwimmerventil wird der
+#                      Fass-voll-Kontakt nie erreicht, im Stadtwasser-Zweig gaebe der
+#                      Waechter bei jeder Befuellung falschen Alarm.
+#
 # 1.0.76 - 2026-08-24  Der Zulauf wird eingerechnet statt das Lernen abzuschalten,
 #                      und sein Wechsel kommt endlich als Ereignis an.
 #                      Bei offenem Hahn speist das Schwimmerventil waehrend eines
@@ -695,7 +719,7 @@ use POSIX;
 # greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
 # gerade selbst geladen) oder die Liste ihr Format aendert.
 {
-    my $FALLBACK = '1.0.76';
+    my $FALLBACK = '1.0.77';
     my $cached;
     sub Gartenbewaesserung_Version {
         return $cached if(defined($cached));
@@ -2193,6 +2217,15 @@ sub Gartenbewaesserung_GetBarrelLevelAfterRefill {
     my $barrelFullSensor = AttrVal($name, "barrelFullSensorDevice", "");
     return 100 if($barrelFullSensor eq "");
     return 100 if(ReadingsVal($name, "barrelFull", "no") eq "yes");
+
+    # Seit es die Liter-Schaetzung gibt, ist ein pauschales "wird schon halb voll
+    # sein" schlechter als das, was das Modul tatsaechlich verbucht hat. Am
+    # 25.08. stand so 50 % im Prozent-Reading, waehrend die Liter-Rechnung 0
+    # sagte - zwei Readings desselben Fasses, die sich widersprachen.
+    my $cap = AttrVal($name, "barrelUsableVolume", 0);
+    my $liter = ReadingsVal($name, "barrelLevel_l", "");
+    return sprintf("%.0f", 100 * $liter / $cap)
+        if($cap > 0 && $liter =~ /^-?\d+(?:\.\d+)?$/);
 
     return $fallbackLevel;
 }
@@ -4221,6 +4254,13 @@ sub Gartenbewaesserung_HandleBarrelEmpty {
             $hash->{HELPER}{barrelEmptyRefillSource} = "ibc";
             $hash->{HELPER}{ibcToBarrelActive} = 1;
             Gartenbewaesserung_NoteIbcToBarrelStart($hash);
+            # Waechter armieren. Auf DIESEM Weg fehlte er - und damit blieb die
+            # Meldung "IBC leer" aus, obwohl 20 Minuten lang nichts ankam
+            # (25.08., 05:07 bis 05:27). Bewusst nur hier und nicht im
+            # Stadtwasser-Zweig darunter: ueber das Schwimmerventil wird der
+            # Fass-voll-Kontakt nie erreicht, dort wuerde der Waechter bei jeder
+            # Befuellung falschen Alarm schlagen.
+            Gartenbewaesserung_StartBarrelFillTimeout($hash);
 
             if($ibcToBarrelPump ne "") {
                 # Ordering follows pumpStartDelay (positive = pump first, negative/zero
@@ -4284,6 +4324,8 @@ sub Gartenbewaesserung_StopBarrelEmptyRefill {
     return if(!$hash->{HELPER}{barrelEmptyRefilling});
 
     Log3 $name, 3, "$name: Stopping barrel empty refill";
+    # Gegenstueck zum Waechter, der in HandleBarrelEmpty armiert wird.
+    Gartenbewaesserung_StopBarrelFillTimeout($hash);
 
     my $source = $hash->{HELPER}{barrelEmptyRefillSource} || "";
 
@@ -5257,6 +5299,21 @@ sub Gartenbewaesserung_NoteIbcToBarrelStop {
                     $name, $headroom, $moved, $minutes);
                 $moved = $headroom;
             }
+        }
+        # Zweiter Deckel, und der fehlte in v1.0.74: eine Strecke kann nicht mehr
+        # liefern, als die QUELLE hat. Am 25.08. buchte ein 20-Minuten-Transfer
+        # 148 l aus einem IBC, der auf 0 stand. Das Fass sprang damit auf 100 %,
+        # und weil 148 ueber barrelFloatLevel liegt, konnte auch MainsFillTick
+        # den Wert nicht mehr einfangen - der Ticker hebt nur bis zur
+        # Schwimmerhoehe an. Vor allem aber galt das Nachfuellen als geglueckt:
+        # kein barrelFillTimeoutAlert, kein "IBC leer", und in der naechsten
+        # Nacht derselbe Leerlauf ohne Warnung.
+        my $vorrat = ReadingsVal($name, "ibcLevel_l", "");
+        if($vorrat =~ /^\d+(?:\.\d+)?$/ && $moved > $vorrat) {
+            Log3 $name, 3, sprintf("%s: IBC->barrel booking capped at %.0f l - that is "
+                . "all the IBC holds (rate would have given %.0f l in %.1f min)",
+                $name, $vorrat, $moved, $minutes);
+            $moved = $vorrat;
         }
     }
 

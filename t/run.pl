@@ -409,6 +409,38 @@ scenario("R  Anker und Bruchteil zaehlen nicht doppelt (v1.0.75)");
             "10 Minuten bringen 44 l, nicht mehr und nicht weniger (ist: $zu)");
 }
 
+scenario("S  Transfer aus leerem IBC erfindet kein Wasser (v1.0.77)");
+{
+    # 25.08., 05:07: Fass leer, Nachfuellen aus einem IBC, der auf 0 steht.
+    # 20 min x Rate = 314 l, gedeckelt auf den Kopfraum 148 - und diese 148
+    # wurden gebucht. Das Fass sprang auf 100 %, obwohl nichts ankam.
+    my $h = build(attr => { ibcToBarrelDuration => 20 });
+    Gartenbewaesserung_SetIbcLevel($h, 0, "test", 1);
+    Gartenbewaesserung_SetBarrelLevel($h, 0, "test", 1);
+    Gartenbewaesserung_StartIBCtoBarrel($h);
+    main::advance(20 * 60 + 30);
+
+    is(rd("barrelLevel_l"), 0, "Fass bleibt leer");
+    is(rd("barrelLevel"), 0, "auch in Prozent");
+    my $g = rd("lastIbcToBarrelVolume_l");
+    ok_true($g eq "unknown" || $g == 0, "nichts gebucht (ist: $g)");
+}
+
+scenario("T  Teilvorrat wird nur bis zum Vorrat gebucht (v1.0.77)");
+{
+    # Gegenprobe: 40 l im IBC, die Rate wuerde 244 l hergeben. Gebucht werden
+    # duerfen genau die 40 - nicht 0 und nicht 148.
+    my $h = build(attr => { ibcToBarrelDuration => 20 });
+    Gartenbewaesserung_SetIbcLevel($h, 40, "test", 1);
+    Gartenbewaesserung_SetBarrelLevel($h, 0, "test", 1);
+    Gartenbewaesserung_StartIBCtoBarrel($h);
+    main::advance(20 * 60 + 30);
+
+    is(rd("lastIbcToBarrelVolume_l"), 40, "genau der Vorrat");
+    is(rd("barrelLevel_l"), 40, "und der steht im Fass");
+    is(rd("ibcLevel_l"), 0, "IBC ist danach leer");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);
