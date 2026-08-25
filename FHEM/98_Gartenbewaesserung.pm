@@ -13,6 +13,30 @@
 #
 ##############################################################################
 #
+# 1.0.78 - 2026-08-25  Neu: mainsDirect_total_l - wieviel Leitungswasser wirklich
+#                      durch das Schwimmerventil gelaufen ist.
+#                      mains_total_l beantwortet die Frage nicht: es zaehlt nur
+#                      Leitungswasser, das anschliessend weiter in den IBC gepumpt
+#                      wurde. Was vom Fass direkt in die Giesskreise ging, taucht
+#                      nirgends auf - und das ist in einer Trockenperiode der
+#                      Loewenanteil. In der Nacht zum 25.08. liefen rund 850 l an
+#                      jeder Statistik vorbei, und die Frage "was muesste auf dem
+#                      Zwischenzaehler stehen" war nur von Hand aus Zeitstempeln zu
+#                      rekonstruieren.
+#                      Gezaehlt wird die Zeit, in der das Ventil offen steht: Hahn
+#                      auf und Fass unter barrelFloatLevel. Gegen den Zwischenzaehler
+#                      geprueft - 1,860 m3 abgelesen gegen 1,8 gerechnet, also auf
+#                      3 % genau ueber drei Tage.
+#                      Gespeichert werden ganze Sekunden, nicht Liter: ein
+#                      Liter-Zaehler wuerde je Takt seinen Nachkommaanteil verlieren
+#                      (siehe v1.0.75), bei 4,4 l/min in einer Nacht ueber 50 l.
+#                      Laeuft im Minutentakt aus CheckSchedule, bewusst neben
+#                      MainsFillTick statt darin: die steigt aus, sobald ein
+#                      Transport laeuft - genau dann aber fuellt der Hahn weiter.
+#                      resetHarvestStats setzt den Zaehler mit zurueck und stempelt
+#                      mainsDirectSince, damit ein Zaehlervergleich einen definierten
+#                      Startpunkt hat.
+#
 # 1.0.77 - 2026-08-25  Fix: der Buchungsdeckel kannte nur das Ziel, nicht die Quelle.
 #                      v1.0.74 begrenzt einen Transfer auf das, was ins Fass passt.
 #                      Was in der QUELLE steht, hat er nie geprueft. Am 25.08. lief
@@ -719,7 +743,7 @@ use POSIX;
 # greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
 # gerade selbst geladen) oder die Liste ihr Format aendert.
 {
-    my $FALLBACK = '1.0.77';
+    my $FALLBACK = '1.0.78';
     my $cached;
     sub Gartenbewaesserung_Version {
         return $cached if(defined($cached));
@@ -986,6 +1010,9 @@ sub Gartenbewaesserung_Set {
         readingsBulkUpdate($hash, "pumpedRain_total_l", "0");
         readingsBulkUpdate($hash, "mains_total_l", "0");
         readingsBulkUpdate($hash, "pumpedOther_total_l", "0");
+        readingsBulkUpdate($hash, "mainsDirect_total_l", "0");
+        readingsBulkUpdate($hash, ".mainsDirectSeconds", "0");
+        readingsBulkUpdate($hash, "mainsDirectSince", TimeNow());
         readingsEndUpdate($hash, 1);
         Log3 $name, 3, "$name: harvest statistics reset";
         return undef;
@@ -5010,6 +5037,63 @@ sub Gartenbewaesserung_MainsFillTick {
     $hash->{HELPER}{drawTainted} = 1;
 }
 
+# Wieviel Leitungswasser ist insgesamt durch das Schwimmerventil gelaufen?
+#
+# Das vorhandene mains_total_l beantwortet die Frage NICHT: es zaehlt nur das
+# Leitungswasser, das anschliessend weiter in den IBC gepumpt wurde. Was vom
+# Fass direkt in die Giesskreise ging, taucht dort nirgends auf - und das ist in
+# einer Trockenperiode der Loewenanteil. In der Nacht zum 25.08. liefen so rund
+# 850 l an jeder Statistik vorbei.
+#
+# Gezaehlt wird die Zeit, in der das Ventil offen steht: Hahn auf und Fass unter
+# der Schwimmerhoehe. Dass daraus die richtige Menge wird, ist am 25.08. gegen
+# den Zwischenzaehler geprueft worden - 1,860 m3 gemessen gegen 1,8 gerechnet.
+#
+# Gespeichert werden ganze SEKUNDEN, nicht Liter. Ein Liter-Zaehler wuerde je
+# Takt seinen Nachkommaanteil verlieren, genau wie MainsFillTick es bis v1.0.75
+# tat - bei 4,4 l/min waeren das 0,4 l pro Minute, in einer Nacht ueber 50 l.
+# Sekunden sind ganzzahlig, da kann nichts wegrunden. Nebeneffekt: wird
+# mainsFillFlow_lpm spaeter genauer bestimmt, rechnet sich die ganze Historie
+# mit - was hier erwuenscht ist, weil die Rate die einzige Unbekannte ist.
+sub Gartenbewaesserung_MainsMeterTick {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    my $rate = AttrVal($name, "mainsFillFlow_lpm", 0);
+    my $float = AttrVal($name, "barrelFloatLevel", 0);
+    my $level = Gartenbewaesserung_BarrelLevelExact($hash);
+
+    # Kein Zulauf, wenn der Hahn zu ist oder das Fass auf Hoehe steht - dann hat
+    # das Schwimmerventil geschlossen. Anker verwerfen, damit die Pause nicht
+    # beim naechsten Oeffnen mitgezaehlt wird.
+    if($rate !~ /^\d+(?:\.\d+)?$/ || $rate <= 0 || $float <= 0
+       || !defined($level) || $level >= $float
+       || Gartenbewaesserung_MainsSupplyState($hash) ne "on") {
+        delete $hash->{HELPER}{mainsMeterAnchor};
+        return;
+    }
+
+    my $now = int(time());
+    my $anchor = $hash->{HELPER}{mainsMeterAnchor};
+    if(!defined($anchor) || $anchor > $now) {
+        # Erster Takt: nur den Anker setzen. Wann der Hahn wirklich aufging,
+        # weiss das Modul nicht - die angefangene Minute wird nicht geschenkt.
+        $hash->{HELPER}{mainsMeterAnchor} = $now;
+        return;
+    }
+    return if($now == $anchor);
+
+    my $sek = ReadingsVal($name, ".mainsDirectSeconds", 0);
+    $sek = 0 if($sek !~ /^\d+$/);
+    $sek += $now - $anchor;
+    $hash->{HELPER}{mainsMeterAnchor} = $now;
+
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, ".mainsDirectSeconds", $sek);
+    readingsBulkUpdate($hash, "mainsDirect_total_l", sprintf("%.0f", $rate * $sek / 60));
+    readingsEndUpdate($hash, 1);
+}
+
 # Foerderrate holen: gelerntes Reading zuerst, dann das gleichnamige Attribut.
 #
 # Gelernt wird nur aus vollstaendigen Laeufen, und Readings ueberleben einen
@@ -6435,6 +6519,12 @@ sub Gartenbewaesserung_CheckSchedule {
 
     # Einziger Taktgeber, der im Betrieb zuverlaessig laeuft (60 s).
     Gartenbewaesserung_MainsFillTick($hash);
+    # Bewusst NICHT in MainsFillTick eingebaut: die steigt aus, sobald ein
+    # Transport laeuft (ibcToBarrelActive, Giessen, Pumpe), weil dort ein anderer
+    # die Fuellstandsbuchung fuehrt. Der Hahn laeuft in dieser Zeit aber weiter -
+    # in der Nacht zum 25.08. waren genau das acht Nachfuellpausen a 81 l, die
+    # dem Zaehler sonst entgingen.
+    Gartenbewaesserung_MainsMeterTick($hash);
     Gartenbewaesserung_MainsFillIbcTick($hash);
 
     my ($sec, $min, $hour, $mday, $mon, $year, $wday) = localtime(time);
@@ -7334,7 +7424,11 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>mainsSupply</b> - <code>on</code>/<code>off</code>; Zustand der Hauswasserzufuhr laut <code>mainsSupplyDevice</code>. Mit <code>mainsFillFlow_lpm</code> lässt das Modul <code>barrelLevel_l</code> währenddessen mitsteigen.</li>
         <li><b>mainsFillIbcTarget</b> / <b>mainsFillIbcDone</b> / <b>mainsFillIbcState</b> - Auftrag, Fortschritt und Lage einer Befüllung per <code>set … mainsFillIbc</code>. <code>Target</code> auf <code>0</code> heißt: kein Auftrag aktiv, und <code>State</code> hält dann fest, warum er endete (<code>done</code>, <code>ibcFull</code>, <code>no water - tap closed?</code>, <code>stopped by hand</code>).</li>
         <li><b>lastIbcFillSource</b> - <code>rain</code> (Hauswasser war zu, reines Regenwasser), <code>mixed</code> (Hauswasser offen, Leitungswasser lief mit), <code>other</code> (angesagtes Fremdwasser, siehe <code>set &lt;name&gt; waterSource</code>) oder <code>unknown</code> (kein <code>mainsSupplyDevice</code> gesetzt).</li>
-        <li><b>pumped_total_l</b> / <b>pumpedRain_total_l</b> / <b>mains_total_l</b> - Insgesamt vom Fass in den IBC gefördertes Volumen, aufgeteilt in Regen- und Leitungswasseranteil. <code>pumpedRain_total_l</code> lässt sich direkt gegen <code>harvest_total_l</code> halten: Weichen die Werte dauerhaft voneinander ab, stimmt <code>roofArea</code> nicht. Läufe mit offener Hauswasserzufuhr steuern ihren Regenanteil nur bei, wenn <code>barrelFloatLevel</code> gesetzt ist. Zurücksetzen mit <code>set &lt;name&gt; resetHarvestStats</code>.</li>
+        <li><b>pumped_total_l</b> / <b>pumpedRain_total_l</b> / <b>mains_total_l</b> - Insgesamt vom Fass in den IBC gefördertes Volumen, aufgeteilt in Regen- und Leitungswasseranteil. <code>pumpedRain_total_l</code> lässt sich direkt gegen <code>harvest_total_l</code> halten: Weichen die Werte dauerhaft voneinander ab, stimmt <code>roofArea</code> nicht. Läufe mit offener Hauswasserzufuhr steuern ihren Regenanteil nur bei, wenn <code>barrelFloatLevel</code> gesetzt ist. Zurücksetzen mit <code>set &lt;name&gt; resetHarvestStats</code>.<br>
+            <b>Achtung:</b> <code>mains_total_l</code> ist <b>nicht</b> der Leitungswasserverbrauch. Es zählt nur den Anteil, der anschließend weiter in den IBC gepumpt wurde. Was vom Fass direkt in die Gießkreise ging, steht in <code>mainsDirect_total_l</code>.</li>
+        <li><b>mainsDirect_total_l</b> / <b>mainsDirectSince</b> - Gesamtes Leitungswasser, das durch das Schwimmerventil ins Fass gelaufen ist, seit dem Zeitstempel in <code>mainsDirectSince</code>. Das ist die Zahl, die man gegen einen Zwischenzähler halten kann.<br>
+            Gerechnet wird aus der Zeit, in der das Ventil offen steht — Hahn auf (<code>mainsSupplyDevice</code>) und Fass unter <code>barrelFloatLevel</code> — mal <code>mainsFillFlow_lpm</code>. Am 25.08.2026 gegen einen Zwischenzähler geprüft: 1,860 m³ abgelesen gegen 1,8 m³ gerechnet, über drei Tage also auf rund 3&nbsp;% genau.<br>
+            Intern werden ganze Sekunden geführt, nicht Liter — ein Liter-Zähler verlöre je Takt seinen Nachkommaanteil. Wird <code>mainsFillFlow_lpm</code> später genauer bestimmt, rechnet sich die gesamte Historie mit; das ist beabsichtigt, weil die Rate die einzige Unbekannte der Rechnung ist. Zurücksetzen mit <code>set &lt;name&gt; resetHarvestStats</code>.</li>
         <li><b>waterSource</b> - <code>rain</code> (Normalfall) oder <code>other</code>, siehe <code>set &lt;name&gt; waterSource</code>. Fällt beim nächsten <code>barrelEmpty</code> automatisch auf <code>rain</code> zurück.</li>
         <li><b>pumpedOther_total_l</b> - Insgesamt gefördertes Volumen aus Fremdwasser-Läufen. Bewusst getrennt von <code>pumpedRain_total_l</code>, damit der Abgleich gegen <code>harvest_total_l</code> und damit die Bestimmung von <code>roofArea</code> sauber bleibt.</li>
         <li><b>lastIbcFillRain_l</b> / <b>lastIbcFillMains_l</b> - Aufteilung des letzten Laufs. Nur gefüllt, wenn <code>mainsSupplyDevice</code> konfiguriert ist.</li>
