@@ -441,6 +441,45 @@ scenario("T  Teilvorrat wird nur bis zum Vorrat gebucht (v1.0.77)");
     is(rd("ibcLevel_l"), 0, "IBC ist danach leer");
 }
 
+scenario("U  Leitungswasser-Zaehler laeuft nur bei offenem Ventil (v1.0.78)");
+{
+    # Hahn auf, Fass leer -> das Schwimmerventil steht offen, 4,4 l/min.
+    my $h = build(mains => "on");
+    Gartenbewaesserung_SetBarrelLevel($h, 0, "test", 1);
+    main::advance(60);                                # erster Takt setzt den Anker
+    main::advance(10 * 60);
+    my $a = rd("mainsDirect_total_l");
+    ok_true($a >= 43 && $a <= 45, "10 min offen = 44 l (ist: $a)");
+
+    # Fass auf Schwimmerhoehe -> Ventil zu, es darf nichts mehr dazukommen.
+    Gartenbewaesserung_SetBarrelLevel($h, 81, "test", 1);
+    main::advance(10 * 60);
+    is(rd("mainsDirect_total_l"), $a, "bei vollem Schwimmer steht der Zaehler");
+
+    # Hahn zu, Fass wieder leer -> ebenfalls nichts.
+    Gartenbewaesserung_SetBarrelLevel($h, 0, "test", 1);
+    sens("stadtwasser", "off");
+    main::advance(10 * 60);
+    is(rd("mainsDirect_total_l"), $a, "bei zugedrehtem Hahn ebenso");
+}
+
+scenario("V  Zaehlt weiter, waehrend MainsFillTick aussetzt (v1.0.78)");
+{
+    # Der Grund, warum der Zaehler NEBEN MainsFillTick sitzt und nicht darin:
+    # sobald ein Transport laeuft, steigt MainsFillTick aus - der Hahn fuellt
+    # aber weiter. In der Nacht zum 25.08. waren das acht Nachfuellpausen.
+    # Zugleich der Nachkomma-Test: bei 4,4 l/min wuerde ein Liter-Zaehler je
+    # Minute 0,4 l wegrunden, ueber 60 Takte also 24 l von 264.
+    my $h = build(mains => "on");
+    $h->{HELPER}{watering} = 1;                       # MainsFillTick setzt aus
+    Gartenbewaesserung_SetBarrelLevel($h, 0, "test", 1);
+    main::advance(60);                                # erster Takt setzt den Anker
+    for (1 .. 60) { main::advance(60) }
+    my $v = rd("mainsDirect_total_l");
+    is(rd("barrelLevel_l"), 0, "MainsFillTick hat wirklich ausgesetzt");
+    ok_true($v >= 263 && $v <= 265, "60 Minuten ergeben 264 l, nicht 240 (ist: $v)");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);
