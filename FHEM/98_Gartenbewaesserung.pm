@@ -13,6 +13,28 @@
 #
 ##############################################################################
 #
+# 1.0.79 - 2026-08-26  Fix: das Schwimmer-Lernen aus v1.0.76 hat sich hochgeschaukelt.
+#                      Ein Lauf galt als Messung, sobald MainsFillIbcTick ihn
+#                      gestartet hatte. Der Tick entscheidet aber anhand von
+#                      barrelLevel_l - und genau das kann daneben liegen. Am 25.08.
+#                      um 10:17 lief so eine "Schwimmer-Runde" 61 Sekunden: 81 l in
+#                      einer Minute waeren 80 l/min. Der Anfangsstand wird ohnehin
+#                      mitgeschrieben (ibcFillBarrelAtStart), jetzt wird er geprueft.
+#
+#                      Zweitens die Ausreisser-Bremse selbst: sie mass gegen das
+#                      GELERNTE Reading, also gegen die Groesse, die entgleisen
+#                      kann. Damit wandert die Grenze mit, und jeder Schritt bleibt
+#                      fuer sich "plausibel" - so kroch ibcFillFlow_lpm von 34 auf
+#                      49,6. Gemessen wird jetzt gegen das Attribut, das von Hand
+#                      gesetzt ist und nicht driftet, und die obere Grenze ist von
+#                      2,0 auf 1,5 heruntergezogen.
+#
+#                      Die Folgen der 49,6 reichten weit: die Notbremse in
+#                      n_d_RegenwasserPumpe rechnet 1,6 x barrelUsableVolume /
+#                      ibcFillFlow_lpm und stand damit auf 4,8 Minuten. In der Nacht
+#                      zum 26.08. hat sie fuenfmal "Fass leer" gemeldet, waehrend
+#                      die Pumpe 473 bis 482 W zog - also mitten im Betrieb.
+#
 # 1.0.78 - 2026-08-25  Neu: mainsDirect_total_l - wieviel Leitungswasser wirklich
 #                      durch das Schwimmerventil gelaufen ist.
 #                      mains_total_l beantwortet die Frage nicht: es zaehlt nur
@@ -743,7 +765,7 @@ use POSIX;
 # greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
 # gerade selbst geladen) oder die Liste ihr Format aendert.
 {
-    my $FALLBACK = '1.0.78';
+    my $FALLBACK = '1.0.79';
     my $cached;
     sub Gartenbewaesserung_Version {
         return $cached if(defined($cached));
@@ -5484,8 +5506,20 @@ sub Gartenbewaesserung_RecordIbcFillRun {
     # steht der Hahn per Definition offen ($source ist immer "mixed"), das
     # Schwimmerventil ist aber zu, solange das Fass auf Hoehe steht, und der
     # Pumpenlauf ist zu kurz, als dass nennenswert nachliefe.
+    # Dass MainsFillIbcTick den Lauf gestartet hat, reicht als Nachweis NICHT:
+    # der Tick entscheidet anhand von barrelLevel_l, und genau das kann daneben
+    # liegen. Am 25.08. lief so eine "Schwimmer-Runde" 61 Sekunden - 81 l in
+    # einer Minute waeren 80 l/min gewesen, und die Rate kroch bis 49,6, was
+    # wiederum die Notbremse der Trockenlauferkennung auf 4,8 Minuten stellte.
+    # Der Anfangsstand wird ohnehin mitgeschrieben; hier wird er geprueft.
     my $floatRun = (!$complete && $fromFloat && $reason eq "barrelEmpty"
-                    && $float > 0) ? 1 : 0;
+                    && $float > 0
+                    && defined($barrelAtStart) && $barrelAtStart >= $float - 2) ? 1 : 0;
+    if(!$complete && $fromFloat && !$floatRun && $reason eq "barrelEmpty" && $float > 0) {
+        Log3 $name, 3, sprintf("%s: mains round started at %s l instead of the float "
+            . "level %.0f l - not counted as a measurement",
+            $name, defined($barrelAtStart) ? sprintf("%.0f", $barrelAtStart) : "?", $float);
+    }
 
     # Bei offenem Hahn speist das Schwimmerventil waehrend des Laufs weiter.
     # Es liefert nur mainsFillFlow_lpm gegen ein Vielfaches davon aus der Pumpe,
@@ -5595,9 +5629,18 @@ sub Gartenbewaesserung_RecordIbcFillRun {
         # Ausreisser-Bremse: ein Lauf, der nicht wirklich am gedachten Startpunkt
         # begann (Fass noch nicht auf Hoehe, vorzeitig abgebrochen), liefert einen
         # wilden Wert. Die Rate darf sich daran nicht verbiegen.
-        if($rate > 0 && ($measured > 2 * $rate || $measured < 0.4 * $rate)) {
+        #
+        # Gemessen wird gegen das ATTRIBUT, nicht gegen das gelernte Reading.
+        # Das Reading ist genau die Groesse, die hier entgleisen kann - haelt man
+        # die Grenze daran fest, wandert sie mit und die Bremse greift nie. Am
+        # 25.08. ist die Rate so von 34 auf 49,6 gekrochen, jeder Schritt fuer
+        # sich noch "plausibel". Das Attribut ist dagegen von Hand gesetzt und
+        # driftet nicht.
+        my $anker = AttrVal($name, "ibcFillFlow_lpm", 0);
+        $anker = $rate if($anker !~ /^\d+(?:\.\d+)?$/ || $anker <= 0);
+        if($anker > 0 && ($measured > 1.5 * $anker || $measured < 0.4 * $anker)) {
             Log3 $name, 3, sprintf("%s: barrel->IBC run gives %.1f l/min against a "
-                . "learned %.1f - implausible, rate left untouched", $name, $measured, $rate);
+                . "nominal %.1f - implausible, rate left untouched", $name, $measured, $anker);
         }
         else {
             # Damped average so a single odd run does not dominate
@@ -7438,7 +7481,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>ibcToBarrelFlow_lpm</b> / <b>lastIbcToBarrelVolume_l</b> - Gelernte Rate der Schwerkraftrichtung IBC&nbsp;&rarr;&nbsp;Fass und die daraus geschätzte Menge des letzten Rücklaufs. Gelernt wird nur aus Läufen, die bei leerem Fass beginnen und mit <code>barrelFull</code> enden – die haben <code>barrelUsableVolume</code> bewegt.</li>
         <li><b>lastIbcToBarrelDuration</b> / <b>lastIbcToBarrelEnd</b> - Dauer (Minuten) und Endgrund (<code>barrelFull</code>, <code>pauseEnd</code>) des letzten Laufs IBC&nbsp;&rarr;&nbsp;Fass, einschließlich der Schwerkraft-Nachspeisung während einer Gießpause.</li>
         <li><b>lastIbcFillDuration</b> / <b>lastIbcFillEnd</b> / <b>lastIbcFillVolume_l</b> - Dauer (Minuten), Endgrund (<code>barrelEmpty</code>, <code>ibcFull</code>, <code>watering</code>, <code>rainStopped</code>, <code>ibcToBarrel</code>, <code>manual</code>) und bewegtes Volumen der letzten Befüllung Fass&nbsp;&rarr;&nbsp;IBC.</li>
-        <li><b>ibcFillFlow_lpm</b> - Gelernte Förderrate in Litern pro Minute, gedämpft gemittelt, sinkt also automatisch mit, wenn der Filter zusetzt. Fortgeschrieben wird sie aus den beiden Läufen mit <b>bekannter Menge</b>: aus dem vollen Fass bis <code>barrelEmpty</code> (das sind <code>barrelUsableVolume</code>, braucht aber Regen) und – seit v1.0.74 – aus einer Stadtwasser-Runde von der Schwimmerhöhe bis <code>barrelEmpty</code> (das sind <code>barrelFloatLevel</code>). Ohne den zweiten Fall bliebe die Rate in einer regenlosen Woche stehen, während die Pumpe längst langsamer geworden ist. Ein Wert, der mehr als das Doppelte oder weniger als 40&nbsp;% des bisherigen ergäbe, wird verworfen statt gelernt.<br>
+        <li><b>ibcFillFlow_lpm</b> - Gelernte Förderrate in Litern pro Minute, gedämpft gemittelt, sinkt also automatisch mit, wenn der Filter zusetzt. Fortgeschrieben wird sie aus den beiden Läufen mit <b>bekannter Menge</b>: aus dem vollen Fass bis <code>barrelEmpty</code> (das sind <code>barrelUsableVolume</code>, braucht aber Regen) und – seit v1.0.74 – aus einer Stadtwasser-Runde von der Schwimmerhöhe bis <code>barrelEmpty</code> (das sind <code>barrelFloatLevel</code>). Ohne den zweiten Fall bliebe die Rate in einer regenlosen Woche stehen, während die Pumpe längst langsamer geworden ist. Zwei Sicherungen halten das Lernen im Zaum (seit v1.0.79): eine Stadtwasser-Runde zählt nur, wenn das Fass beim Pumpenstart wirklich auf Schwimmerhöhe stand — dass <code>mainsFillIbc</code> den Lauf angestoßen hat, reicht nicht, denn dessen Entscheidung hängt selbst an der Füllstandsschätzung. Und ein Wert über dem 1,5-fachen oder unter 40&nbsp;% des <b>Attributs</b> wird verworfen. Bewusst das Attribut und nicht das gelernte Reading: an letzterem festgemacht wandert die Grenze mit dem Fehler mit, jeder Schritt bleibt für sich plausibel, und die Rate schaukelt sich hoch — am 25.08.2026 von 34 auf 49,6, was wiederum die Notbremse der Trockenlauferkennung auf 4,8 Minuten stellte.<br>
             Steht der Hahn dabei offen, kommt <code>mainsFillFlow_lpm × Laufzeit</code> als Zulauf hinzu (seit v1.0.76). Das Schwimmerventil liefert nur einen Bruchteil dessen, was die Pumpe nimmt, hält also nie mit – über einen Lauf summiert es sich aber auf gut zehn Liter, und ohne diesen Term hielte das Modul eine gesunde Pumpe für verschlissen. Für die Statistik gilt: was von der Schwimmerhöhe abwärts gepumpt wird, ist <b>immer</b> Leitungswasser und wird nie als Ernte gebucht – bis dorthin füllt nur das Ventil, Regen ginge darüber hinaus bis zum Fass-voll-Kontakt.</li>
         <li><b>harvest_today_l</b> / <b>harvest_month_l</b> / <b>harvest_year_l</b> / <b>harvest_total_l</b> - Aufgefangene Regenwassermenge in Litern (heute, laufender Monat, laufendes Jahr, seit Inbetriebnahme). Berechnet als <code>Regenmenge (mm) × roofArea × runoffCoefficient</code>; nur aktiv, wenn <code>roofArea</code> gesetzt ist. Die Perioden-Zähler starten bei Tages-, Monats- bzw. Jahreswechsel automatisch neu, <code>harvest_total_l</code> läuft weiter. Zurücksetzen mit <code>set &lt;name&gt; resetHarvestStats</code>.<br>
             <i>Grenze:</i> Der Wert beziffert, was am Fallrohr ankommt. Was bei vollem Fass überläuft, kann nicht abgezogen werden – die tatsächlich gespeicherte Menge liegt also darunter.</li>
