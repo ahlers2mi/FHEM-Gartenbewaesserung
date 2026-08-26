@@ -480,6 +480,37 @@ scenario("V  Zaehlt weiter, waehrend MainsFillTick aussetzt (v1.0.78)");
     ok_true($v >= 263 && $v <= 265, "60 Minuten ergeben 264 l, nicht 240 (ist: $v)");
 }
 
+scenario("W  Schwimmer-Runde unterhalb der Schwimmerhoehe zaehlt nicht (v1.0.79)");
+{
+    # MainsFillIbcTick hat den Lauf gestartet, das Fass stand aber nur bei 40 l.
+    # Bis v1.0.78 galt allein der Start durch den Tick als Nachweis - und der
+    # entscheidet anhand von barrelLevel_l, das daneben liegen kann.
+    my $h = build(mains => "on");
+    main::readingsSingleUpdate($h, "barrelLevel_l", 40, 0);
+    Gartenbewaesserung_StartIBCFill($h, 1, 1);
+    main::advance(80);
+    sens("barrelEmpty", "yes");
+
+    is(rd("ibcFillFlow_lpm"), "34.2", "Rate unveraendert");
+    ok_true(rd("lastIbcFillVolume_l") ne "81", "und die 81 werden nicht gebucht");
+}
+
+scenario("X  Ausreisser wird am Attribut gemessen, nicht am Reading (v1.0.79)");
+{
+    # Der Fall vom 25.08. um 10:17: Schwimmer-Runde in 61 Sekunden, also gut
+    # 83 l/min. Steht das gelernte Reading schon auf 49,6, liess die alte
+    # Bremse (2 x Reading = 99) den Wert durch - so kroch die Rate immer weiter.
+    # Das Attribut bleibt bei 34,2 und haelt die Grenze fest.
+    my $h = build(mains => "on");
+    main::readingsSingleUpdate($h, "ibcFillFlow_lpm", 49.6, 0);
+    main::readingsSingleUpdate($h, "barrelLevel_l", 81, 0);
+    Gartenbewaesserung_StartIBCFill($h, 1, 1);
+    main::advance(61);
+    sens("barrelEmpty", "yes");
+
+    is(rd("ibcFillFlow_lpm"), "49.6", "Rate bleibt stehen, statt weiter zu klettern");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);
