@@ -511,6 +511,42 @@ scenario("X  Ausreisser wird am Attribut gemessen, nicht am Reading (v1.0.79)");
     is(rd("ibcFillFlow_lpm"), "49.6", "Rate bleibt stehen, statt weiter zu klettern");
 }
 
+scenario("Y  Zu kurzer Schwimmer-Lauf bucht nur Rate x Zeit (v1.0.80)");
+{
+    # Der Fall vom 27.08.: zehn Runden buchten je ~85 l, sechs davon liefen
+    # unter 1,3 Minuten. Bei 34,2 l/min sind 1,2 min hoechstens 41 l - nicht 86.
+    # Der IBC stand danach auf 874 statt auf etwa 494.
+    my $h = build(mains => "on");
+    Gartenbewaesserung_SetIbcLevel($h, 0, "test", 1);
+    main::readingsSingleUpdate($h, "barrelLevel_l", 81, 0);
+    Gartenbewaesserung_StartIBCFill($h, 1, 1);
+    main::advance(72);                                # 1,2 min
+    sens("barrelEmpty", "yes");
+
+    my $g = rd("lastIbcFillVolume_l");
+    ok_true($g >= 38 && $g <= 48, "gebucht werden ~41 l statt 86 (ist: $g)");
+    ok_true(rd("ibcLevel_l") <= 48, "und nur die kommen im IBC an (ist: "
+            . rd("ibcLevel_l") . ")");
+    is(rd("ibcFillFlow_lpm"), "34.2", "aus einem gekappten Lauf wird nicht gelernt");
+}
+
+scenario("Z  Ein ausreichend langer Lauf bleibt ungekappt (v1.0.80)");
+{
+    # Gegenprobe: 2,4 min sind bei 34,2 l/min genau die Schwimmermenge. Hier
+    # darf die Schranke nicht zuschlagen, sonst waere der Fix eine Verschlimm-
+    # besserung und Szenario N gaebe es nicht mehr.
+    my $h = build(mains => "on");
+    Gartenbewaesserung_SetIbcLevel($h, 0, "test", 1);
+    main::readingsSingleUpdate($h, "barrelLevel_l", 81, 0);
+    Gartenbewaesserung_StartIBCFill($h, 1, 1);
+    main::advance(160);                               # 2:40
+    sens("barrelEmpty", "yes");
+
+    my $g = rd("lastIbcFillVolume_l");
+    ok_true($g >= 92 && $g <= 94, "volle Schwimmermenge plus Zulauf (ist: $g)");
+    ok_true(rd("ibcFillFlow_lpm") > 34.2, "und die Rate lernt weiterhin");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);

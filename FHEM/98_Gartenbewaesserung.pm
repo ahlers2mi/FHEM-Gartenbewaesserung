@@ -13,6 +13,24 @@
 #
 ##############################################################################
 #
+# 1.0.80 - 2026-08-28  Fix: eine Pumpe bewegt nie mehr als Rate x Laufzeit.
+#                      $complete und $floatRun setzen eine BEKANNTE Menge an -
+#                      barrelUsableVolume bzw. barrelFloatLevel. Ob der Lauf
+#                      ueberhaupt lange genug dafuer war, hat niemand geprueft.
+#                      Am 27.08. buchten zehn Stadtwasser-Runden je rund 85 l,
+#                      sechs davon in 0,5 bis 1,3 Minuten. Bei 34 l/min sind das
+#                      17 bis 44 l, nicht 85. Der IBC stand danach auf 874 statt
+#                      auf etwa 494 - 379 l, die es nie gab.
+#                      Der Prueflauf ist trivial und braucht keine neue Groesse:
+#                      liegt die angesetzte Menge ueber Foerderrate x Laufzeit,
+#                      war das Fass nicht dort, wo das Etikett behauptet. Dann
+#                      gilt die Physik, nicht die Annahme.
+#                      Ein so gekappter Lauf zaehlt ausserdem nicht mehr als
+#                      Messung: die Rate darf nicht aus einem Lauf lernen, dessen
+#                      Mengenannahme sich gerade als unmoeglich erwiesen hat.
+#                      Damit ist der dritte Deckel derselben Familie beisammen -
+#                      Ziel (v1.0.74), Quelle (v1.0.77) und jetzt Durchsatz.
+#
 # 1.0.79 - 2026-08-26  Fix: das Schwimmer-Lernen aus v1.0.76 hat sich hochgeschaukelt.
 #                      Ein Lauf galt als Messung, sobald MainsFillIbcTick ihn
 #                      gestartet hatte. Der Tick entscheidet aber anhand von
@@ -765,7 +783,7 @@ use POSIX;
 # greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
 # gerade selbst geladen) oder die Liste ihr Format aendert.
 {
-    my $FALLBACK = '1.0.79';
+    my $FALLBACK = '1.0.80';
     my $cached;
     sub Gartenbewaesserung_Version {
         return $cached if(defined($cached));
@@ -5533,11 +5551,29 @@ sub Gartenbewaesserung_RecordIbcFillRun {
     my $topUp = $inflow * $minutes;
 
     my $moved = 0;
+    my $gekappt = 0;
     if($complete) {
         $moved = $volume + $topUp;
     }
     elsif($floatRun) {
         $moved = $float + $topUp;
+    }
+    # Die harte Schranke ueber allem: eine Pumpe bewegt nie mehr als
+    # Foerderrate x Laufzeit. $complete und $floatRun setzen eine BEKANNTE Menge
+    # an - aber nur, wenn der Lauf auch lange genug dafuer war. Am 27.08. buchten
+    # zehn Stadtwasser-Runden je rund 85 l, sechs davon in 0,5 bis 1,3 Minuten;
+    # bei 34 l/min sind das 17 bis 44 l. Der IBC stand danach auf 874 statt auf
+    # etwa 494. Ein zu kurzer Lauf heisst: das Fass war nicht dort, wo das
+    # Etikett behauptet - dann gilt die Messung nicht, sondern die Physik.
+    if(($complete || $floatRun) && $rate > 0) {
+        my $schranke = $rate * $minutes + $topUp;
+        if($moved > $schranke) {
+            Log3 $name, 3, sprintf("%s: run of %.1f min booked as %.0f l, but %.1f l/min "
+                . "can only move %.0f l - barrel was not where it was assumed",
+                $name, $minutes, $moved, $rate, $schranke);
+            $moved = $schranke;
+            $gekappt = 1;
+        }
     }
     elsif($rate > 0) {
         $moved = $rate * $minutes;
@@ -5621,9 +5657,12 @@ sub Gartenbewaesserung_RecordIbcFillRun {
     # dem, was der Hahn waehrend des Laufs nachgeliefert hat. Nur so zieht die
     # Rate den Filterverschleiss nach; ohne den zweiten Fall bleibt sie in einer
     # regenlosen Woche stehen und bucht dauerhaft zu viel.
+    # Ein gekappter Lauf ist keine Messung mehr: die angesetzte Menge hat sich
+    # gerade als unmoeglich erwiesen, also darf die Rate erst recht nicht daraus
+    # lernen - sonst lernt sie genau den Fehler, der sie gekappt hat.
     my $known = 0;
-    $known = $volume + $topUp if($complete);
-    $known = $float  + $topUp if($floatRun);
+    $known = $volume + $topUp if($complete && !$gekappt);
+    $known = $float  + $topUp if($floatRun && !$gekappt);
     if($known > 0) {
         my $measured = $known / $minutes;
         # Ausreisser-Bremse: ein Lauf, der nicht wirklich am gedachten Startpunkt
