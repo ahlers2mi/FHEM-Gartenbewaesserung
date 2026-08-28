@@ -13,6 +13,45 @@
 #
 ##############################################################################
 #
+# 1.0.81 - 2026-08-28  Fix: der Anker des Zulauf-Tickers ueberlebte eine
+#                      Neuverankerung des Fassstands - die eigentliche Ursache
+#                      hinter den 874 l im IBC.
+#                      MainsFillTick rechnet seit v1.0.73 gegen einen Anker aus
+#                      Zeitpunkt und Pegel. Wird der Fassstand von AUSSEN neu
+#                      verankert (barrelEmpty, barrelFull, set barrelLevel),
+#                      blieb dieser Anker stehen. Beim naechsten Takt ergibt
+#                      Ankerpegel + Rate x verstrichene Zeit dann laengst mehr
+#                      als die Schwimmerhoehe, wird darauf gedeckelt - und der
+#                      gerade auf 0 verankerte Stand springt in EINEM Schritt
+#                      auf 81.
+#                      Im Log vom 27.08.: 12:51:49 barrelEmpty -> 0, 12:52:16
+#                      wieder 81. MainsFillIbcTick hielt das Fass daraufhin nach
+#                      einer Minute erneut fuer bereit statt nach achtzehn, die
+#                      Pumpe lief 30 bis 60 Sekunden ins Leere, und der Lauf
+#                      wurde als volle Schwimmer-Runde ueber 81 l gebucht. Zehn
+#                      Runden ergaben so 873 gebuchte gegen 494 moegliche Liter.
+#                      Der Durchsatz-Deckel aus v1.0.80 faengt den Buchungs-
+#                      schaden ab, aber nicht die sinnlosen Pumpenlaeufe - das
+#                      ist hier die Ursache, dort das Symptom.
+#
+# 1.0.80 - 2026-08-28  Fix: eine Pumpe bewegt nie mehr als Rate x Laufzeit.
+#                      $complete und $floatRun setzen eine BEKANNTE Menge an -
+#                      barrelUsableVolume bzw. barrelFloatLevel. Ob der Lauf
+#                      ueberhaupt lange genug dafuer war, hat niemand geprueft.
+#                      Am 27.08. buchten zehn Stadtwasser-Runden je rund 85 l,
+#                      sechs davon in 0,5 bis 1,3 Minuten. Bei 34 l/min sind das
+#                      17 bis 44 l, nicht 85. Der IBC stand danach auf 874 statt
+#                      auf etwa 494 - 379 l, die es nie gab.
+#                      Der Prueflauf ist trivial und braucht keine neue Groesse:
+#                      liegt die angesetzte Menge ueber Foerderrate x Laufzeit,
+#                      war das Fass nicht dort, wo das Etikett behauptet. Dann
+#                      gilt die Physik, nicht die Annahme.
+#                      Ein so gekappter Lauf zaehlt ausserdem nicht mehr als
+#                      Messung: die Rate darf nicht aus einem Lauf lernen, dessen
+#                      Mengenannahme sich gerade als unmoeglich erwiesen hat.
+#                      Damit ist der dritte Deckel derselben Familie beisammen -
+#                      Ziel (v1.0.74), Quelle (v1.0.77) und jetzt Durchsatz.
+#
 # 1.0.79 - 2026-08-26  Fix: das Schwimmer-Lernen aus v1.0.76 hat sich hochgeschaukelt.
 #                      Ein Lauf galt als Messung, sobald MainsFillIbcTick ihn
 #                      gestartet hatte. Der Tick entscheidet aber anhand von
@@ -765,7 +804,7 @@ use POSIX;
 # greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
 # gerade selbst geladen) oder die Liste ihr Format aendert.
 {
-    my $FALLBACK = '1.0.79';
+    my $FALLBACK = '1.0.81';
     my $cached;
     sub Gartenbewaesserung_Version {
         return $cached if(defined($cached));
@@ -4942,6 +4981,19 @@ sub Gartenbewaesserung_SetBarrelLevel {
     readingsBulkUpdate($hash, "barrelLevel", sprintf("%.0f", 100 * $liters / $capacity));
     readingsBulkUpdate($hash, "barrelLevelAnchor", TimeNow() . " " . $reason) if($anchor);
     readingsEndUpdate($hash, 1);
+
+    # Wird der Stand von AUSSEN verankert - barrelEmpty, barrelFull oder von
+    # Hand -, muss der Anker des Zulauf-Tickers weg. Sonst rechnet der beim
+    # naechsten Takt aus seiner alten Zeit weiter, landet ueber der
+    # Schwimmerhoehe und setzt den gerade verankerten Stand in EINEM Schritt
+    # wieder auf voll.
+    #
+    # Genau das ist am 27.08. passiert: 12:51:49 barrelEmpty -> 0, 12:52:16
+    # wieder 81. MainsFillIbcTick hielt das Fass daraufhin nach einer Minute
+    # erneut fuer bereit statt nach achtzehn, die Pumpe lief 30 bis 60 Sekunden
+    # ins Leere, und der Lauf wurde als volle Schwimmer-Runde gebucht. Zehn
+    # Runden, 873 gebuchte Liter, 494 moegliche.
+    delete $hash->{HELPER}{mainsFillAnchor} if($anchor);
 }
 
 # Fuellstand einschliesslich des mitgefuehrten Bruchteils.
@@ -5533,11 +5585,29 @@ sub Gartenbewaesserung_RecordIbcFillRun {
     my $topUp = $inflow * $minutes;
 
     my $moved = 0;
+    my $gekappt = 0;
     if($complete) {
         $moved = $volume + $topUp;
     }
     elsif($floatRun) {
         $moved = $float + $topUp;
+    }
+    # Die harte Schranke ueber allem: eine Pumpe bewegt nie mehr als
+    # Foerderrate x Laufzeit. $complete und $floatRun setzen eine BEKANNTE Menge
+    # an - aber nur, wenn der Lauf auch lange genug dafuer war. Am 27.08. buchten
+    # zehn Stadtwasser-Runden je rund 85 l, sechs davon in 0,5 bis 1,3 Minuten;
+    # bei 34 l/min sind das 17 bis 44 l. Der IBC stand danach auf 874 statt auf
+    # etwa 494. Ein zu kurzer Lauf heisst: das Fass war nicht dort, wo das
+    # Etikett behauptet - dann gilt die Messung nicht, sondern die Physik.
+    if(($complete || $floatRun) && $rate > 0) {
+        my $schranke = $rate * $minutes + $topUp;
+        if($moved > $schranke) {
+            Log3 $name, 3, sprintf("%s: run of %.1f min booked as %.0f l, but %.1f l/min "
+                . "can only move %.0f l - barrel was not where it was assumed",
+                $name, $minutes, $moved, $rate, $schranke);
+            $moved = $schranke;
+            $gekappt = 1;
+        }
     }
     elsif($rate > 0) {
         $moved = $rate * $minutes;
@@ -5621,9 +5691,12 @@ sub Gartenbewaesserung_RecordIbcFillRun {
     # dem, was der Hahn waehrend des Laufs nachgeliefert hat. Nur so zieht die
     # Rate den Filterverschleiss nach; ohne den zweiten Fall bleibt sie in einer
     # regenlosen Woche stehen und bucht dauerhaft zu viel.
+    # Ein gekappter Lauf ist keine Messung mehr: die angesetzte Menge hat sich
+    # gerade als unmoeglich erwiesen, also darf die Rate erst recht nicht daraus
+    # lernen - sonst lernt sie genau den Fehler, der sie gekappt hat.
     my $known = 0;
-    $known = $volume + $topUp if($complete);
-    $known = $float  + $topUp if($floatRun);
+    $known = $volume + $topUp if($complete && !$gekappt);
+    $known = $float  + $topUp if($floatRun && !$gekappt);
     if($known > 0) {
         my $measured = $known / $minutes;
         # Ausreisser-Bremse: ein Lauf, der nicht wirklich am gedachten Startpunkt

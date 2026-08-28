@@ -511,6 +511,71 @@ scenario("X  Ausreisser wird am Attribut gemessen, nicht am Reading (v1.0.79)");
     is(rd("ibcFillFlow_lpm"), "49.6", "Rate bleibt stehen, statt weiter zu klettern");
 }
 
+scenario("Y  Zu kurzer Schwimmer-Lauf bucht nur Rate x Zeit (v1.0.80)");
+{
+    # Der Fall vom 27.08.: zehn Runden buchten je ~85 l, sechs davon liefen
+    # unter 1,3 Minuten. Bei 34,2 l/min sind 1,2 min hoechstens 41 l - nicht 86.
+    # Der IBC stand danach auf 874 statt auf etwa 494.
+    my $h = build(mains => "on");
+    Gartenbewaesserung_SetIbcLevel($h, 0, "test", 1);
+    main::readingsSingleUpdate($h, "barrelLevel_l", 81, 0);
+    Gartenbewaesserung_StartIBCFill($h, 1, 1);
+    main::advance(72);                                # 1,2 min
+    sens("barrelEmpty", "yes");
+
+    my $g = rd("lastIbcFillVolume_l");
+    ok_true($g >= 38 && $g <= 48, "gebucht werden ~41 l statt 86 (ist: $g)");
+    ok_true(rd("ibcLevel_l") <= 48, "und nur die kommen im IBC an (ist: "
+            . rd("ibcLevel_l") . ")");
+    is(rd("ibcFillFlow_lpm"), "34.2", "aus einem gekappten Lauf wird nicht gelernt");
+}
+
+scenario("Z  Ein ausreichend langer Lauf bleibt ungekappt (v1.0.80)");
+{
+    # Gegenprobe: 2,4 min sind bei 34,2 l/min genau die Schwimmermenge. Hier
+    # darf die Schranke nicht zuschlagen, sonst waere der Fix eine Verschlimm-
+    # besserung und Szenario N gaebe es nicht mehr.
+    my $h = build(mains => "on");
+    Gartenbewaesserung_SetIbcLevel($h, 0, "test", 1);
+    main::readingsSingleUpdate($h, "barrelLevel_l", 81, 0);
+    Gartenbewaesserung_StartIBCFill($h, 1, 1);
+    main::advance(160);                               # 2:40
+    sens("barrelEmpty", "yes");
+
+    my $g = rd("lastIbcFillVolume_l");
+    ok_true($g >= 92 && $g <= 94, "volle Schwimmermenge plus Zulauf (ist: $g)");
+    ok_true(rd("ibcFillFlow_lpm") > 34.2, "und die Rate lernt weiterhin");
+}
+
+scenario("AA Nach barrelEmpty springt das Fass nicht sofort wieder auf voll (v1.0.81)");
+{
+    # Der Kern des 874-l-Falls. Der Ticker laeuft 20 Minuten und haelt das Fass
+    # auf Schwimmerhoehe. Dann leert die Pumpe es (barrelEmpty verankert auf 0).
+    # Bis v1.0.80 rechnete der Ticker aus seinem ALTEN Anker weiter und setzte
+    # den Stand im naechsten Takt in einem Schritt zurueck auf 81 - woraufhin
+    # MainsFillIbcTick nach einer Minute die naechste Runde startete.
+    my $h = build(mains => "on");
+    Gartenbewaesserung_SetBarrelLevel($h, 0, "test", 1);
+    main::advance(25 * 60);                           # Ticker fuellt bis 81
+    ok_true(rd("barrelLevel_l") >= 79, "Fass steht auf Schwimmerhoehe (ist: "
+            . rd("barrelLevel_l") . ")");
+
+    # Ueber den Pumpenweg leeren, nicht ueber ein Giess-Ereignis: nach einem
+    # barrelEmpty beim Giessen laeuft sofort das Nachfuellen an, und dann setzt
+    # MainsFillTick ohnehin aus. Der Fall vom 27.08. war eine Stadtwasser-Runde.
+    # Kurz: der Lauf am 27.08. dauerte 33 Sekunden. Faellt kein Minutentakt
+    # hinein, kommt MainsFillTick nie dazu, seinen Anker zu verwerfen - genau
+    # das ist die Bedingung fuer den Fehler.
+    Gartenbewaesserung_StartIBCFill($h, 1, 1);
+    main::advance(33);
+    sens("barrelEmpty", "yes");                       # Pumpe hat es geleert
+    is(rd("barrelLevel_l"), 0, "auf 0 verankert");
+
+    main::advance(70);                                # ein Takt spaeter
+    my $l = rd("barrelLevel_l");
+    ok_true($l <= 10, "nach einer Minute hoechstens ein paar Liter (ist: $l)");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);
