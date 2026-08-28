@@ -547,6 +547,35 @@ scenario("Z  Ein ausreichend langer Lauf bleibt ungekappt (v1.0.80)");
     ok_true(rd("ibcFillFlow_lpm") > 34.2, "und die Rate lernt weiterhin");
 }
 
+scenario("AA Nach barrelEmpty springt das Fass nicht sofort wieder auf voll (v1.0.81)");
+{
+    # Der Kern des 874-l-Falls. Der Ticker laeuft 20 Minuten und haelt das Fass
+    # auf Schwimmerhoehe. Dann leert die Pumpe es (barrelEmpty verankert auf 0).
+    # Bis v1.0.80 rechnete der Ticker aus seinem ALTEN Anker weiter und setzte
+    # den Stand im naechsten Takt in einem Schritt zurueck auf 81 - woraufhin
+    # MainsFillIbcTick nach einer Minute die naechste Runde startete.
+    my $h = build(mains => "on");
+    Gartenbewaesserung_SetBarrelLevel($h, 0, "test", 1);
+    main::advance(25 * 60);                           # Ticker fuellt bis 81
+    ok_true(rd("barrelLevel_l") >= 79, "Fass steht auf Schwimmerhoehe (ist: "
+            . rd("barrelLevel_l") . ")");
+
+    # Ueber den Pumpenweg leeren, nicht ueber ein Giess-Ereignis: nach einem
+    # barrelEmpty beim Giessen laeuft sofort das Nachfuellen an, und dann setzt
+    # MainsFillTick ohnehin aus. Der Fall vom 27.08. war eine Stadtwasser-Runde.
+    # Kurz: der Lauf am 27.08. dauerte 33 Sekunden. Faellt kein Minutentakt
+    # hinein, kommt MainsFillTick nie dazu, seinen Anker zu verwerfen - genau
+    # das ist die Bedingung fuer den Fehler.
+    Gartenbewaesserung_StartIBCFill($h, 1, 1);
+    main::advance(33);
+    sens("barrelEmpty", "yes");                       # Pumpe hat es geleert
+    is(rd("barrelLevel_l"), 0, "auf 0 verankert");
+
+    main::advance(70);                                # ein Takt spaeter
+    my $l = rd("barrelLevel_l");
+    ok_true($l <= 10, "nach einer Minute hoechstens ein paar Liter (ist: $l)");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);

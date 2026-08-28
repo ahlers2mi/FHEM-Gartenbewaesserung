@@ -13,6 +13,27 @@
 #
 ##############################################################################
 #
+# 1.0.81 - 2026-08-28  Fix: der Anker des Zulauf-Tickers ueberlebte eine
+#                      Neuverankerung des Fassstands - die eigentliche Ursache
+#                      hinter den 874 l im IBC.
+#                      MainsFillTick rechnet seit v1.0.73 gegen einen Anker aus
+#                      Zeitpunkt und Pegel. Wird der Fassstand von AUSSEN neu
+#                      verankert (barrelEmpty, barrelFull, set barrelLevel),
+#                      blieb dieser Anker stehen. Beim naechsten Takt ergibt
+#                      Ankerpegel + Rate x verstrichene Zeit dann laengst mehr
+#                      als die Schwimmerhoehe, wird darauf gedeckelt - und der
+#                      gerade auf 0 verankerte Stand springt in EINEM Schritt
+#                      auf 81.
+#                      Im Log vom 27.08.: 12:51:49 barrelEmpty -> 0, 12:52:16
+#                      wieder 81. MainsFillIbcTick hielt das Fass daraufhin nach
+#                      einer Minute erneut fuer bereit statt nach achtzehn, die
+#                      Pumpe lief 30 bis 60 Sekunden ins Leere, und der Lauf
+#                      wurde als volle Schwimmer-Runde ueber 81 l gebucht. Zehn
+#                      Runden ergaben so 873 gebuchte gegen 494 moegliche Liter.
+#                      Der Durchsatz-Deckel aus v1.0.80 faengt den Buchungs-
+#                      schaden ab, aber nicht die sinnlosen Pumpenlaeufe - das
+#                      ist hier die Ursache, dort das Symptom.
+#
 # 1.0.80 - 2026-08-28  Fix: eine Pumpe bewegt nie mehr als Rate x Laufzeit.
 #                      $complete und $floatRun setzen eine BEKANNTE Menge an -
 #                      barrelUsableVolume bzw. barrelFloatLevel. Ob der Lauf
@@ -783,7 +804,7 @@ use POSIX;
 # greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
 # gerade selbst geladen) oder die Liste ihr Format aendert.
 {
-    my $FALLBACK = '1.0.80';
+    my $FALLBACK = '1.0.81';
     my $cached;
     sub Gartenbewaesserung_Version {
         return $cached if(defined($cached));
@@ -4960,6 +4981,19 @@ sub Gartenbewaesserung_SetBarrelLevel {
     readingsBulkUpdate($hash, "barrelLevel", sprintf("%.0f", 100 * $liters / $capacity));
     readingsBulkUpdate($hash, "barrelLevelAnchor", TimeNow() . " " . $reason) if($anchor);
     readingsEndUpdate($hash, 1);
+
+    # Wird der Stand von AUSSEN verankert - barrelEmpty, barrelFull oder von
+    # Hand -, muss der Anker des Zulauf-Tickers weg. Sonst rechnet der beim
+    # naechsten Takt aus seiner alten Zeit weiter, landet ueber der
+    # Schwimmerhoehe und setzt den gerade verankerten Stand in EINEM Schritt
+    # wieder auf voll.
+    #
+    # Genau das ist am 27.08. passiert: 12:51:49 barrelEmpty -> 0, 12:52:16
+    # wieder 81. MainsFillIbcTick hielt das Fass daraufhin nach einer Minute
+    # erneut fuer bereit statt nach achtzehn, die Pumpe lief 30 bis 60 Sekunden
+    # ins Leere, und der Lauf wurde als volle Schwimmer-Runde gebucht. Zehn
+    # Runden, 873 gebuchte Liter, 494 moegliche.
+    delete $hash->{HELPER}{mainsFillAnchor} if($anchor);
 }
 
 # Fuellstand einschliesslich des mitgefuehrten Bruchteils.
