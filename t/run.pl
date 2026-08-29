@@ -576,6 +576,118 @@ scenario("AA Nach barrelEmpty springt das Fass nicht sofort wieder auf voll (v1.
     ok_true($l <= 10, "nach einer Minute hoechstens ein paar Liter (ist: $l)");
 }
 
+scenario("BB Zu kurzer Transfer leer->voll lernt keine Schwerkraftrate (v1.0.82)");
+{
+    # Der Messzweig in NoteIbcToBarrelStop hatte als einziger keine Gegenprobe:
+    # leeres Fass + Fass-voll-Kontakt = 148 l, egal wie kurz der Lauf war.
+    # barrelEmpty ist aber keine Pegelmessung, sondern aus der Pumpenleistung
+    # abgeleitet - schaltet der Schwimmer der Tauchpumpe zu frueh ab, stand noch
+    # Wasser im Fass. 148 l in 2 Minuten waeren 74 l/min Schwerkraft; gemessen
+    # sind 13,6 bis 15,4.
+    my $h = build();
+    Gartenbewaesserung_SetIbcLevel($h, 500, "test", 1);
+    Gartenbewaesserung_SetBarrelLevel($h, 0, "test", 1);
+    # barrelEmpty direkt setzen statt ueber den Sensor: der Sensorweg startet das
+    # Nachfuellen selbst, hier soll genau EIN Transfer laufen.
+    main::readingsSingleUpdate($h, "barrelEmpty", "yes", 0);
+    Gartenbewaesserung_StartIBCtoBarrel($h);
+    main::advance(120);                               # 2 min
+    sens("barrelFull", "yes");
+
+    is(rd("lastIbcToBarrelEnd"), "barrelFull", "Ende auf dem Kontakt");
+    is(rd("ibcToBarrelFlow_lpm"), "12.2", "74 l/min werden nicht gelernt");
+    my $g = rd("lastIbcToBarrelVolume_l");
+    ok_true($g >= 22 && $g <= 27,
+            "gebucht wird Rate x Zeit, also ~24 l statt 148 (ist: $g)");
+}
+
+scenario("CC Ein plausibler Transfer leer->voll misst weiterhin (v1.0.82)");
+{
+    # Gegenprobe zu BB: ohne sie waere die Bremse eine Verschlimmbesserung -
+    # dieser Zweig ist die einzige Stelle, die die Schwerkraftrate ueberhaupt
+    # kalibriert. 10 Minuten fuer 148 l sind 14,8 l/min, also im Rahmen.
+    my $h = build();
+    Gartenbewaesserung_SetIbcLevel($h, 500, "test", 1);
+    Gartenbewaesserung_SetBarrelLevel($h, 0, "test", 1);
+    main::readingsSingleUpdate($h, "barrelEmpty", "yes", 0);
+    Gartenbewaesserung_StartIBCtoBarrel($h);
+    main::advance(600);                               # 10 min
+    sens("barrelFull", "yes");
+
+    is(rd("lastIbcToBarrelVolume_l"), 148, "volles Fassmass gebucht");
+    is(rd("ibcToBarrelFlow_lpm"), "13.0", "Rate lernt: 0,7 x 12,2 + 0,3 x 14,8");
+    is(rd("ibcLevel_l"), 352, "und genau die 148 gehen dem IBC ab");
+}
+
+scenario("DD Bei offenem Hahn wird der Schwimmer-Anteil abgezogen (v1.0.82)");
+{
+    # Solange das Fass unter barrelFloatLevel steht, speist das Schwimmerventil
+    # mit; bei 81 l und 12,2 + 4,4 l/min Zulauf sind das die ersten 4,9 Minuten,
+    # also rund 22 l. Von den 148 l zwischen den Kontakten kamen damit ~126 aus
+    # dem IBC. Ohne den Abzug bucht der Transfer dem IBC Wasser ab, das dort nie
+    # wegging.
+    my $h = build(mains => "on");
+    Gartenbewaesserung_SetIbcLevel($h, 500, "test", 1);
+    Gartenbewaesserung_SetBarrelLevel($h, 0, "test", 1);
+    main::readingsSingleUpdate($h, "barrelEmpty", "yes", 0);
+    Gartenbewaesserung_StartIBCtoBarrel($h);
+    main::advance(600);
+    sens("barrelFull", "yes");
+
+    my $g = rd("lastIbcToBarrelVolume_l");
+    ok_true($g >= 124 && $g <= 128,
+            "~126 l aus dem IBC statt der vollen 148 (ist: $g)");
+}
+
+scenario("EE Ausreisser-Bremse beim Giessen (v1.0.82)");
+{
+    # LearnWateringFlow war die letzte Lernstelle ohne Plausibilitaetspruefung.
+    # 148 l auf 2 Minuten Ventilzeit sind 74 l/min - genau der Wert, der am
+    # 22.08. in valve1Flow_lpm stand, weil ein noch offenes Ventil in
+    # drawMinutes fehlte. Direkt gesetzt statt ueber einen Giesslauf: die Bremse
+    # soll auch dann greifen, wenn die Ursache eine andere ist als 2026-08-22.
+    my $h = build();
+    sens("barrelFull", "yes");                        # setzt den Lern-Anker
+    main::readingsSingleUpdate($h, "valve1Flow_lpm", 14.3, 0);
+    $h->{HELPER}{drawTainted} = 0;
+    $h->{HELPER}{drawMinutes} = 2;
+    $h->{HELPER}{drawByValve} = { 1 => 2 };
+    Gartenbewaesserung_LearnWateringFlow($h);
+    is(rd("valve1Flow_lpm"), "14.3", "74 l/min wird nicht gelernt");
+
+    # Gegenprobe: 12 Minuten sind 12,3 l/min gegen ein Nennmass von 18,5 - das
+    # muss durchgehen, sonst lernt der Kreis nie wieder etwas.
+    $h->{HELPER}{drawTainted} = 0;
+    $h->{HELPER}{drawMinutes} = 12;
+    $h->{HELPER}{drawByValve} = { 1 => 12 };
+    Gartenbewaesserung_LearnWateringFlow($h);
+    is(rd("valve1Flow_lpm"), "13.7", "ein plausibler Lauf lernt weiterhin");
+}
+
+scenario("FF disable nimmt dem Modul nicht dauerhaft den Takt (v1.0.82)");
+{
+    # CheckSchedule loeschte seinen Timer, BEVOR es bei disable/manualMode
+    # ausstieg - neu armiert wird nur in Define und StopAll. Ein einziges
+    # "attr bw disable 1" hat den Minutentakt damit fuer immer erledigt, und mit
+    # ihm MainsFillTick, MainsMeterTick und MainsFillIbcTick. Ein "disable 0"
+    # holte nichts zurueck, und gemeldet wurde es nirgends.
+    my $h = build(mains => "on");
+    Gartenbewaesserung_SetBarrelLevel($h, 0, "test", 1);
+    main::advance(120);
+    my $vorher = rd("mainsDirect_total_l");
+    ok_true($vorher > 0, "der Zaehler laeuft ueberhaupt (ist: $vorher)");
+
+    $attr{bw}{disable} = 1;
+    main::advance(300);
+    is(rd("mainsDirect_total_l"), $vorher, "abgeschaltet zaehlt nichts weiter");
+
+    delete $attr{bw}{disable};
+    main::advance(600);
+    my $nachher = rd("mainsDirect_total_l");
+    ok_true($nachher > $vorher,
+            "nach dem Einschalten laeuft der Takt wieder (ist: $nachher)");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);

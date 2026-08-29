@@ -13,6 +13,44 @@
 #
 ##############################################################################
 #
+# 1.0.82 - 2026-08-29  Drei Luecken, die alle dieselbe Form haben: eine Buchung
+#                      glaubt einem Etikett, ohne zu pruefen, ob der Lauf
+#                      ueberhaupt dazu passt.
+#                      1. NoteIbcToBarrelStop, Zweig "leeres Fass -> Fass voll":
+#                      buchte immer barrelUsableVolume und lernte die Schwerkraft-
+#                      rate daraus, ohne jede Gegenprobe. Alle drei Deckel aus
+#                      v1.0.74/77/80 sitzen im elsif-Zweig daneben; der Kopfraum-
+#                      Deckel waere hier ohnehin wirkungslos, weil barrelEmpty den
+#                      Stand auf 0 verankert und der Kopfraum damit immer das volle
+#                      Fass ist. barrelEmpty ist aber keine Pegelmessung, sondern
+#                      aus der Pumpenleistung abgeleitet - schaltet der Schwimmer
+#                      der Tauchpumpe zu frueh ab, bewegten sich weniger als 148 l.
+#                      Ein 2-Minuten-Transfer zog die gelernte Rate so von 14 auf
+#                      54 l/min hoch. Jetzt: Ausreisser-Bremse gegen das Attribut
+#                      (0,4x bis 1,5x, wie v1.0.79), danach Rueckfall auf den
+#                      Ratenweg samt seiner Deckel.
+#                      Ausserdem wird jetzt abgezogen, was das Schwimmerventil
+#                      waehrend des Transfers beisteuert - diese Liter kamen aus
+#                      der Leitung, nicht aus dem IBC. Anders als beim Hochpumpen
+#                      steigt das Fass dabei, das Ventil schliesst also bei
+#                      barrelFloatLevel; gerechnet wird deshalb nur die Zeit bis
+#                      dorthin (bei 81 l und 12,2 + 4,4 l/min gut 4,9 min = 22 l)
+#                      statt ueber die volle Laufzeit. Ein zu HOHER Abzug buchte
+#                      dem IBC zu wenig ab - sein Stand liefe nach oben davon,
+#                      genau die Richtung der 874 l aus v1.0.80/81.
+#                      2. LearnWateringFlow hatte als einzige Lernstelle noch gar
+#                      keine Bremse. drawMinutes zaehlt nur Ventilzeit, und die
+#                      wird erst beim Schliessen gebucht; war beim Leermelden noch
+#                      ein Ventil offen, faellt das ganze Fassvolumen auf eine zu
+#                      kurze Zeit (22.08.: valve1Flow_lpm 74 statt 14,3).
+#                      3. CheckSchedule und CheckRain nahmen sich bei disable bzw.
+#                      manualMode selbst den Takt: RemoveInternalTimer lief, das
+#                      return kam davor, neu armiert wird nur in Define und
+#                      StopAll. Ein "disable 0" holte den Takt also nicht zurueck,
+#                      und mit ihm blieben MainsFillTick, MainsMeterTick (also
+#                      mainsDirect_total_l) und MainsFillIbcTick stehen. Jetzt
+#                      laeuft der Takt weiter und tut nur nichts.
+#
 # 1.0.81 - 2026-08-28  Fix: der Anker des Zulauf-Tickers ueberlebte eine
 #                      Neuverankerung des Fassstands - die eigentliche Ursache
 #                      hinter den 874 l im IBC.
@@ -804,7 +842,7 @@ use POSIX;
 # greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
 # gerade selbst geladen) oder die Liste ihr Format aendert.
 {
-    my $FALLBACK = '1.0.81';
+    my $FALLBACK = '1.0.82';
     my $cached;
     sub Gartenbewaesserung_Version {
         return $cached if(defined($cached));
@@ -5326,6 +5364,27 @@ sub Gartenbewaesserung_LearnWateringFlow {
     my $measured = $capacity / $minutes;
     my $old = ReadingsVal($name, $target, 0);
     $old = 0 if($old !~ /^\d+(?:\.\d+)?$/);
+
+    # Ausreisser-Bremse, dieselbe wie fuer die Pumpenrate seit v1.0.79 - hier
+    # fehlte sie noch. drawMinutes zaehlt nur Ventil-Offenzeit, die aber erst beim
+    # SCHLIESSEN gebucht wird (NoteValveDraw): war beim Leermelden noch ein Ventil
+    # offen, fehlen dessen Minuten in der Summe, und das ganze Fassvolumen faellt
+    # auf eine zu kurze Zeit. Am 22.08. wurden so 148 l durch 2 statt 6,8 Minuten
+    # geteilt und dem falschen Kreis gutgeschrieben - valve1Flow_lpm sprang auf
+    # 74 l/min, das Fuenffache des echten Werts.
+    #
+    # Gemessen wird gegen das ATTRIBUT: das Reading ist die Groesse, die hier
+    # entgleist, an ihr wandert die Grenze mit und die Bremse greift nie.
+    my $anker = AttrVal($name, $target, 0);
+    $anker = $old if($anker !~ /^\d+(?:\.\d+)?$/ || $anker <= 0);
+    if($anker > 0 && ($measured > 1.5 * $anker || $measured < 0.4 * $anker)) {
+        Log3 $name, 3, sprintf("%s: watering run gives %.1f l/min for %s against a nominal "
+            . "%.1f - implausible, rate left untouched (valve still open when the barrel "
+            . "reported empty?)", $name, $measured,
+            (scalar(@valves) == 1) ? "circuit $valves[0]" : "the mix", $anker);
+        return;
+    }
+
     my $new = ($old > 0) ? ($old * 0.7 + $measured * 0.3) : $measured;
     readingsSingleUpdate($hash, $target, sprintf("%.1f", $new), 1);
     Log3 $name, 3, sprintf("%s: full barrel emptied by %.1f min of watering (%s) "
@@ -5404,6 +5463,9 @@ sub Gartenbewaesserung_NoteIbcToBarrelStart {
     my $lvl = ReadingsVal($hash->{NAME}, "barrelLevel_l", "");
     $hash->{HELPER}{ibcToBarrelBarrelAtStart} =
         ($lvl =~ /^-?\d+(?:\.\d+)?$/) ? $lvl : undef;
+    # Stand des Hahns merken - waehrend eines Transfers speist das Schwimmerventil
+    # das Fass mit, und diese Liter kamen nicht aus dem IBC.
+    $hash->{HELPER}{ibcToBarrelMainsAtStart} = Gartenbewaesserung_MainsSupplyState($hash);
     # Erster Blick schon nach 5 s: oeffnet die Strecke in ein volles Fass, sind
     # das rund 1 l statt der 200 l von frueher. Danach reichen 30 s.
     RemoveInternalTimer($hash, "Gartenbewaesserung_IbcToBarrelWatchdog");
@@ -5418,30 +5480,86 @@ sub Gartenbewaesserung_NoteIbcToBarrelStop {
     my $start = $hash->{HELPER}{ibcToBarrelStartTime};
     my $fromEmpty = $hash->{HELPER}{ibcToBarrelFromEmpty};
     my $barrelAtStart = $hash->{HELPER}{ibcToBarrelBarrelAtStart};
+    my $mainsAtStart = $hash->{HELPER}{ibcToBarrelMainsAtStart};
     delete $hash->{HELPER}{ibcToBarrelStartTime};
     delete $hash->{HELPER}{ibcToBarrelFromEmpty};
     delete $hash->{HELPER}{ibcToBarrelBarrelAtStart};
+    delete $hash->{HELPER}{ibcToBarrelMainsAtStart};
     return if(!$start);
 
     $reason = "unknown" if(!defined($reason) || $reason eq "");
     my $minutes = (int(time()) - $start) / 60;
     return if($minutes <= 0);
 
-    # A transfer that started with an empty barrel and ended on barrelFull moved
-    # exactly barrelUsableVolume - the same trick that measures the pump, applied
-    # to the gravity side.
     my $volume = AttrVal($name, "barrelUsableVolume", 0);
+    my $float  = AttrVal($name, "barrelFloatLevel", 0);
     my $rate   = Gartenbewaesserung_FlowRate($hash, "ibcToBarrelFlow_lpm");
     $rate = 0 if($rate !~ /^\d+(?:\.\d+)?$/);
 
+    # Bei offenem Hahn haelt das Schwimmerventil dagegen: solange das Fass unter
+    # barrelFloatLevel steht, laeuft Leitungswasser mit hinein. Von den 148 l
+    # zwischen den beiden Kontakten kam dann nur ein Teil aus dem IBC - der Rest
+    # aus der Leitung. Ohne diesen Abzug bucht der Transfer dem IBC Wasser ab, das
+    # dort nie wegging, und lernt die Schwerkraftrate zu hoch. Gleiche Rechnung
+    # wie in RecordIbcFillRun seit v1.0.76.
+    my $inflow = AttrVal($name, "mainsFillFlow_lpm", 0);
+    $inflow = 0 if($inflow !~ /^\d+(?:\.\d+)?$/);
+    $inflow = 0 if(($mainsAtStart || "") ne "on"
+                   && Gartenbewaesserung_MainsSupplyState($hash) ne "on");
+    my $topUp = $inflow * $minutes;
+    # Anders als beim Hochpumpen steigt das Fass hier, und das Schwimmerventil
+    # schliesst, sobald es barrelFloatLevel erreicht - danach traegt der Hahn
+    # nichts mehr bei. Wie lange das dauert, ergibt sich aus der Summe beider
+    # Zufluesse. Der Unterschied ist nicht kosmetisch: ueber die volle Laufzeit
+    # gerechnet waeren es bei 10 min 44 l statt 22, und ein zu HOHER Abzug bucht
+    # dem IBC zu wenig ab - sein Stand liefe nach oben davon, genau die Richtung,
+    # die im August die 874 l ergab.
+    if($float > 0) {
+        my $bisSchwimmer = ($rate + $inflow > 0) ? ($float / ($rate + $inflow)) : $minutes;
+        $topUp = $inflow * $bisSchwimmer if($bisSchwimmer < $minutes);
+        $topUp = $float if($topUp > $float);
+    }
+
     my $moved = 0;
     my $measured = 0;
+    # Messzweig: leeres Fass bis Fass-voll-Kontakt sind genau barrelUsableVolume -
+    # derselbe Kniff, der die Pumpe misst, auf die Schwerkraftseite angewandt.
+    # Die Menge ist hier die Messung und die Rate das Abgeleitete; ein Deckel auf
+    # Rate x Zeit wie in v1.0.80 waere deshalb falsch herum und wuerde genau die
+    # Kalibrierung zerstoeren, um die es geht. Was fehlte, ist die Gegenprobe, OB
+    # der Lauf ueberhaupt zu einem Transfer passt:
+    #   - barrelEmpty ist keine Pegelmessung, sondern aus der Pumpenleistung
+    #     abgeleitet. Schaltet der Schwimmer der Tauchpumpe zu frueh ab, stand
+    #     noch Wasser im Fass - es bewegten sich weniger als 148 l.
+    #   - dasselbe Bild bei einem prellenden Fass-voll-Kontakt.
+    # Beide Faelle sehen gleich aus: der Lauf ist zu KURZ fuer 148 l. Gemessen
+    # wird gegen das ATTRIBUT, nicht gegen das gelernte Reading - das Reading ist
+    # die Groesse, die entgleisen kann, an ihr wandert die Grenze mit (v1.0.79).
+    my $verworfen = 0;
     if($fromEmpty && $reason eq "barrelFull" && $volume > 0) {
-        $moved = $volume;
-        $measured = $volume / $minutes;
-        $rate = ($rate > 0) ? ($rate * 0.7 + $measured * 0.3) : $measured;
+        my $ausIbc = $volume - $topUp;
+        my $kandidat = $ausIbc / $minutes;
+        my $anker = AttrVal($name, "ibcToBarrelFlow_lpm", 0);
+        $anker = $rate if($anker !~ /^\d+(?:\.\d+)?$/ || $anker <= 0);
+        if($ausIbc <= 0) {
+            $verworfen = 1;
+            Log3 $name, 3, sprintf("%s: IBC->barrel run of %.1f min: the mains could have "
+                . "supplied all %.0f l on its own - nothing booked against the IBC",
+                $name, $minutes, $volume);
+        }
+        elsif($anker > 0 && ($kandidat > 1.5 * $anker || $kandidat < 0.4 * $anker)) {
+            $verworfen = 1;
+            Log3 $name, 3, sprintf("%s: IBC->barrel run gives %.1f l/min against a nominal "
+                . "%.1f - implausible for gravity, barrel was not where it was assumed "
+                . "(falling back to the learned rate)", $name, $kandidat, $anker);
+        }
+        else {
+            $moved = $ausIbc;
+            $measured = $kandidat;
+            $rate = ($rate > 0) ? ($rate * 0.7 + $measured * 0.3) : $measured;
+        }
     }
-    elsif($rate > 0) {
+    if(($verworfen || !$measured) && $rate > 0) {
         $moved = $rate * $minutes;
         # Deckel: ins Fass passt nur, was noch Platz hat. Waehrend eines Transfers
         # ist das Giessen gestoppt, der Kopfraum steht also fest. Ohne den Deckel
@@ -6535,7 +6653,13 @@ sub Gartenbewaesserung_CheckRain {
 
     RemoveInternalTimer($hash, "Gartenbewaesserung_CheckRain");
 
-    return if(IsDisabled($name));
+    # Wie in CheckSchedule: der Takt muss weiterlaufen, sonst kommt die
+    # Regenpruefung nach einem disable nie wieder von selbst hoch.
+    if(IsDisabled($name)) {
+        my $interval = AttrVal($name, "rainCheckInterval", 5) * 60;
+        InternalTimer(gettimeofday() + $interval, "Gartenbewaesserung_CheckRain", $hash);
+        return;
+    }
 
     # Keep the rolling rain amount fresh even without sensor events (window slides)
     Gartenbewaesserung_UpdateRainAmount($hash);
@@ -6630,8 +6754,18 @@ sub Gartenbewaesserung_CheckSchedule {
 
     RemoveInternalTimer($hash, "Gartenbewaesserung_CheckSchedule");
 
-    return if(IsDisabled($name));
-    return if(AttrVal($name, "manualMode", 0));
+    # Abgeschaltet heisst: nichts tun - nicht: nie wieder aufwachen. Bis v1.0.81
+    # stand hinter diesen beiden Bedingungen ein blankes return, waehrend das
+    # RemoveInternalTimer oben schon gelaufen war. Damit war der Minutentakt nach
+    # einem einzigen "attr <geraet> disable 1" tot, und ein "disable 0" holte ihn
+    # nicht zurueck: der Attr-Handler kennt CheckSchedule nicht, neu armiert wird
+    # nur in Define und StopAll. Mit dem Takt weg waren auch MainsFillTick,
+    # MainsMeterTick (also mainsDirect_total_l) und MainsFillIbcTick weg - der
+    # Zeitplan lief danach nie wieder an, ohne dass irgendetwas es gemeldet haette.
+    if(IsDisabled($name) || AttrVal($name, "manualMode", 0)) {
+        InternalTimer(gettimeofday() + 60, "Gartenbewaesserung_CheckSchedule", $hash);
+        return;
+    }
 
     # Einziger Taktgeber, der im Betrieb zuverlaessig laeuft (60 s).
     Gartenbewaesserung_MainsFillTick($hash);
