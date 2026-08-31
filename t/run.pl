@@ -688,6 +688,109 @@ scenario("FF disable nimmt dem Modul nicht dauerhaft den Takt (v1.0.82)");
             "nach dem Einschalten laeuft der Takt wieder (ist: $nachher)");
 }
 
+scenario("GG Verregneter Pumpenlauf lernt keine Rate (v1.0.83)");
+{
+    # Der Fall vom 31.08.: waehrend der sieben Minuten Ernte regnete es weiter
+    # (harvest_today_l 100,6 -> 237,9). Die Pumpe bewegte damit mehr als das
+    # bekannte Fassmass, und die Rate kam zu NIEDRIG heraus - 35,4 fiel auf 32,5
+    # und sah nach einem zusetzenden Filter aus.
+    my $h = build(attr => { rainAmountDevice => "sens:regen_mm",
+                            roofArea => 45, runoffCoefficient => 0.8 });
+    main::readingsSingleUpdate($h, ".rainAccum", 10.0, 0);
+    sens("barrelFull", "yes");                        # voll -> Ernte von Hand
+    Gartenbewaesserung_StartIBCFill($h, 1);
+    # 5 min: lang genug, dass der Durchsatz-Deckel aus v1.0.80 NICHT greift -
+    # sonst prueft das Szenario den alten Deckel statt der neuen Regel.
+    main::advance(300);
+    main::readingsSingleUpdate($h, ".rainAccum", 13.8, 0);   # 3,8 mm = 137 l
+    sens("barrelEmpty", "yes");
+
+    is(rd("ibcFillFlow_lpm"), "34.2", "Rate bleibt stehen statt auf 32,8 zu fallen");
+    ok_true(rd("lastIbcFillVolume_l") ne "(fehlt)", "gebucht wird der Lauf trotzdem");
+}
+
+scenario("HH Ohne Regen lernt derselbe Lauf weiterhin (v1.0.83)");
+{
+    # Gegenprobe zu GG - ohne sie waere das Veto eine Verschlimmbesserung.
+    my $h = build(attr => { rainAmountDevice => "sens:regen_mm",
+                            roofArea => 45, runoffCoefficient => 0.8 });
+    main::readingsSingleUpdate($h, ".rainAccum", 10.0, 0);
+    sens("barrelFull", "yes");
+    Gartenbewaesserung_StartIBCFill($h, 1);
+    main::advance(300);
+    sens("barrelEmpty", "yes");                       # kein Regen dazwischen
+
+    ok_true(rd("ibcFillFlow_lpm") != 34.2,
+            "Rate lernt (ist: " . rd("ibcFillFlow_lpm") . ")");
+}
+
+scenario("II Kalibrierlauf verweigert bei offenem Hahn (v1.0.83)");
+{
+    # Bei offenem Hahn speist das Schwimmerventil beide Richtungen mit - das
+    # Ergebnis waere ein Modell statt einer Messung.
+    my $h = build(mains => "on");
+    Gartenbewaesserung_SetIbcLevel($h, 500, "test", 1);
+    my $err = Gartenbewaesserung_CalibrateStart($h);
+    ok_true(defined($err) && $err =~ /mains tap/, "abgelehnt (: " . ($err // "undef") . ")");
+    is(relay("POWER8"), "OFF", "und nichts laeuft an");
+    is(rd("calibration"), "(fehlt)", "kein Lauf vermerkt");
+}
+
+scenario("JJ Kalibrierlauf misst beide Raten in drei Phasen (v1.0.83)");
+{
+    my $h = build();
+    Gartenbewaesserung_SetIbcLevel($h, 500, "test", 1);
+    Gartenbewaesserung_SetBarrelLevel($h, 81, "test", 1);
+
+    ok_true(!defined(Gartenbewaesserung_CalibrateStart($h)), "Lauf startet ohne Fehler");
+    main::advance(10);                                # pumpStartDelay abwarten
+    is(relay("POWER8"), "ON", "Phase 0: Pumpe laeuft");
+
+    main::advance(160);
+    sens("barrelEmpty", "yes");                       # Fass leer
+    main::advance(20);                                # Tick schaltet weiter
+    is(relay("POWER5"), "ON", "Phase 1: Transferventil offen");
+    sens("barrelEmpty", "no");                        # Wasser steigt, Kontakt frei
+
+    main::advance(600);                               # 10 min Schwerkraft
+    sens("barrelFull", "yes");
+    main::advance(20);                                # Tick startet Phase 2 (sieht fromFull)
+    sens("barrelFull", "no");                         # Pegel faellt wieder
+    is(relay("POWER8"), "ON", "Phase 2: Pumpe laeuft wieder");
+
+    main::advance(280);
+    sens("barrelEmpty", "yes");
+    main::advance(20);
+
+    is(rd("calibration"), "idle", "Lauf beendet");
+    is(rd("calibrationResult"), "ok", "als geglueckt vermerkt");
+    ok_true(rd("calibrationGravityFlow_lpm") ne "(fehlt)",
+            "Schwerkraftrate gemessen (ist: " . rd("calibrationGravityFlow_lpm") . ")");
+    ok_true(rd("calibrationPumpFlow_lpm") ne "(fehlt)",
+            "Pumpenrate gemessen (ist: " . rd("calibrationPumpFlow_lpm") . ")");
+    ok_true(rd("calibrationFilter") =~ /%/,
+            "Filteraussage dabei (ist: " . rd("calibrationFilter") . ")");
+}
+
+scenario("KK Regen waehrend des Kalibrierlaufs bricht ab (v1.0.83)");
+{
+    my $h = build(attr => { rainAmountDevice => "sens:regen_mm",
+                            roofArea => 45, runoffCoefficient => 0.8 });
+    main::readingsSingleUpdate($h, ".rainAccum", 10.0, 0);
+    Gartenbewaesserung_SetIbcLevel($h, 500, "test", 1);
+    Gartenbewaesserung_SetBarrelLevel($h, 81, "test", 1);
+    ok_true(!defined(Gartenbewaesserung_CalibrateStart($h)), "Lauf startet ohne Fehler");
+
+    main::advance(30);
+    main::readingsSingleUpdate($h, ".rainAccum", 10.5, 0);   # 0,5 mm = 18 l
+    main::advance(20);
+
+    ok_true(rd("calibrationResult") =~ /aborted/,
+            "Regen bricht ab (: " . rd("calibrationResult") . ")");
+    is(relay("POWER8"), "OFF", "Pumpe aus");
+    is(rd("calibration"), "idle", "Zustand aufgeraeumt");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);
