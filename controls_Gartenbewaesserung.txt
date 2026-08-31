@@ -1,1 +1,1 @@
-UPD 2026-08-31_19:18:01 429550 FHEM/98_Gartenbewaesserung.pm
+UPD 2026-08-31_21:31:39 439656 FHEM/98_Gartenbewaesserung.pm
