@@ -13,6 +13,38 @@
 #
 ##############################################################################
 #
+# 1.0.83 - 2026-08-31  Neu: "set <name> calibrate" - ein Kalibrierlauf
+#                      IBC -> Fass -> IBC, der beide Foerderraten misst, statt
+#                      auf eine zufaellige Gelegenheit zu warten. Er kostet kein
+#                      Wasser (dieselben 148 l gehen hin und zurueck) und liefert
+#                      in drei Phasen: Fass leerpumpen (Nullpunkt), IBC -> Fass
+#                      bis barrelFull (Schwerkraftrate ueber genau ein Fass),
+#                      Fass -> IBC bis barrelEmpty (Pumpenrate ueber genau ein
+#                      Fass). Die Pumpenrate gegen das Attribut gehalten ergibt
+#                      nebenbei die Filteraussage (34,4 sauber, 30,3 verschmutzt).
+#                      Waechter davor: kein Giessen, kein anderer Transport,
+#                      genug im IBC, kein Regen - und der HAHN MUSS ZU SEIN. Bei
+#                      offenem Hahn speist das Schwimmerventil beide Richtungen
+#                      mit, und das Ergebnis waere ein Modell statt einer
+#                      Messung. Waehrend des Laufs brechen Regen, ein geoeffneter
+#                      Hahn oder ein startender Giesszyklus ab, statt eine
+#                      verdorbene Messung zu lernen.
+#                      Dazu passend: aus einem Lauf, in den es HINEINGEREGNET
+#                      hat, wird keine Rate mehr gelernt - weder die Pumpen- noch
+#                      die Schwerkraftrate. Am 31.08. fiel ibcFillFlow_lpm so von
+#                      35,4 auf 32,5 und sah nach einem zusetzenden Filter aus;
+#                      tatsaechlich hatte es waehrend der sieben Minuten
+#                      weitergeregnet (harvest_today_l 100,6 -> 237,9), die Pumpe
+#                      also mehr bewegt als das bekannte Fassmass. Der Regen als
+#                      Term wie $topUp waere keine Loesung: der Dachertrag liegt
+#                      bei Starkregen selbst daneben (137 l gerechnet gegen rund
+#                      59, die ankamen - die Rinne nimmt keine 20 l/min).
+#                      Das Veto ist nur deshalb vertretbar, WEIL es den
+#                      Kalibrierlauf gibt: das Fass wird ja durch Regen voll, ein
+#                      Regen-Veto allein wuerde den Hauptlernpfad abschalten.
+#                      Gebucht wird ein verregneter Lauf weiterhin - das Wasser
+#                      ist ja im IBC angekommen -, nur gelernt wird nicht.
+#
 # 1.0.82 - 2026-08-29  Drei Luecken, die alle dieselbe Form haben: eine Buchung
 #                      glaubt einem Etikett, ohne zu pruefen, ob der Lauf
 #                      ueberhaupt dazu passt.
@@ -842,7 +874,7 @@ use POSIX;
 # greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
 # gerade selbst geladen) oder die Liste ihr Format aendert.
 {
-    my $FALLBACK = '1.0.82';
+    my $FALLBACK = '1.0.83';
     my $cached;
     sub Gartenbewaesserung_Version {
         return $cached if(defined($cached));
@@ -1051,6 +1083,7 @@ sub Gartenbewaesserung_Set {
                "resetHarvestStats:noArg " .
                "ibcLevel:textField barrelLevel:textField " .
                "waterSource:rain,other " .
+               "calibrate:noArg stopCalibrate:noArg " .
                "refreshSensors:noArg " .
                "validate:noArg";
 
@@ -1080,6 +1113,13 @@ sub Gartenbewaesserung_Set {
             return undef;
         }
         return Gartenbewaesserung_MainsFillIbcStart($hash, $spec);
+    }
+    elsif($cmd eq "calibrate") {
+        return Gartenbewaesserung_CalibrateStart($hash);
+    }
+    elsif($cmd eq "stopCalibrate") {
+        return "no calibration is running" if(!$hash->{HELPER}{calib});
+        return Gartenbewaesserung_CalibrateAbort($hash, "stopped by hand");
     }
     elsif($cmd eq "startIBCtoBarrel") {
         return Gartenbewaesserung_StartIBCtoBarrel($hash);
@@ -4581,6 +4621,9 @@ sub Gartenbewaesserung_StopAll {
 
     Gartenbewaesserung_StopPumpWatchdog($hash);
     Gartenbewaesserung_StopBarrelFillTimeout($hash);
+    # Vor dem RemoveInternalTimer: der Abbruch raeumt seinen eigenen Tick mit ab,
+    # und ein laufender Kalibrierlauf darf nicht als "ok" stehenbleiben.
+    Gartenbewaesserung_CalibrateAbort($hash, "stopAll") if($hash->{HELPER}{calib});
     RemoveInternalTimer($hash);
 
     # Close all valves
@@ -4867,6 +4910,7 @@ sub Gartenbewaesserung_StartIBCFill {
     $hash->{HELPER}{ibcFillFromFull}  = (ReadingsVal($name, "barrelFull", "no") eq "yes") ? 1 : 0;
     $hash->{HELPER}{ibcFillFromFloat} = ($fromFloat && !$hash->{HELPER}{ibcFillFromFull}) ? 1 : 0;
     $hash->{HELPER}{ibcFillMainsAtStart} = Gartenbewaesserung_MainsSupplyState($hash);
+    $hash->{HELPER}{ibcFillRainAtStart} = ReadingsVal($name, ".rainAccum", "");
     # Obergrenze fuer eine ratenbasierte Buchung: mehr als drinsteht kann die
     # Pumpe nicht herausholen.
     my $lvlAtStart = ReadingsVal($name, "barrelLevel_l", "");
@@ -5466,6 +5510,7 @@ sub Gartenbewaesserung_NoteIbcToBarrelStart {
     # Stand des Hahns merken - waehrend eines Transfers speist das Schwimmerventil
     # das Fass mit, und diese Liter kamen nicht aus dem IBC.
     $hash->{HELPER}{ibcToBarrelMainsAtStart} = Gartenbewaesserung_MainsSupplyState($hash);
+    $hash->{HELPER}{ibcToBarrelRainAtStart} = ReadingsVal($hash->{NAME}, ".rainAccum", "");
     # Erster Blick schon nach 5 s: oeffnet die Strecke in ein volles Fass, sind
     # das rund 1 l statt der 200 l von frueher. Danach reichen 30 s.
     RemoveInternalTimer($hash, "Gartenbewaesserung_IbcToBarrelWatchdog");
@@ -5481,10 +5526,12 @@ sub Gartenbewaesserung_NoteIbcToBarrelStop {
     my $fromEmpty = $hash->{HELPER}{ibcToBarrelFromEmpty};
     my $barrelAtStart = $hash->{HELPER}{ibcToBarrelBarrelAtStart};
     my $mainsAtStart = $hash->{HELPER}{ibcToBarrelMainsAtStart};
+    my $rainAtStart = $hash->{HELPER}{ibcToBarrelRainAtStart};
     delete $hash->{HELPER}{ibcToBarrelStartTime};
     delete $hash->{HELPER}{ibcToBarrelFromEmpty};
     delete $hash->{HELPER}{ibcToBarrelBarrelAtStart};
     delete $hash->{HELPER}{ibcToBarrelMainsAtStart};
+    delete $hash->{HELPER}{ibcToBarrelRainAtStart};
     return if(!$start);
 
     $reason = "unknown" if(!defined($reason) || $reason eq "");
@@ -5535,13 +5582,28 @@ sub Gartenbewaesserung_NoteIbcToBarrelStop {
     # Beide Faelle sehen gleich aus: der Lauf ist zu KURZ fuer 148 l. Gemessen
     # wird gegen das ATTRIBUT, nicht gegen das gelernte Reading - das Reading ist
     # die Groesse, die entgleisen kann, an ihr wandert die Grenze mit (v1.0.79).
+    # Regen waehrend des Laufs macht die Messung wertlos: das Fass hat den
+    # Kontakt dann nicht allein durch den Transfer erreicht. Und ein Regen-Term
+    # wie $topUp waere hier keine Loesung, weil der Dachertrag bei Starkregen
+    # selbst danebenliegt - am 31.08. rechneten 137 l Ertrag gegen rund 59, die
+    # wirklich ankamen (die Rinne nimmt keine 20 l/min). Gemessen wird die
+    # Schwerkraftrate stattdessen im Kalibrierlauf, der bei Regen abbricht.
+    my $regen = Gartenbewaesserung_RainSince($hash, $rainAtStart);
+    my $verregnet = (defined($regen) && $volume > 0 && $regen > 0.05 * $volume) ? 1 : 0;
+
     my $verworfen = 0;
     if($fromEmpty && $reason eq "barrelFull" && $volume > 0) {
         my $ausIbc = $volume - $topUp;
         my $kandidat = $ausIbc / $minutes;
         my $anker = AttrVal($name, "ibcToBarrelFlow_lpm", 0);
         $anker = $rate if($anker !~ /^\d+(?:\.\d+)?$/ || $anker <= 0);
-        if($ausIbc <= 0) {
+        if($verregnet) {
+            $verworfen = 1;
+            Log3 $name, 3, sprintf("%s: IBC->barrel run had %.0f l of rain falling into the "
+                . "barrel - the full contact was not reached by the transfer alone, "
+                . "not counted as a measurement", $name, $regen);
+        }
+        elsif($ausIbc <= 0) {
             $verworfen = 1;
             Log3 $name, 3, sprintf("%s: IBC->barrel run of %.1f min: the mains could have "
                 . "supplied all %.0f l on its own - nothing booked against the IBC",
@@ -5647,6 +5709,13 @@ sub Gartenbewaesserung_RecordIbcFillRun {
     # into the IBC is not purely harvested rain.
     my $mainsStart = $hash->{HELPER}{ibcFillMainsAtStart} || "";
     delete $hash->{HELPER}{ibcFillMainsAtStart};
+    # Regen waehrend des Laufs: dann hat die Pumpe mehr bewegt als das bekannte
+    # Fassmass, und die Rate kaeme zu NIEDRIG heraus. Am 31.08. fiel sie so von
+    # 35,4 auf 32,5 und sah nach einem zusetzenden Filter aus - es hatte nur
+    # waehrend der sieben Minuten weitergeregnet. Gelernt wird deshalb nicht;
+    # gebucht wird trotzdem, das Wasser ist ja im IBC angekommen.
+    my $regen = Gartenbewaesserung_RainSince($hash, $hash->{HELPER}{ibcFillRainAtStart});
+    delete $hash->{HELPER}{ibcFillRainAtStart};
     my $mainsNow = Gartenbewaesserung_MainsSupplyState($hash);
     my $source = "unknown";
     if($mainsStart ne "" || $mainsNow ne "") {
@@ -5812,10 +5881,16 @@ sub Gartenbewaesserung_RecordIbcFillRun {
     # Ein gekappter Lauf ist keine Messung mehr: die angesetzte Menge hat sich
     # gerade als unmoeglich erwiesen, also darf die Rate erst recht nicht daraus
     # lernen - sonst lernt sie genau den Fehler, der sie gekappt hat.
+    my $verregnet = (defined($regen) && $volume > 0 && $regen > 0.05 * $volume) ? 1 : 0;
     my $known = 0;
     $known = $volume + $topUp if($complete && !$gekappt);
     $known = $float  + $topUp if($floatRun && !$gekappt);
-    if($known > 0) {
+    if($known > 0 && $verregnet) {
+        Log3 $name, 3, sprintf("%s: barrel->IBC run had %.0f l of rain falling in - the pump "
+            . "moved more than the known %.0f l, rate left untouched", $name, $regen, $known);
+        readingsBulkUpdate($hash, "lastIbcFillVolume_l", sprintf("%.0f", $moved > 0 ? $moved : $known));
+    }
+    elsif($known > 0) {
         my $measured = $known / $minutes;
         # Ausreisser-Bremse: ein Lauf, der nicht wirklich am gedachten Startpunkt
         # begann (Fass noch nicht auf Hoehe, vorzeitig abgebrochen), liefert einen
@@ -6571,6 +6646,238 @@ sub Gartenbewaesserung_UpdateRainAmount {
 }
 
 ##############################################################################
+# Wieviel Regen ist seit einem Startwert gefallen, in Litern Dachertrag?
+#
+# Rueckgabe undef, wenn es keinen Regenmesser gibt oder der Startwert fehlt -
+# dann KANN das Modul einen verregneten Lauf nicht erkennen, und der Aufrufer
+# darf das nicht mit "es hat nicht geregnet" verwechseln.
+##############################################################################
+sub Gartenbewaesserung_RainSince {
+    my ($hash, $start) = @_;
+    my $name = $hash->{NAME};
+
+    return undef if(AttrVal($name, "rainAmountDevice", "") eq "");
+    return undef if(!defined($start) || $start !~ /^-?\d+(?:\.\d+)?$/);
+    my $now = ReadingsVal($name, ".rainAccum", "");
+    return undef if($now !~ /^-?\d+(?:\.\d+)?$/);
+
+    my $mm = $now - $start;
+    return 0 if($mm <= 0);            # Sammler wurde zwischendurch zurueckgesetzt
+    my $area = AttrVal($name, "roofArea", 0);
+    return 0 if($area !~ /^\d+(?:\.\d+)?$/ || $area <= 0);
+    my $runoff = AttrVal($name, "runoffCoefficient", 0.8);
+    $runoff = 0.8 if($runoff !~ /^\d+(?:\.\d+)?$/ || $runoff <= 0);
+
+    return $mm * $area * $runoff;
+}
+
+##############################################################################
+# Kalibrierlauf: IBC -> Fass -> IBC
+#
+# Die beiden Foerderraten des Systems werden im Betrieb nur gelernt, wenn sich
+# zufaellig die passende Gelegenheit ergibt: ein volles Fass, das am Stueck
+# leergepumpt wird (Pumpenrate), bzw. ein Transfer, der von leer bis zum
+# Fass-voll-Kontakt durchlaeuft (Schwerkraftrate). Beide wandern - die
+# Pumpenrate mit dem Filterzustand, die Schwerkraftrate sogar mit dem
+# IBC-Fuellstand. Auf den Zufall zu warten heisst, monatelang mit einer
+# veralteten Zahl zu rechnen.
+#
+# Ein Kalibrierlauf stellt die Gelegenheit absichtlich her. Er kostet KEIN
+# Wasser - dieselben 148 l gehen hin und zurueck - und liefert in einem Zug:
+#
+#   Phase 0  Fass -> IBC bis barrelEmpty   Vorbereitung (bekannter Nullpunkt);
+#                                          steht das Fass auf Schwimmerhoehe,
+#                                          faellt nebenbei eine Messung ab
+#   Phase 1  IBC -> Fass bis barrelFull    Schwerkraftrate ueber genau ein Fass
+#   Phase 2  Fass -> IBC bis barrelEmpty   Pumpenrate ueber genau ein Fass
+#
+# Damit ist auch die Filterfrage beantwortet: die Pumpenrate aus Phase 2 gegen
+# das Attribut gehalten sagt, wie weit der Filter zu ist (gemessen 34,4 sauber
+# gegen 30,3 verschmutzt) - statt sie aus dem Verhalten zu erraten.
+#
+# Weil der Lauf ABSICHTLICH angestossen wird, darf er streng sein: Regen oder
+# ein offener Hahn brechen ab, statt eine verdorbene Messung zu lernen. Bei
+# einer Gelegenheitsmessung waere so ein Veto fatal - das Fass wird ja DURCH
+# Regen voll -, hier ist es gratis, weil man den Lauf einfach wiederholt.
+##############################################################################
+sub Gartenbewaesserung_CalibrateStart {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    return "a calibration is already running" if($hash->{HELPER}{calib});
+    return "not while watering"        if($hash->{HELPER}{watering} || $hash->{HELPER}{circuitMode});
+    return "not while the IBC fill is running"  if($hash->{HELPER}{ibcFilling});
+    return "not while a transfer is running"    if($hash->{HELPER}{ibcToBarrelActive});
+    return "not while a mains fill is running"  if(Gartenbewaesserung_MainsFillIbcActive($hash));
+
+    # Hahn zu. Bei offenem Hahn speist das Schwimmerventil BEIDE Richtungen mit,
+    # und das Ergebnis waere ein Modell statt einer Messung.
+    my $mains = Gartenbewaesserung_MainsSupplyState($hash);
+    return "close the mains tap first - mainsSupply is on" if($mains eq "on");
+
+    return "not while it is raining" if(ReadingsVal($name, "raining", "no") eq "yes");
+
+    my $volume = AttrVal($name, "barrelUsableVolume", 0);
+    return "barrelUsableVolume is not set" if($volume !~ /^\d+(?:\.\d+)?$/ || $volume <= 0);
+    return "no barrel-full sensor configured"
+        if(AttrVal($name, "barrelFullSensorDevice", "") eq "");
+    return "no barrel-empty sensor configured"
+        if(AttrVal($name, "barrelEmptySensorDevice", "") eq "");
+
+    # Der IBC muss ein volles Fass hergeben und danach noch etwas uebrig haben,
+    # sonst laeuft die Strecke in Phase 1 leer und es gibt keinen Kontakt.
+    return "the IBC reports empty" if(ReadingsVal($name, "ibcEmpty", "no") eq "yes");
+    my $ibc = ReadingsVal($name, "ibcLevel_l", "");
+    if($ibc =~ /^\d+(?:\.\d+)?$/ && $ibc < $volume + 20) {
+        return sprintf("the IBC holds only %.0f l, a calibration needs %.0f", $ibc, $volume + 20);
+    }
+
+    $hash->{HELPER}{calib} = {
+        phase     => 0,
+        since     => int(time()),
+        rainStart => ReadingsVal($name, ".rainAccum", ""),
+        mainsKnown => ($mains eq "") ? 0 : 1,
+    };
+
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, "calibration", "phase 0: emptying the barrel");
+    readingsBulkUpdate($hash, "calibrationResult", "running");
+    readingsEndUpdate($hash, 1);
+    Log3 $name, 3, "$name: calibration started"
+        . ($mains eq "" ? " (no mainsSupplyDevice - tap state unverified)" : "");
+
+    my $err = Gartenbewaesserung_StartIBCFill($hash, 1);
+    if($err) {
+        Gartenbewaesserung_CalibrateAbort($hash, "phase 0 would not start: $err");
+        return $err;
+    }
+
+    RemoveInternalTimer($hash, "Gartenbewaesserung_CalibrateTick");
+    InternalTimer(gettimeofday() + 15, "Gartenbewaesserung_CalibrateTick", $hash);
+    return undef;
+}
+
+sub Gartenbewaesserung_CalibrateTick {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+    my $c = $hash->{HELPER}{calib};
+
+    RemoveInternalTimer($hash, "Gartenbewaesserung_CalibrateTick");
+    return if(!$c);
+
+    my $volume = AttrVal($name, "barrelUsableVolume", 148);
+
+    # Abbruchgruende, die in jeder Phase gelten
+    return Gartenbewaesserung_CalibrateAbort($hash, "watering started")
+        if($hash->{HELPER}{watering} || $hash->{HELPER}{circuitMode});
+    return Gartenbewaesserung_CalibrateAbort($hash, "the mains tap was opened")
+        if(Gartenbewaesserung_MainsSupplyState($hash) eq "on");
+    my $regen = Gartenbewaesserung_RainSince($hash, $c->{rainStart});
+    if(defined($regen) && $regen > 0.05 * $volume) {
+        return Gartenbewaesserung_CalibrateAbort($hash,
+            sprintf("%.0f l of rain fell into the barrel during the run", $regen));
+    }
+    return Gartenbewaesserung_CalibrateAbort($hash, "took longer than 90 minutes")
+        if(int(time()) - $c->{since} > 5400);
+
+    if($c->{phase} == 0 && !$hash->{HELPER}{ibcFilling}) {
+        return Gartenbewaesserung_CalibrateAbort($hash,
+            "the barrel did not reach the empty contact in phase 0")
+            if(ReadingsVal($name, "barrelEmpty", "no") ne "yes");
+
+        $c->{phase} = 1;
+        readingsSingleUpdate($hash, "calibration", "phase 1: IBC to barrel", 1);
+        Log3 $name, 3, "$name: calibration phase 1 - IBC to barrel until the full contact";
+        my $err = Gartenbewaesserung_StartIBCtoBarrel($hash);
+        return Gartenbewaesserung_CalibrateAbort($hash, "phase 1 would not start: $err") if($err);
+    }
+    elsif($c->{phase} == 1 && !$hash->{HELPER}{ibcToBarrelActive}) {
+        my $ende = ReadingsVal($name, "lastIbcToBarrelEnd", "?");
+        return Gartenbewaesserung_CalibrateAbort($hash,
+            "the transfer ended on '$ende' instead of the barrel-full contact")
+            if($ende ne "barrelFull");
+
+        $c->{gravity}    = ReadingsVal($name, "ibcToBarrelFlow_lpm", "");
+        $c->{gravityMin} = ReadingsVal($name, "lastIbcToBarrelDuration", "");
+        $c->{phase} = 2;
+        readingsSingleUpdate($hash, "calibration", "phase 2: barrel to IBC", 1);
+        Log3 $name, 3, "$name: calibration phase 2 - pumping the full barrel back";
+        my $err = Gartenbewaesserung_StartIBCFill($hash, 1);
+        return Gartenbewaesserung_CalibrateAbort($hash, "phase 2 would not start: $err") if($err);
+    }
+    elsif($c->{phase} == 2 && !$hash->{HELPER}{ibcFilling}) {
+        my $ende = ReadingsVal($name, "lastIbcFillEnd", "?");
+        return Gartenbewaesserung_CalibrateAbort($hash,
+            "the pump run ended on '$ende' instead of the barrel-empty contact")
+            if($ende ne "barrelEmpty");
+
+        $c->{pump}    = ReadingsVal($name, "ibcFillFlow_lpm", "");
+        $c->{pumpMin} = ReadingsVal($name, "lastIbcFillDuration", "");
+        return Gartenbewaesserung_CalibrateFinish($hash);
+    }
+
+    InternalTimer(gettimeofday() + 15, "Gartenbewaesserung_CalibrateTick", $hash);
+}
+
+sub Gartenbewaesserung_CalibrateFinish {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+    my $c = $hash->{HELPER}{calib};
+    return if(!$c);
+    delete $hash->{HELPER}{calib};
+    RemoveInternalTimer($hash, "Gartenbewaesserung_CalibrateTick");
+
+    # Der Filterzustand ist die Pumpenrate gegen das ATTRIBUT - also gegen den
+    # von Hand gemessenen Sollwert, nicht gegen das gelernte Reading, das
+    # gerade eben erst von dieser Messung bewegt wurde.
+    my $soll = AttrVal($name, "ibcFillFlow_lpm", 0);
+    my $filter = "";
+    if($soll =~ /^\d+(?:\.\d+)?$/ && $soll > 0 && $c->{pump} =~ /^\d+(?:\.\d+)?$/) {
+        my $pct = 100 * $c->{pump} / $soll;
+        $filter = sprintf("%.0f%% of nominal", $pct);
+        $filter .= ($pct < 85) ? " - check the filter" : " - ok";
+    }
+
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, "calibration", "idle");
+    readingsBulkUpdate($hash, "calibrationResult", "ok");
+    readingsBulkUpdate($hash, "lastCalibration", TimeNow());
+    readingsBulkUpdate($hash, "calibrationPumpFlow_lpm", $c->{pump})
+        if($c->{pump} ne "");
+    readingsBulkUpdate($hash, "calibrationGravityFlow_lpm", $c->{gravity})
+        if($c->{gravity} ne "");
+    readingsBulkUpdate($hash, "calibrationFilter", $filter) if($filter ne "");
+    readingsEndUpdate($hash, 1);
+
+    Log3 $name, 3, sprintf("%s: calibration done - gravity %s l/min (%s min), "
+        . "pump %s l/min (%s min)%s", $name,
+        $c->{gravity}, $c->{gravityMin}, $c->{pump}, $c->{pumpMin},
+        $filter ne "" ? ", filter $filter" : "");
+    return undef;
+}
+
+sub Gartenbewaesserung_CalibrateAbort {
+    my ($hash, $why) = @_;
+    my $name = $hash->{NAME};
+    my $c = $hash->{HELPER}{calib};
+    return if(!$c);
+    delete $hash->{HELPER}{calib};
+    RemoveInternalTimer($hash, "Gartenbewaesserung_CalibrateTick");
+
+    $why = "stopped" if(!defined($why) || $why eq "");
+    Gartenbewaesserung_StopIBCFill($hash, "calibrationAborted") if($hash->{HELPER}{ibcFilling});
+    Gartenbewaesserung_StopIBCtoBarrel($hash, "calibrationAborted")
+        if($hash->{HELPER}{ibcToBarrelActive});
+
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, "calibration", "idle");
+    readingsBulkUpdate($hash, "calibrationResult", "aborted in phase $c->{phase}: $why");
+    readingsEndUpdate($hash, 1);
+    Log3 $name, 3, "$name: calibration aborted in phase $c->{phase}: $why";
+    return undef;
+}
+
+##############################################################################
 # Rainwater-collection watchdog: if enough rain falls without the barrel/IBC
 # ever showing a fill response, something is wrong with the collection path
 # (gutter, downpipe, diverter, filter). Arms a one-shot verification timer.
@@ -6689,7 +6996,8 @@ sub Gartenbewaesserung_CheckRain {
             my $barrelSensorDef = AttrVal($name, "barrelFullSensorDevice", "");
             if($barrelSensorDef ne "") {
                 # Sensor-based: start IBC fill only when barrel is full
-                if(ReadingsVal($name, "barrelFull", "no") eq "yes" && !$hash->{HELPER}{ibcFilling}) {
+                if(ReadingsVal($name, "barrelFull", "no") eq "yes" && !$hash->{HELPER}{ibcFilling}
+                   && !$hash->{HELPER}{calib}) {
                     Log3 $name, 3, "$name: Rain active and barrel full, starting IBC fill";
                     Gartenbewaesserung_StartIBCFill($hash, 0);
                 }
@@ -6735,6 +7043,7 @@ sub Gartenbewaesserung_CheckRain {
        && !$hash->{HELPER}{watering}
        && !$hash->{HELPER}{circuitMode}
        && !$hash->{HELPER}{ibcToBarrelActive}
+       && !$hash->{HELPER}{calib}
        && Gartenbewaesserung_HarvestDue($hash)) {
         Log3 $name, 3, "$name: Barrel full and " . ReadingsVal($name, "rainSinceHarvest_mm", "?")
             . " mm rain in window, starting IBC fill";
@@ -7052,6 +7361,15 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         ist es nicht, der nächste Kontakt verankert ihn ohnehin.</li>
         <li><a id="Gartenbewaesserung-set-ibcLevel"></a><b>ibcLevel &lt;liter&gt;</b> bzw. <b>ibcLevel &lt;prozent&gt;%</b> - Verankert die Füllstandsschätzung des IBC auf einem abgelesenen Wert. Das ist der genaueste Eingriff, den es gibt: die Schätzung rechnet ab hier neu weiter und die bis dahin aufgelaufene Drift ist weg. Ohne Prozentzeichen wird die Zahl als Liter verstanden. Setzt <code>ibcUsableVolume</code> voraus.</li>
         <li><a id="Gartenbewaesserung-set-barrelLevel"></a><b>barrelLevel &lt;liter&gt;</b> bzw. <b>barrelLevel &lt;prozent&gt;%</b> - Dasselbe für das Fass. Das Fass verankert sich normalerweise mehrmals täglich von selbst an <code>barrelFull</code> oder <code>barrelEmpty</code>; dieser Befehl ist für den Anfang, solange noch kein Kontakt gemeldet hat. Setzt <code>barrelUsableVolume</code> voraus.</li>
+        <li><a id="Gartenbewaesserung-set-calibrate"></a><b>calibrate</b> - Kalibrierlauf <b>IBC → Fass → IBC</b>. Misst beide Förderraten, statt auf eine zufällige Gelegenheit zu warten, und <b>kostet kein Wasser</b> – dieselbe Fassfüllung geht hin und zurück. Drei Phasen:
+        <ul>
+          <li><b>Phase 0</b> – Fass leerpumpen bis <code>barrelEmpty</code>: stellt den bekannten Nullpunkt her. Steht das Fass auf Schwimmerhöhe, fällt nebenbei schon eine Messung ab.</li>
+          <li><b>Phase 1</b> – IBC → Fass bis <code>barrelFull</code>: <code>ibcToBarrelFlow_lpm</code> über genau <code>barrelUsableVolume</code>. Diese Rate ist füllstandsabhängig und wurde vorher nur zufällig gemessen.</li>
+          <li><b>Phase 2</b> – Fass → IBC bis <code>barrelEmpty</code>: <code>ibcFillFlow_lpm</code> über genau ein Fass.</li>
+        </ul>
+        Ergebnis in <code>lastCalibration</code>, <code>calibrationPumpFlow_lpm</code>, <code>calibrationGravityFlow_lpm</code> und <code>calibrationFilter</code> – Letzteres ist die gemessene Pumpenrate in Prozent des <b>Attributs</b> <code>ibcFillFlow_lpm</code> und damit die Filteraussage; unter 85 % steht dort ein Hinweis.<br>
+        Startet nur, wenn nicht gegossen wird, kein anderer Transport läuft, der IBC mindestens ein Fass plus 20 l hergibt, es nicht regnet – und <b>der Hahn zu ist</b>. Bei offenem Hahn speist das Schwimmerventil beide Richtungen mit; das Ergebnis wäre ein Modell statt einer Messung. Während des Laufs brechen Regen, ein geöffneter Hahn oder ein startender Gießzyklus ab, statt eine verdorbene Messung zu lernen – der Lauf lässt sich ja einfach wiederholen.</li>
+        <li><a id="Gartenbewaesserung-set-stopCalibrate"></a><b>stopCalibrate</b> - Bricht einen laufenden Kalibrierlauf ab und schaltet Pumpe und Ventil aus. <code>stop</code> bzw. <code>stopAll</code> tut das ebenfalls.</li>
         <li><a id="Gartenbewaesserung-set-refreshSensors"></a><b>refreshSensors</b> - Liest alle konfigurierten Sensor-Readings sofort neu ein und aktualisiert die Readings (z. B. nach Neustart oder Gerätetausch)</li>
         <li><a id="Gartenbewaesserung-set-validate"></a><b>validate</b> - Prüft die komplette Konfiguration und zeigt Fehler, Warnungen und Infos an</li>
     </ul>
