@@ -13,6 +13,28 @@
 #
 ##############################################################################
 #
+# 1.0.85 - 2026-09-01  Der Kalibrierlauf meldete den falschen Wert und schwieg
+#                      zu einem Filter, der schon zu war.
+#                      1. calibrationPumpFlow_lpm/-GravityFlow_lpm lasen das
+#                      GELERNTE Reading - also die gedaempfte Mischung
+#                      0,7 x alt + 0,3 x neu. Damit verschluckt ein
+#                      Kalibrierlauf 70 % seiner eigenen Neuigkeit, ausgerechnet
+#                      bei der ersten Messung nach einer Veraenderung. Am 31.08.
+#                      standen 148 l in 4,8 min = 30,8 l/min gemessen gegen 31,6
+#                      im Reading. Jetzt wird aus Menge und Laufzeit gerechnet.
+#                      2. Die Warnschwelle lag bei 85 % - unter dem bekannten
+#                      Verschmutzt-Fall. Gemessen an dieser Anlage: 34,4 sauber,
+#                      30,3 verschmutzt, bei Nennwert 34,2 also 89 %. Eine
+#                      85-%-Schwelle konnte damit nie ansprechen. Neues Attribut
+#                      calibrationFilterWarn (Default 93, knapp unter der Mitte
+#                      zwischen sauber und verschmutzt). Der Lauf vom 31.08.
+#                      haette damit "check the filter" gemeldet statt "ok".
+#                      3. Neu calibrationGravityAtIbc_l: die Schwerkraftrate
+#                      haengt an der Wassersaeule (13,6 bei 198 l gegen 15,4 bei
+#                      494 l). Ohne den IBC-Stand sind zwei Laeufe nicht
+#                      vergleichbar, und ein Rueckgang saehe nach Verstopfung
+#                      aus, obwohl nur der IBC leerer war.
+#
 # 1.0.84 - 2026-09-01  Wenn das Wasser nicht fuer den ganzen Zyklus reicht.
 #                      Ausgangslage: reisst der Vorrat mitten im Zyklus ab und
 #                      der Hahn ist zu, stoppt das Modul sauber
@@ -906,7 +928,7 @@ use POSIX;
 # greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
 # gerade selbst geladen) oder die Liste ihr Format aendert.
 {
-    my $FALLBACK = '1.0.84';
+    my $FALLBACK = '1.0.85';
     my $cached;
     sub Gartenbewaesserung_Version {
         return $cached if(defined($cached));
@@ -988,6 +1010,7 @@ sub Gartenbewaesserung_Initialize {
         "barrelEmptyMaxRefillAttempts:slider,0,1,10 " .
         "barrelEmptyResumeMaxAge:slider,0,1,24 " .
         "rotateCircuits:0,1 " .
+        "calibrationFilterWarn:slider,50,1,100 " .
         "rainSkipsWatering:0,1 " .
         "activeValves:textField " .
         "weekdaysOnly:0,1 " .
@@ -6901,6 +6924,18 @@ sub Gartenbewaesserung_CalibrateStart {
     return undef;
 }
 
+# Rate eines Kalibrierlaufs aus der gebuchten Menge und der Laufzeit - also die
+# MESSUNG, nicht der gelernte Mittelwert. Leerstring, wenn eines von beidem
+# fehlt (bei "unknown" etwa).
+sub Gartenbewaesserung_CalibrateRate {
+    my ($hash, $volReading, $minutes) = @_;
+
+    my $vol = ReadingsVal($hash->{NAME}, $volReading, "");
+    return "" if($vol !~ /^\d+(?:\.\d+)?$/ || $vol <= 0);
+    return "" if(!defined($minutes) || $minutes !~ /^\d+(?:\.\d+)?$/ || $minutes <= 0);
+    return sprintf("%.1f", $vol / $minutes);
+}
+
 sub Gartenbewaesserung_CalibrateTick {
     my ($hash) = @_;
     my $name = $hash->{NAME};
@@ -6930,6 +6965,12 @@ sub Gartenbewaesserung_CalibrateTick {
             if(ReadingsVal($name, "barrelEmpty", "no") ne "yes");
 
         $c->{phase} = 1;
+        # Der IBC-Stand VOR dem Transfer gehoert zur Schwerkraftmessung dazu:
+        # die Rate haengt an der Wassersaeule (gemessen 13,6 bei 198 l gegen
+        # 15,4 bei 494 l). Ohne den Stand sind zwei Kalibrierlaeufe nicht
+        # vergleichbar, und ein Rueckgang saehe nach Verstopfung aus, obwohl
+        # nur der IBC leerer war.
+        $c->{ibcAtGravity} = ReadingsVal($name, "ibcLevel_l", "");
         readingsSingleUpdate($hash, "calibration", "phase 1: IBC to barrel", 1);
         Log3 $name, 3, "$name: calibration phase 1 - IBC to barrel until the full contact";
         my $err = Gartenbewaesserung_StartIBCtoBarrel($hash);
@@ -6941,8 +6982,14 @@ sub Gartenbewaesserung_CalibrateTick {
             "the transfer ended on '$ende' instead of the barrel-full contact")
             if($ende ne "barrelFull");
 
-        $c->{gravity}    = ReadingsVal($name, "ibcToBarrelFlow_lpm", "");
+        # Die MESSUNG dieses Laufs, nicht das gelernte Reading. Das Reading ist
+        # die gedaempfte Mischung 0,7 x alt + 0,3 x neu und verschluckt damit
+        # 70 % der Neuigkeit - ausgerechnet bei der ersten Messung nach einer
+        # Veraenderung, also wenn es darauf ankommt. Am 31.08. standen 30,8
+        # gemessen gegen 31,6 im Reading, und die Filteraussage haengt daran.
         $c->{gravityMin} = ReadingsVal($name, "lastIbcToBarrelDuration", "");
+        $c->{gravity}    = Gartenbewaesserung_CalibrateRate($hash,
+            "lastIbcToBarrelVolume_l", $c->{gravityMin});
         $c->{phase} = 2;
         readingsSingleUpdate($hash, "calibration", "phase 2: barrel to IBC", 1);
         Log3 $name, 3, "$name: calibration phase 2 - pumping the full barrel back";
@@ -6955,8 +7002,9 @@ sub Gartenbewaesserung_CalibrateTick {
             "the pump run ended on '$ende' instead of the barrel-empty contact")
             if($ende ne "barrelEmpty");
 
-        $c->{pump}    = ReadingsVal($name, "ibcFillFlow_lpm", "");
         $c->{pumpMin} = ReadingsVal($name, "lastIbcFillDuration", "");
+        $c->{pump}    = Gartenbewaesserung_CalibrateRate($hash,
+            "lastIbcFillVolume_l", $c->{pumpMin});
         return Gartenbewaesserung_CalibrateFinish($hash);
     }
 
@@ -6971,15 +7019,23 @@ sub Gartenbewaesserung_CalibrateFinish {
     delete $hash->{HELPER}{calib};
     RemoveInternalTimer($hash, "Gartenbewaesserung_CalibrateTick");
 
-    # Der Filterzustand ist die Pumpenrate gegen das ATTRIBUT - also gegen den
-    # von Hand gemessenen Sollwert, nicht gegen das gelernte Reading, das
-    # gerade eben erst von dieser Messung bewegt wurde.
+    # Der Filterzustand ist die gemessene Pumpenrate gegen das ATTRIBUT - also
+    # gegen den von Hand gemessenen Sollwert, nicht gegen das gelernte Reading,
+    # das gerade eben erst von dieser Messung bewegt wurde.
+    #
+    # Die Warnschwelle kommt aus den Messwerten der Anlage, nicht aus dem
+    # Bauchgefuehl: 34,4 l/min war der Wert mit sauberem Filter, 30,3 der mit
+    # verschmutztem - bei einem Nennwert von 34,2 sind das 89 %. Eine Schwelle
+    # bei 85 % laege also UNTER dem bekannten Verschmutzt-Fall und meldete nie
+    # etwas. Der Default 93 liegt knapp unter der Mitte zwischen beiden.
     my $soll = AttrVal($name, "ibcFillFlow_lpm", 0);
+    my $warn = AttrVal($name, "calibrationFilterWarn", 93);
+    $warn = 93 if($warn !~ /^\d+(?:\.\d+)?$/ || $warn <= 0);
     my $filter = "";
     if($soll =~ /^\d+(?:\.\d+)?$/ && $soll > 0 && $c->{pump} =~ /^\d+(?:\.\d+)?$/) {
         my $pct = 100 * $c->{pump} / $soll;
         $filter = sprintf("%.0f%% of nominal", $pct);
-        $filter .= ($pct < 85) ? " - check the filter" : " - ok";
+        $filter .= ($pct < $warn) ? " - check the filter" : " - ok";
     }
 
     readingsBeginUpdate($hash);
@@ -6990,6 +7046,8 @@ sub Gartenbewaesserung_CalibrateFinish {
         if($c->{pump} ne "");
     readingsBulkUpdate($hash, "calibrationGravityFlow_lpm", $c->{gravity})
         if($c->{gravity} ne "");
+    readingsBulkUpdate($hash, "calibrationGravityAtIbc_l", $c->{ibcAtGravity})
+        if(defined($c->{ibcAtGravity}) && $c->{ibcAtGravity} ne "");
     readingsBulkUpdate($hash, "calibrationFilter", $filter) if($filter ne "");
     readingsEndUpdate($hash, 1);
 
@@ -7515,7 +7573,10 @@ sub Gartenbewaesserung_UpdateNotifyDev {
           <li><b>Phase 1</b> – IBC → Fass bis <code>barrelFull</code>: <code>ibcToBarrelFlow_lpm</code> über genau <code>barrelUsableVolume</code>. Diese Rate ist füllstandsabhängig und wurde vorher nur zufällig gemessen.</li>
           <li><b>Phase 2</b> – Fass → IBC bis <code>barrelEmpty</code>: <code>ibcFillFlow_lpm</code> über genau ein Fass.</li>
         </ul>
-        Ergebnis in <code>lastCalibration</code>, <code>calibrationPumpFlow_lpm</code>, <code>calibrationGravityFlow_lpm</code> und <code>calibrationFilter</code> – Letzteres ist die gemessene Pumpenrate in Prozent des <b>Attributs</b> <code>ibcFillFlow_lpm</code> und damit die Filteraussage; unter 85 % steht dort ein Hinweis.<br>
+        Ergebnis in <code>lastCalibration</code>, <code>calibrationPumpFlow_lpm</code>, <code>calibrationGravityFlow_lpm</code>, <code>calibrationGravityAtIbc_l</code> und <code>calibrationFilter</code>.<br>
+        Die beiden Raten sind die <b>Messung dieses Laufs</b> (gebuchte Menge ÷ Laufzeit), nicht die gelernten Readings – die sind die gedämpfte Mischung <code>0,7 × alt + 0,3 × neu</code> und würden 70 % der Neuigkeit verschlucken, ausgerechnet bei der ersten Messung nach einer Veränderung.<br>
+        <code>calibrationGravityAtIbc_l</code> ist der IBC-Stand vor dem Transfer: die Schwerkraftrate hängt an der Wassersäule (gemessen 13,6 l/min bei 198 l gegen 15,4 bei 494 l), ohne den Stand sind zwei Läufe nicht vergleichbar.<br>
+        <code>calibrationFilter</code> ist die gemessene Pumpenrate in Prozent des <b>Attributs</b> <code>ibcFillFlow_lpm</code>, siehe <code>calibrationFilterWarn</code>.<br>
         Startet nur, wenn nicht gegossen wird, kein anderer Transport läuft, der IBC mindestens ein Fass plus 20 l hergibt, es nicht regnet – und <b>der Hahn zu ist</b>. Bei offenem Hahn speist das Schwimmerventil beide Richtungen mit; das Ergebnis wäre ein Modell statt einer Messung. Während des Laufs brechen Regen, ein geöffneter Hahn oder ein startender Gießzyklus ab, statt eine verdorbene Messung zu lernen – der Lauf lässt sich ja einfach wiederholen.</li>
         <li><a id="Gartenbewaesserung-set-stopCalibrate"></a><b>stopCalibrate</b> - Bricht einen laufenden Kalibrierlauf ab und schaltet Pumpe und Ventil aus. <code>stop</code> bzw. <code>stopAll</code> tut das ebenfalls.</li>
         <li><a id="Gartenbewaesserung-set-refreshSensors"></a><b>refreshSensors</b> - Liest alle konfigurierten Sensor-Readings sofort neu ein und aktualisiert die Readings (z. B. nach Neustart oder Gerätetausch)</li>
@@ -7959,6 +8020,17 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Reset des Alerts bei <code>barrelFull:yes</code> oder <code>raining:yes</code>.
         </li>
 
+        <li><a id="Gartenbewaesserung-attr-calibrationFilterWarn"></a>
+            <b>calibrationFilterWarn</b><br>
+            Typ: Slider (50–100 %). Standardwert: 93.<br>
+            Ab welchem Anteil des Nennwerts (<code>attr … ibcFillFlow_lpm</code>) ein
+            <code>calibrate</code>-Lauf „check the filter“ meldet.<br>
+            Der Default kommt aus Messwerten, nicht aus dem Bauchgefühl: an dieser Anlage waren
+            <b>34,4 l/min mit sauberem und 30,3 mit verschmutztem Filter</b> gemessen – bei einem
+            Nennwert von 34,2 sind das 89 %. Eine Schwelle bei 85 % läge also <b>unter</b> dem
+            bekannten Verschmutzt-Fall und könnte nie ansprechen. 93 liegt knapp unter der Mitte
+            zwischen beiden Zuständen. Wer andere Werte gemessen hat, setzt die Schwelle
+            entsprechend zwischen seinen eigenen Sauber- und Verschmutzt-Wert.</li>
         <li><a id="Gartenbewaesserung-attr-barrelEmptyResumeMaxAge"></a>
             <b>barrelEmptyResumeMaxAge</b><br>
             Typ: Slider (0–24 Stunden). Standardwert: 6. <code>0</code> = kein Verfall.<br>

@@ -15,7 +15,20 @@ sub is {
     if("$got" eq "$want") { $ok++;  printf("    ok    %-46s = %s\n", $what, $got) }
     else { $fail++; printf("  FAIL    %-46s = %s (erwartet %s)\n", $what, $got, $want) }
 }
-sub ok_true { my ($c,$what)=@_; $c ? ($ok++, printf("    ok    %s\n",$what)) : ($fail++, printf("  FAIL    %s\n",$what)) }
+sub ok_true {
+    my ($c, $what) = @_;
+    # Falle, die einmal zugeschlagen hat: ok_true($x =~ /y/, "text").
+    # Ein FEHLGESCHLAGENER Match liefert im Listenkontext die leere Liste, nicht
+    # 0 - die Argumentliste schrumpft auf einen Eintrag, der Text rutscht auf
+    # $c, und ein nichtleerer Text ist wahr. Die Zusicherung wird also gruen,
+    # genau wenn sie rot sein muesste, und faellt nur durch den fehlenden Text
+    # auf. Ein Test, der nicht rot werden kann, ist wertlos - deshalb hier ein
+    # harter Abbruch statt einer stillen Gruenmeldung. Aufrufer: !!(...) setzen.
+    die "ok_true ohne Text aufgerufen - Bedingung im Listenkontext verschluckt? "
+        . "Match-Bedingungen als !!(\$x =~ /y/) schreiben.\n" if(!defined($what));
+    $c ? ($ok++, printf("    ok    %s\n", $what))
+       : ($fail++, printf("  FAIL    %s\n", $what));
+}
 
 # --- Testanlage: Attrappen fuer alle Aktoren und Sensoren -------------------
 sub dev { my ($n,$s)=@_; $defs{$n} = { NAME=>$n, TYPE=>"dummy", STATE=>$s//"off", READINGS=>{} }; }
@@ -731,7 +744,7 @@ scenario("II Kalibrierlauf verweigert bei offenem Hahn (v1.0.83)");
     my $h = build(mains => "on");
     Gartenbewaesserung_SetIbcLevel($h, 500, "test", 1);
     my $err = Gartenbewaesserung_CalibrateStart($h);
-    ok_true(defined($err) && $err =~ /mains tap/, "abgelehnt (: " . ($err // "undef") . ")");
+    ok_true(!!(defined($err) && $err =~ /mains tap/), "abgelehnt (: " . ($err // "undef") . ")");
     is(relay("POWER8"), "OFF", "und nichts laeuft an");
     is(rd("calibration"), "(fehlt)", "kein Lauf vermerkt");
 }
@@ -768,7 +781,7 @@ scenario("JJ Kalibrierlauf misst beide Raten in drei Phasen (v1.0.83)");
             "Schwerkraftrate gemessen (ist: " . rd("calibrationGravityFlow_lpm") . ")");
     ok_true(rd("calibrationPumpFlow_lpm") ne "(fehlt)",
             "Pumpenrate gemessen (ist: " . rd("calibrationPumpFlow_lpm") . ")");
-    ok_true(rd("calibrationFilter") =~ /%/,
+    ok_true(!!(rd("calibrationFilter") =~ /%/),
             "Filteraussage dabei (ist: " . rd("calibrationFilter") . ")");
 }
 
@@ -785,7 +798,7 @@ scenario("KK Regen waehrend des Kalibrierlaufs bricht ab (v1.0.83)");
     main::readingsSingleUpdate($h, ".rainAccum", 10.5, 0);   # 0,5 mm = 18 l
     main::advance(20);
 
-    ok_true(rd("calibrationResult") =~ /aborted/,
+    ok_true(!!(rd("calibrationResult") =~ /aborted/),
             "Regen bricht ab (: " . rd("calibrationResult") . ")");
     is(relay("POWER8"), "OFF", "Pumpe aus");
     is(rd("calibration"), "idle", "Zustand aufgeraeumt");
@@ -884,6 +897,70 @@ scenario("PP Ohne rotateCircuits bleibt die Reihenfolge fest (v1.0.84)");
         main::advance(5);
     }
     is(join(",", @start), "1,1,1", "immer Kreis 1, altes Verhalten unveraendert");
+}
+
+scenario("QQ Kalibrierlauf meldet die Messung, nicht den Mittelwert (v1.0.85)");
+{
+    # Der Fall vom 31.08.: gemessen 148 l in 4,8 min = 30,8 l/min, im Reading
+    # stand danach 31,6 - die gedaempfte Mischung 0,7 x alt + 0,3 x neu. Ein
+    # Kalibrierlauf verschluckte damit 70 % seiner eigenen Neuigkeit, und die
+    # Filteraussage haengt daran. Hier auf die Spitze getrieben: das Reading
+    # steht auf 50, die Messung liegt bei gut 30.
+    my $h = build();
+    main::readingsSingleUpdate($h, "ibcFillFlow_lpm", 50, 0);
+    Gartenbewaesserung_SetIbcLevel($h, 500, "test", 1);
+    Gartenbewaesserung_SetBarrelLevel($h, 81, "test", 1);
+    Gartenbewaesserung_CalibrateStart($h);
+
+    main::advance(170);
+    sens("barrelEmpty", "yes");
+    main::advance(20);
+    sens("barrelEmpty", "no");
+    main::advance(600);
+    sens("barrelFull", "yes");
+    main::advance(20);
+    sens("barrelFull", "no");
+    main::advance(280);
+    sens("barrelEmpty", "yes");
+    main::advance(20);
+
+    my $gemessen = rd("calibrationPumpFlow_lpm");
+    ok_true($gemessen >= 28 && $gemessen <= 33,
+            "gemeldet wird die Messung ~30, nicht der Mittelwert 44 (ist: $gemessen)");
+    ok_true(rd("ibcFillFlow_lpm") > 40,
+            "das gelernte Reading bleibt gedaempft (ist: " . rd("ibcFillFlow_lpm") . ")");
+
+    # 30 von 34,2 sind 88 % - unter der neuen Schwelle 93, ueber der alten 85.
+    ok_true(!!(rd("calibrationFilter") =~ /check the filter/),
+            "Filter wird angemahnt (ist: " . rd("calibrationFilter") . ")");
+    ok_true(rd("calibrationGravityAtIbc_l") ne "(fehlt)",
+            "IBC-Stand zur Schwerkraftmessung dabei (ist: "
+            . rd("calibrationGravityAtIbc_l") . ")");
+}
+
+scenario("RR Ein sauberer Filter wird nicht angemahnt (v1.0.85)");
+{
+    # Gegenprobe zu QQ: bei einer Rate auf Nennhoehe darf nichts gemeldet
+    # werden, sonst waere die schaerfere Schwelle nur ein Dauerwarner.
+    my $h = build();
+    Gartenbewaesserung_SetIbcLevel($h, 500, "test", 1);
+    Gartenbewaesserung_SetBarrelLevel($h, 81, "test", 1);
+    Gartenbewaesserung_CalibrateStart($h);
+
+    main::advance(170);
+    sens("barrelEmpty", "yes");
+    main::advance(20);
+    sens("barrelEmpty", "no");
+    main::advance(600);
+    sens("barrelFull", "yes");
+    main::advance(20);
+    sens("barrelFull", "no");
+    main::advance(245);                               # ~4,4 min -> rund 34 l/min
+    sens("barrelEmpty", "yes");
+    main::advance(20);
+
+    ok_true(!!(rd("calibrationFilter") =~ /- ok$/),
+            "kein Fehlalarm (ist: " . rd("calibrationFilter") . ")");
 }
 
 print "\n";
