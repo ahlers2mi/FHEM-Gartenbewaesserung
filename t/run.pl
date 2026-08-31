@@ -791,6 +791,101 @@ scenario("KK Regen waehrend des Kalibrierlaufs bricht ab (v1.0.83)");
     is(rd("calibration"), "idle", "Zustand aufgeraeumt");
 }
 
+scenario("LL Vorschau: Bedarf, Vorrat und Deckung (v1.0.84)");
+{
+    # Raten der Testanlage, nicht die der echten Anlage:
+    # 10 x 18,5 + 20 x 14,2 + 11 x 15 = 185 + 284 + 165 = 634 l
+    my $h = build();
+    Gartenbewaesserung_SetIbcLevel($h, 500, "test", 1);
+    Gartenbewaesserung_SetBarrelLevel($h, 100, "test", 1);
+    main::advance(70);                                # ein Minutentakt
+
+    is(rd("cycleWaterNeeded_l"), 634, "Bedarf aus Dauer x Rate je Kreis");
+    is(rd("cycleWaterAvailable_l"), 600, "Vorrat = IBC + Fass");
+    is(rd("cycleCoverage_pct"), 95, "Deckung 600/634 = 95 %");
+
+    # Der gelernte Wert schlaegt das Attribut - dieselbe Reihenfolge wie bei
+    # der Buchung, sonst rechnete die Vorschau mit anderen Zahlen als das Modul.
+    main::readingsSingleUpdate($h, "valve1Flow_lpm", 30, 0);
+    main::advance(70);
+    is(rd("cycleWaterNeeded_l"), 749, "gelernte Rate 30 statt Attribut 18,5 (+115 l)");
+}
+
+scenario("MM Unterbrochener Lauf verfaellt statt Stunden spaeter anzulaufen (v1.0.84)");
+{
+    # Der Fall: Hahn zu, IBC leer. Das Modul merkt sich den Rest und wartet auf
+    # Wasser - bei zugedrehtem Hahn hebt aber nur Regen die barrelEmpty-Sperre
+    # auf. Kommt der zwei Tage spaeter mittags, liefe die Nachtbewaesserung
+    # dann an. Nach barrelEmptyResumeMaxAge wird stattdessen verworfen.
+    my $h = build(attr => { barrelEmptyResumeMaxAge => 6 });
+    sens("barrelFull", "yes");
+    Gartenbewaesserung_StartWatering($h);
+    main::advance(120);
+    is(rd("currentValve"), 1, "Kreis 1 laeuft");
+
+    sens("barrelEmpty", "yes");                       # Wasser ist alle
+    ok_true($h->{HELPER}{barrelEmptyResumePending}, "Rest ist gemerkt");
+
+    main::advance(7 * 3600);                          # sieben Stunden spaeter
+    sens("barrelEmpty", "no");                        # jetzt kaeme Wasser
+    my $st = Gartenbewaesserung_ResumeAfterBarrelEmpty($h);
+
+    is($st, "expired", "Lauf ist verfallen");
+    main::advance(10);                                # Resume oeffnet erst nach 2 s
+    is(relay("POWER1"), "OFF", "und Kreis 1 laeuft NICHT wieder an");
+    ok_true(rd("lastCycleAborted") ne "(fehlt)", "als verfallen protokolliert");
+}
+
+scenario("NN Innerhalb der Frist wird weiterhin fortgesetzt (v1.0.84)");
+{
+    # Gegenprobe zu MM - ohne sie waere das Verfallsdatum eine
+    # Verschlimmbesserung: der normale Fall ist eine Pause von Minuten.
+    my $h = build(attr => { barrelEmptyResumeMaxAge => 6 });
+    sens("barrelFull", "yes");
+    Gartenbewaesserung_StartWatering($h);
+    main::advance(120);
+    sens("barrelEmpty", "yes");
+
+    main::advance(600);                               # zehn Minuten
+    sens("barrelEmpty", "no");
+    my $st = Gartenbewaesserung_ResumeAfterBarrelEmpty($h);
+
+    ok_true($st eq "resumed" || $st eq "none",
+            "kein Verfall nach zehn Minuten (ist: $st)");
+    ok_true(rd("lastCycleAborted") eq "(fehlt)", "nichts als verfallen vermerkt");
+}
+
+scenario("OO Rotation dreht den Startkreis weiter (v1.0.84)");
+{
+    # Ohne Rotation trifft ein Wassermangel immer dieselben hinteren Kreise.
+    my $h = build(attr => { rotateCircuits => 1 });
+    sens("barrelFull", "yes");
+
+    my @start;
+    for my $runde (1 .. 4) {
+        Gartenbewaesserung_StartWatering($h);
+        push @start, rd("cycleFirstValve");
+        Gartenbewaesserung_StopAll($h);
+        main::advance(5);
+    }
+    is(join(",", @start), "1,2,3,1", "Startkreis wandert 1 -> 2 -> 3 -> 1");
+}
+
+scenario("PP Ohne rotateCircuits bleibt die Reihenfolge fest (v1.0.84)");
+{
+    my $h = build();                                  # Attribut nicht gesetzt
+    sens("barrelFull", "yes");
+
+    my @start;
+    for my $runde (1 .. 3) {
+        Gartenbewaesserung_StartWatering($h);
+        push @start, rd("cycleFirstValve");
+        Gartenbewaesserung_StopAll($h);
+        main::advance(5);
+    }
+    is(join(",", @start), "1,1,1", "immer Kreis 1, altes Verhalten unveraendert");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);

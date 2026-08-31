@@ -13,6 +13,38 @@
 #
 ##############################################################################
 #
+# 1.0.84 - 2026-09-01  Wenn das Wasser nicht fuer den ganzen Zyklus reicht.
+#                      Ausgangslage: reisst der Vorrat mitten im Zyklus ab und
+#                      der Hahn ist zu, stoppt das Modul sauber
+#                      (barrelEmptyMaxRefillAttempts -> AbortNoWater) und merkt
+#                      sich den Rest. Zwei Dinge fehlten daran.
+#                      1. Der gemerkte Rest hatte kein Verfallsdatum. Bei
+#                      zugedrehtem Hahn hebt nur neuer Regen die
+#                      barrelEmpty-Sperre auf - faellt der zwei Tage spaeter um
+#                      15 Uhr, faengt dann die Nachtbewaesserung an. Bei Sonne,
+#                      zum schlechtesten Zeitpunkt, ohne dass jemand damit
+#                      rechnet. Neues Attribut barrelEmptyResumeMaxAge (Stunden,
+#                      Default 6, 0 = aus); danach wird verworfen statt
+#                      nachgeholt, Reading lastCycleAborted.
+#                      2. Bei fester Reihenfolge trifft der Ausfall IMMER
+#                      dieselben Kreise - die hinteren bekommen Nacht fuer Nacht
+#                      gar nichts. Neues Attribut rotateCircuits (Default 0):
+#                      der Startkreis wandert je Zyklus weiter, Reading
+#                      cycleFirstValve. Das braucht KEINE Mengenschaetzung und
+#                      erhaelt ganze, tiefe Gaben - anders als ein prozentuales
+#                      Kuerzen, das alle flach giesst und dabei auf ibcLevel_l
+#                      angewiesen waere, den am schlechtesten verankerten Wert
+#                      der Anlage.
+#                      Dazu die Vorschau cycleWaterNeeded_l /
+#                      cycleWaterAvailable_l / cycleCoverage_pct, im Minutentakt
+#                      aus CheckSchedule. Alle Ventilraten sind inzwischen
+#                      Kontakt zu Kontakt gemessen, Dauer x Rate ist also
+#                      belastbar: rund 730 l fuer 10+20+11 min. Sie ist
+#                      absichtlich NUR eine Anzeige - man sieht abends, ob man
+#                      den Hahn aufdreht, statt es morgens am Ergebnis zu merken.
+#                      Die Ratenauswahl je Kreis liegt dafuer jetzt in
+#                      Gartenbewaesserung_ValveFlow statt zweimal im Code.
+#
 # 1.0.83 - 2026-08-31  Neu: "set <name> calibrate" - ein Kalibrierlauf
 #                      IBC -> Fass -> IBC, der beide Foerderraten misst, statt
 #                      auf eine zufaellige Gelegenheit zu warten. Er kostet kein
@@ -874,7 +906,7 @@ use POSIX;
 # greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
 # gerade selbst geladen) oder die Liste ihr Format aendert.
 {
-    my $FALLBACK = '1.0.83';
+    my $FALLBACK = '1.0.84';
     my $cached;
     sub Gartenbewaesserung_Version {
         return $cached if(defined($cached));
@@ -954,6 +986,8 @@ sub Gartenbewaesserung_Initialize {
         "pumpMaxRuntime:slider,0,1,240 " .
         "barrelFillTimeout:slider,0,1,120 " .
         "barrelEmptyMaxRefillAttempts:slider,0,1,10 " .
+        "barrelEmptyResumeMaxAge:slider,0,1,24 " .
+        "rotateCircuits:0,1 " .
         "rainSkipsWatering:0,1 " .
         "activeValves:textField " .
         "weekdaysOnly:0,1 " .
@@ -3088,6 +3122,29 @@ sub Gartenbewaesserung_StartWatering {
         return "No active valves configured";
     }
 
+    # Reihenfolge weiterdrehen. Reicht das Wasser nicht fuer den ganzen Zyklus,
+    # bricht er irgendwo ab - und zwar bei fester Reihenfolge IMMER an derselben
+    # Stelle. Die hinteren Kreise bekommen dann Nacht fuer Nacht gar nichts,
+    # waehrend die vorderen jedes Mal voll versorgt werden.
+    #
+    # Die Rotation braucht dafuer KEINE Mengenschaetzung: sie sorgt nur dafuer,
+    # dass der Ausfall jede Nacht einen anderen trifft. Ueber eine Woche bekommt
+    # jeder ungefaehr seinen Anteil - und zwar in ganzen, tiefen Gaben statt in
+    # flachen. Das ist der Grund, warum hier rotiert und nicht gekuerzt wird.
+    if(AttrVal($name, "rotateCircuits", 0) && scalar(@activeValves) > 1) {
+        my $zuletzt = ReadingsVal($name, "cycleFirstValve", "");
+        my $off = 0;
+        if($zuletzt =~ /^\d+$/) {
+            for my $i (0 .. $#activeValves) {
+                next if($activeValves[$i] != $zuletzt);
+                $off = ($i + 1) % scalar(@activeValves);
+                last;
+            }
+        }
+        push(@activeValves, splice(@activeValves, 0, $off)) if($off);
+    }
+    readingsSingleUpdate($hash, "cycleFirstValve", $activeValves[0], 0);
+
     # Store watering plan
     $hash->{HELPER}{wateringQueue} = \@activeValves;
     $hash->{HELPER}{wateringIndex} = 0;
@@ -3925,6 +3982,31 @@ sub Gartenbewaesserung_ResumeAfterBarrelEmpty {
     if(!defined($context) || ref($context) ne "HASH") {
         Gartenbewaesserung_ClearBarrelEmptyResumeContext($hash);
         return "none";
+    }
+
+    # Verfallsdatum. Ein unterbrochener Lauf wartet sonst BELIEBIG lange auf
+    # Wasser: bei zugedrehtem Hahn hebt nur neuer Regen die barrelEmpty-Sperre
+    # auf, und der kann Tage auf sich warten lassen. Dann faengt die
+    # Nachtbewaesserung an, wenn es zwei Tage spaeter um 15 Uhr regnet - bei
+    # Sonne, zum denkbar schlechtesten Zeitpunkt, und ohne dass irgendjemand
+    # damit rechnet. Nach Ablauf wird der Rest verworfen statt nachgeholt; der
+    # naechste regulaere Zyklus faengt ohnehin von vorne an.
+    my $maxAge = AttrVal($name, "barrelEmptyResumeMaxAge", 6);
+    if($maxAge > 0 && defined($context->{createdAt})) {
+        my $alter = (time() - $context->{createdAt}) / 3600;
+        if($alter > $maxAge) {
+            Log3 $name, 3, sprintf("%s: interrupted run is %.1f h old (limit %s h) - "
+                . "discarding instead of resuming at an unplanned hour", $name, $alter, $maxAge);
+            Gartenbewaesserung_ClearBarrelEmptyResumeContext($hash);
+            delete $hash->{HELPER}{noWaterAbort};
+            readingsBeginUpdate($hash);
+            readingsBulkUpdate($hash, "state", "idle");
+            readingsBulkUpdate($hash, "phase", "idle");
+            readingsBulkUpdate($hash, "lastCycleAborted",
+                sprintf("%s - interrupted run expired after %.1f h", TimeNow(), $alter));
+            readingsEndUpdate($hash, 1);
+            return "expired";
+        }
     }
 
     if(ReadingsVal($name, "barrelEmpty", "no") eq "yes") {
@@ -5269,6 +5351,80 @@ sub Gartenbewaesserung_FlowRate {
     return 0;
 }
 
+# Entnahmerate EINES Kreises, vom Speziellen zum Allgemeinen: die Rate dieses
+# Kreises schlaegt die gemeinsame, denn jeder Kreis hat andere Sprenger und
+# nicht gleich viele. Danach die gelernte Gesamtrate, dann deren Attribut.
+# 0 heisst "keine bekannt" - der Aufrufer entscheidet, was das bedeutet.
+sub Gartenbewaesserung_ValveFlow {
+    my ($hash, $valveNum) = @_;
+    my $name = $hash->{NAME};
+
+    my $vn = (defined($valveNum) && $valveNum =~ /^\d+$/) ? $valveNum : "";
+    foreach my $candidate (
+        $vn ne "" ? ReadingsVal($name, "valve${vn}Flow_lpm", 0) : 0,
+        $vn ne "" ? AttrVal($name, "valve${vn}Flow_lpm", 0) : 0,
+        ReadingsVal($name, "wateringFlow_lpm", 0),
+        AttrVal($name, "wateringFlow_lpm", 0),
+    ) {
+        next if($candidate !~ /^\d+(?:\.\d+)?$/ || $candidate <= 0);
+        return $candidate;
+    }
+    return 0;
+}
+
+##############################################################################
+# Vorschau: reicht das Wasser fuer einen ganzen Zyklus?
+#
+# Alle Ventilraten sind inzwischen Kontakt-zu-Kontakt gemessen, die Rechnung
+# Dauer x Rate ist also belastbar. Sie sagt abends, ob man den Hahn aufdrehen
+# will - statt es morgens am Ergebnis zu merken.
+#
+# Bewusst NUR eine Anzeige. Aus der Deckung automatisch die Laufzeiten zu
+# kuerzen waere zweimal falsch: Giessen ist nicht linear (die halbe Zeit ist
+# nicht der halbe Nutzen, das Wasser dringt flacher ein und verdunstet
+# anteilig mehr), und der Vorrat steht in ibcLevel_l - dem am schlechtesten
+# verankerten Wert der Anlage. Das Fass verankert sich mehrmals taeglich an
+# einem Kontakt, der IBC nur bei ibcFull/ibcEmpty, also praktisch nie.
+##############################################################################
+sub Gartenbewaesserung_UpdateCycleForecast {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    my @valves = grep { /^\d+$/ && $_ >= 1 && $_ <= 8 }
+                 split(/,/, AttrVal($name, "activeValves", "1,2,3,4,5,6,7,8"));
+    return if(!@valves);
+
+    my $bedarf = 0;
+    my $unbekannt = 0;
+    foreach my $v (@valves) {
+        my $min  = AttrVal($name, "valve${v}Duration", 0);
+        next if($min !~ /^\d+(?:\.\d+)?$/ || $min <= 0);
+        my $rate = Gartenbewaesserung_ValveFlow($hash, $v);
+        if($rate <= 0) { $unbekannt++; next; }
+        $bedarf += $min * $rate;
+    }
+    return if($bedarf <= 0);
+
+    # Vorrat: was in beiden Behaeltern steht. Stadtwasser bewusst NICHT
+    # eingerechnet - mit 4,4 l/min liefert der Hahn weniger als jeder Kreis
+    # zieht, er verlaengert den Zyklus also, statt ihn zu ermoeglichen.
+    my $vorrat = 0;
+    foreach my $r ("ibcLevel_l", "barrelLevel_l") {
+        my $v = ReadingsVal($name, $r, "");
+        $vorrat += $v if($v =~ /^\d+(?:\.\d+)?$/);
+    }
+
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, "cycleWaterNeeded_l", sprintf("%.0f", $bedarf));
+    readingsBulkUpdate($hash, "cycleWaterAvailable_l", sprintf("%.0f", $vorrat));
+    readingsBulkUpdate($hash, "cycleCoverage_pct",
+        sprintf("%.0f", 100 * $vorrat / $bedarf));
+    readingsBulkUpdate($hash, "cycleWaterNote",
+        $unbekannt ? "$unbekannt circuit(s) without a known flow rate - demand is understated"
+                   : "-");
+    readingsEndUpdate($hash, 1);
+}
+
 sub Gartenbewaesserung_ApplyBarrelFloatFloor {
     my ($hash) = @_;
     my $name = $hash->{NAME};
@@ -5315,23 +5471,11 @@ sub Gartenbewaesserung_NoteValveDraw {
 
     my $capacity = AttrVal($name, "barrelUsableVolume", 0);
     if($capacity > 0) {
-        # Vom Speziellen zum Allgemeinen: die Rate DIESES Kreises schlaegt die
-        # gemeinsame, denn jeder Kreis hat andere Sprenger und nicht gleich
-        # viele. Danach die gelernte Gesamtrate, dann das Attribut, zuletzt der
-        # Pauschalabzug - der ignoriert die Laufzeit und liegt bei laengeren
-        # Ventilen weit daneben, deshalb der Log-Hinweis.
-        my $vn = (defined($valveNum) && $valveNum =~ /^\d+$/) ? $valveNum : "";
-        my $rate = 0;
-        foreach my $candidate (
-            $vn ne "" ? ReadingsVal($name, "valve${vn}Flow_lpm", 0) : 0,
-            $vn ne "" ? AttrVal($name, "valve${vn}Flow_lpm", 0) : 0,
-            ReadingsVal($name, "wateringFlow_lpm", 0),
-            AttrVal($name, "wateringFlow_lpm", 0),
-        ) {
-            next if($candidate !~ /^\d+(?:\.\d+)?$/ || $candidate <= 0);
-            $rate = $candidate;
-            last;
-        }
+        # Dieselbe Reihenfolge wie in der Zyklus-Vorschau - deshalb ein Helfer
+        # statt zweier Kopien. Bleibt sie 0, greift der Pauschalabzug; der
+        # ignoriert die Laufzeit und liegt bei laengeren Ventilen weit daneben,
+        # deshalb der Log-Hinweis.
+        my $rate = Gartenbewaesserung_ValveFlow($hash, $valveNum);
 
         my $drawn;
         if($rate > 0 && $minutes > 0) {
@@ -7085,6 +7229,10 @@ sub Gartenbewaesserung_CheckSchedule {
     # dem Zaehler sonst entgingen.
     Gartenbewaesserung_MainsMeterTick($hash);
     Gartenbewaesserung_MainsFillIbcTick($hash);
+    # Vorschau mitlaufen lassen: der Wert ist abends interessant, nicht erst
+    # beim Start. Die Readings aendern sich nur, wenn sich ein Fuellstand
+    # aendert, es entstehen also keine Ereignisse im Leerlauf.
+    Gartenbewaesserung_UpdateCycleForecast($hash);
 
     my ($sec, $min, $hour, $mday, $mon, $year, $wday) = localtime(time);
     my $currentTime = sprintf("%02d:%02d", $hour, $min);
@@ -7811,6 +7959,31 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Reset des Alerts bei <code>barrelFull:yes</code> oder <code>raining:yes</code>.
         </li>
 
+        <li><a id="Gartenbewaesserung-attr-barrelEmptyResumeMaxAge"></a>
+            <b>barrelEmptyResumeMaxAge</b><br>
+            Typ: Slider (0–24 Stunden). Standardwert: 6. <code>0</code> = kein Verfall.<br>
+            Verfallsdatum für einen unterbrochenen Lauf. Bricht die Bewässerung mangels Wasser ab,
+            merkt sich das Modul die Restzeit und setzt sie fort, sobald wieder Wasser da ist. Bei
+            <b>zugedrehtem Hahn</b> kann das dauern: dann hebt nur neuer Regen die
+            <code>barrelEmpty</code>-Sperre auf. Fällt der zwei Tage später um 15 Uhr, würde dann
+            die unterbrochene <i>Nacht</i>bewässerung anlaufen – bei Sonne, zum schlechtesten
+            Zeitpunkt, und ohne dass jemand damit rechnet. Nach Ablauf wird der Rest deshalb
+            <b>verworfen statt nachgeholt</b> (Reading <code>lastCycleAborted</code>); der nächste
+            reguläre Zyklus fängt ohnehin von vorne an.</li>
+        <li><a id="Gartenbewaesserung-attr-rotateCircuits"></a>
+            <b>rotateCircuits</b><br>
+            Typ: 0/1. Standardwert: 0 (aus, feste Reihenfolge wie in <code>activeValves</code>).<br>
+            Dreht den <b>Startkreis</b> bei jedem Zyklus um eine Position weiter (Reading
+            <code>cycleFirstValve</code>). Sinn: reicht das Wasser nicht für den ganzen Zyklus,
+            bricht er irgendwo ab – bei fester Reihenfolge <b>immer an derselben Stelle</b>. Die
+            hinteren Kreise bekommen dann Nacht für Nacht gar nichts, während die vorderen jedes
+            Mal voll versorgt werden. Mit Rotation trifft der Ausfall jede Nacht einen anderen, und
+            über eine Woche bekommt jeder ungefähr seinen Anteil.<br>
+            Bewusst eine Rotation und <b>keine prozentuale Kürzung</b>: Gießen ist nicht linear –
+            die halbe Zeit ist nicht der halbe Nutzen, das Wasser dringt flacher ein und verdunstet
+            anteilig mehr. Lieber wenige Kreise <i>richtig</i> als alle zu flach. Außerdem braucht
+            die Rotation keine Mengenschätzung; eine Kürzung müsste sich auf
+            <code>ibcLevel_l</code> stützen, den am schlechtesten verankerten Wert der Anlage.</li>
         <li><a id="Gartenbewaesserung-attr-barrelEmptyMaxRefillAttempts"></a>
             <b>barrelEmptyMaxRefillAttempts</b><br>
             Typ: Slider (0–10). Standardwert: 3.<br>
