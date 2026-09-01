@@ -13,6 +13,35 @@
 #
 ##############################################################################
 #
+# 1.0.87 - 2026-09-01  Der Alarm "Fass wurde nicht voll" haengt jetzt am Ende
+#                      des Transfers statt an einer eigenen Uhr.
+#                      barrelFillTimeout war ein zweiter Timer neben dem Deckel
+#                      ibcToBarrelDuration, und fuer einen zweiten Timer gibt es
+#                      keinen richtigen Wert: kuerzer als der Deckel feuert er
+#                      mitten in einen normalen Transfer, laenger sagt er nur
+#                      spaeter, was der Transfer schon gesagt hat, gleich lang
+#                      ist ein Wettrennen. Am 29.08. stand er auf 12 bei einem
+#                      Deckel von 20 und einer echten Laufzeit von 11,7 min:
+#                      "IBC leer" gemeldet, ibcLevel_l auf 0 verankert, obwohl
+#                      Wasser drin war - 147 l Drift bis zum Ablesen am 01.09.
+#                      Der Fehler ist nicht die 12, sondern die eigene Uhr.
+#                      Jetzt setzt NoteIbcToBarrelStop den Alarm, wenn ein
+#                      IBC->Fass-Lauf seine volle erlaubte Zeit hatte und
+#                      barrelFull trotzdem ausblieb - unabhaengig davon, ob das
+#                      Ende "maxDuration" oder "pauseEnd" heisst; gezaehlt wird
+#                      die Zeit. Ein Pausenende vor Ablauf der erlaubten Zeit
+#                      ist kein Befund. Stadtwasser ist nie betroffen: der
+#                      Schwimmer erreicht barrelFull nie, und die Funktion sieht
+#                      nur IBC-Laeufe. barrelFillTimeout bleibt als Rueckfall
+#                      fuer ibcToBarrelDuration = 0 (ohne Deckel braucht es eine
+#                      Uhr) und kann sonst geloescht werden.
+#                      validate prueft die Reihenfolge Physik < Deckel < Alarm:
+#                      Timeout unter dem Deckel (Warnung), Timeout ueber dem
+#                      Deckel (redundant, Info), Deckel zu knapp ueber
+#                      barrelUsableVolume / ibcToBarrelFlow_lpm (Warnung - die
+#                      Rate faellt mit dem IBC-Stand), Pausendauer unter dem
+#                      Deckel (Warnung - der Transfer wird abgeschnitten).
+#
 # 1.0.86 - 2026-09-01  Regen waehrend eines Pumpenlaufs wurde nicht gebucht.
 #                      Am 31.08. buchte eine siebenminuetige Ernte 179 l,
 #                      waehrend die Pumpe in derselben Zeit rund 217 l bewegt
@@ -950,7 +979,7 @@ use POSIX;
 # greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
 # gerade selbst geladen) oder die Liste ihr Format aendert.
 {
-    my $FALLBACK = '1.0.86';
+    my $FALLBACK = '1.0.87';
     my $cached;
     sub Gartenbewaesserung_Version {
         return $cached if(defined($cached));
@@ -2007,6 +2036,49 @@ sub Gartenbewaesserung_ValidateConfig {
     }
     else {
         push @info, "Automatic pause: DISABLED (continuous watering)";
+    }
+
+    # Deckel, Waechter und Physik der IBC->Fass-Strecke muessen in dieser
+    # Reihenfolge stehen: Physik < Deckel (ibcToBarrelDuration) < Alarm. Am
+    # 29.08. stand der Alarm (barrelFillTimeout 12) UNTER dem Deckel (20) und
+    # feuerte mitten in einen normalen 11,7-Minuten-Transfer - "IBC leer",
+    # ibcLevel_l auf 0 verankert, 147 l Drift bis zum Ablesen.
+    my $ibcDur = AttrVal($name, "ibcToBarrelDuration", 15);
+    my $fillTo = AttrVal($name, "barrelFillTimeout", 0);
+    $ibcDur = 0 if($ibcDur !~ /^\d+(?:\.\d+)?$/);
+    $fillTo = 0 if($fillTo !~ /^\d+(?:\.\d+)?$/);
+    if($fillTo > 0 && $ibcDur > 0) {
+        if($fillTo <= $ibcDur) {
+            push @warnings, "barrelFillTimeout ($fillTo min) is not above ibcToBarrelDuration "
+                . "($ibcDur min): the alert fires while a transfer is still legitimately running, "
+                . "a LOW IBC then looks like an EMPTY one and ibcLevel_l is anchored to 0. Delete "
+                . "the attribute - the alert is raised when a transfer ends without barrelFull.";
+        }
+        else {
+            push @info, "barrelFillTimeout ($fillTo min) is redundant: with ibcToBarrelDuration "
+                . "set, the alert is raised at the end of the transfer. It can be deleted.";
+        }
+    }
+    my $gRate = Gartenbewaesserung_FlowRate($hash, "ibcToBarrelFlow_lpm");
+    my $bVol  = AttrVal($name, "barrelUsableVolume", 0);
+    $bVol = 0 if($bVol !~ /^\d+(?:\.\d+)?$/);
+    if($ibcDur > 0 && $gRate > 0 && $bVol > 0) {
+        my $need = $bVol / $gRate;
+        if($ibcDur < $need * 1.3) {
+            push @warnings, sprintf("ibcToBarrelDuration (%g min) leaves little room: a full "
+                . "transfer needs %.1f min at %.1f l/min, and the gravity rate falls with the "
+                . "IBC level. A too-short ceiling turns a low IBC into a false 'empty'. "
+                . "Recommend at least %.0f min.", $ibcDur, $need, $gRate, $need * 1.5);
+        }
+        else {
+            push @info, sprintf("ibcToBarrelDuration %g min vs. %.1f min needed at %.1f l/min OK",
+                $ibcDur, $need, $gRate);
+        }
+    }
+    if($pauseDuration > 0 && $ibcDur > 0 && $pauseDuration < $ibcDur) {
+        push @warnings, "wateringPauseDuration ($pauseDuration min) is below ibcToBarrelDuration "
+            . "($ibcDur min): an IBC refill during a pause is cut off at pauseEnd before it "
+            . "could fill the barrel.";
     }
 
     # Check pump
@@ -5865,6 +5937,31 @@ sub Gartenbewaesserung_NoteIbcToBarrelStop {
         Gartenbewaesserung_AdjustIbcLevel($hash, -$moved, "IBC->barrel");
         Gartenbewaesserung_AdjustBarrelLevel($hash, $moved, "IBC->barrel");
     }
+
+    # Der Alarm "Fass wurde nicht voll" gehoert HIER hin - ans Ende des
+    # Transfers, nicht an eine eigene Uhr. barrelFillTimeout war so eine Uhr, und
+    # fuer sie gibt es keinen richtigen Wert: kuerzer als ibcToBarrelDuration
+    # feuert sie mitten in einen normalen Transfer (29.08.: 12 min Timeout bei
+    # 11,7 min Laufzeit -> "IBC leer" -> ibcLevel_l auf 0 verankert, obwohl
+    # Wasser drin war - 147 l Drift bis zum Ablesen am 01.09.), laenger sagt sie
+    # nur spaeter, was der Transfer schon gesagt hat. Die Information entsteht
+    # in dem Moment, in dem der Transfer seine volle erlaubte Zeit hatte und der
+    # Kontakt trotzdem ausblieb.
+    # Absichtlich unabhaengig vom Grund-String: ob der Deckel "maxDuration"
+    # heisst oder ein Pausenende "pauseEnd", gezaehlt wird die Zeit. Ein
+    # Pausenende VOR Ablauf der erlaubten Zeit ist kein Befund - der Transfer
+    # hatte dann keine faire Chance. Stadtwasser ist hier nie gemeint: ueber
+    # den Schwimmer wird barrelFull nie erreicht, und diese Funktion sieht nur
+    # IBC->Fass-Laeufe. barrelFillTimeout bleibt als Rueckfall fuer
+    # ibcToBarrelDuration = 0 - ohne Deckel braucht es eine Uhr.
+    my $limit = AttrVal($name, "ibcToBarrelDuration", 0);
+    if($limit =~ /^\d+(?:\.\d+)?$/ && $limit > 0 && $minutes >= $limit - 0.1
+       && $reason ne "barrelFull"
+       && ReadingsVal($name, "barrelFull", "no") ne "yes") {
+        Log3 $name, 1, sprintf("%s: WARNUNG - IBC->Fass-Transfer hatte %.1f von %g min und "
+            . "das Fass ist nicht voll: IBC leer oder Strecke gestoert", $name, $minutes, $limit);
+        readingsSingleUpdate($hash, "barrelFillTimeoutAlert", "yes", 1);
+    }
 }
 
 ##############################################################################
@@ -8058,22 +8155,28 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         </li>
         <li><a id="Gartenbewaesserung-attr-barrelFillTimeout"></a>
             <b>barrelFillTimeout</b><br>
-            Typ: Slider (0–120 Minuten). Standardwert: 0 Minuten.<br>
-            Watchdog für die Fass-Befüllung. Als Erfolg zählt ausschließlich
-            <code>barrelFull</code>. Das ist Absicht: Steht im Fass ein Schwimmerventil aus der
-            Hauswasserleitung, wird <code>barrelEmpty</code> auch bei staubtrockenem IBC binnen
-            Minuten wieder <code>no</code> – „Wasser ist da“ sagt dann nichts über die
-            konfigurierte Quelle aus. Nur der Voll-Kontakt unterscheidet: Ein IBC mit Wasser hebt
-            das Fass bis dorthin, ein Schwimmer allein bleibt darunter. Genau daraus lässt sich
-            ein leerer IBC ableiten.<br>
-            Wird das Befüllventil
-            (<code>barrelFillValveDevice</code> oder <code>ibcToBarrelValveDevice</code>)
-            geöffnet, aber der <code>barrelFullSensorDevice</code> meldet innerhalb der
-            konfigurierten Minuten kein <code>full</code>, dann wird Reading
-            <code>barrelFillTimeoutAlert</code> auf <code>yes</code> gesetzt.
-            Typischer Indikator: IBC leer oder Wasserzufuhr unterbrochen.
-            0 = deaktiviert. Voraussetzung: <code>barrelFullSensorDevice</code> ist konfiguriert.
-            Reset des Alerts bei <code>barrelFull:yes</code> oder <code>raining:yes</code>.
+            Typ: Slider (0–120 Minuten). Standardwert: 0 = aus. <b>Seit v1.0.87 nur noch ein
+            Rückfall</b> – im Normalfall löschen.<br>
+            Der Alarm <code>barrelFillTimeoutAlert</code> („Fass wurde nicht voll“) entsteht seit
+            v1.0.87 <b>am Ende eines IBC → Fass-Transfers</b>: hatte der Transfer seine volle
+            erlaubte Zeit (<code>ibcToBarrelDuration</code>) und <code>barrelFull</code> blieb
+            trotzdem aus, ist der IBC leer oder die Strecke gestört. Dafür braucht es keine
+            eigene Uhr – und für eine eigene Uhr gibt es auch <b>keinen richtigen Wert</b>:
+            kürzer als <code>ibcToBarrelDuration</code> feuert sie mitten in einen normalen
+            Transfer (so am 29.08.2026: Timeout 12 min bei 11,7 min echter Laufzeit → „IBC leer“
+            → <code>ibcLevel_l</code> auf 0 verankert, obwohl Wasser drin war), länger sagt sie nur
+            später, was der Transfer schon gesagt hat.<br>
+            Dieses Attribut ist deshalb nur noch für <code>ibcToBarrelDuration = 0</code> gedacht
+            (kein Deckel → ohne Uhr gäbe es keinen Alarm). Steht ein Deckel, ist es redundant;
+            steht es <i>unter</i> dem Deckel, ist es schädlich. <code>set … validate</code> meldet
+            beides.<br>
+            Als Erfolg zählt weiterhin ausschließlich <code>barrelFull</code>, nie das Verschwinden
+            von <code>barrelEmpty</code>: über ein Schwimmerventil aus der Hauswasserleitung wird der
+            Voll-Kontakt <b>nie</b> erreicht, der Schwimmer stoppt darunter – ein Pausenende ohne
+            <code>barrelFull</code> ist bei Stadtwasser also normal und kein Alarm. Bewertet werden
+            nur IBC → Fass-Läufe. Voraussetzung: <code>barrelFullSensorDevice</code> ist
+            konfiguriert. Reset des Alerts bei <code>barrelFull:yes</code> oder
+            <code>raining:yes</code>.
         </li>
 
         <li><a id="Gartenbewaesserung-attr-calibrationFilterWarn"></a>

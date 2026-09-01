@@ -1003,6 +1003,65 @@ scenario("TT Ohne Regen bleibt die Buchung auf dem Fassmass (v1.0.86)");
     is(rd("lastIbcFillVolume_l"), 148, "genau das Fassmass, kein Zuschlag");
 }
 
+scenario("UU Transfer ohne barrelFull nach voller erlaubter Zeit meldet IBC leer (v1.0.87)");
+{
+    # barrelFillTimeout 0: die alte Uhr ist AUS. Kommt der Alarm trotzdem, dann
+    # aus dem Transferende - genau da soll er herkommen. Auf v1.0.86 bleibt er
+    # ohne die Uhr stumm.
+    my $h = build(attr => { barrelFillTimeout => 0, ibcToBarrelDuration => 14 });
+    Gartenbewaesserung_SetIbcLevel($h, 30, "test", 1);   # IBC praktisch leer
+    Gartenbewaesserung_SetBarrelLevel($h, 0, "test", 1);
+    is(rd("barrelFillTimeoutAlert"), "no", "vorher kein Alarm");
+
+    Gartenbewaesserung_StartIBCtoBarrel($h);
+    main::advance(14 * 60 + 40);                      # Deckel erreicht, kein Kontakt
+
+    is(relay("POWER5"), "OFF", "Deckel hat zugemacht");
+    is(rd("barrelFillTimeoutAlert"), "yes", "Alarm aus dem Transferende, ohne eigene Uhr");
+}
+
+scenario("VV Kein Alarm bei Kontakt oder vorzeitigem Stopp (v1.0.87)");
+{
+    # Gegenprobe: ein Transfer, der den Kontakt erreicht, und einer, der vor
+    # Ablauf der erlaubten Zeit von Hand endet, sind beide kein Befund.
+    my $h = build(attr => { barrelFillTimeout => 0, ibcToBarrelDuration => 14 });
+    Gartenbewaesserung_SetIbcLevel($h, 500, "test", 1);
+    Gartenbewaesserung_SetBarrelLevel($h, 0, "test", 1);
+
+    Gartenbewaesserung_StartIBCtoBarrel($h);
+    main::advance(600);
+    sens("barrelFull", "yes");
+    is(rd("barrelFillTimeoutAlert"), "no", "Kontakt kam nach 10 min: kein Alarm");
+
+    sens("barrelFull", "no");
+    Gartenbewaesserung_StartIBCtoBarrel($h);
+    main::advance(120);
+    Gartenbewaesserung_StopIBCtoBarrel($h, "manual");
+    is(rd("barrelFillTimeoutAlert"), "no", "nach 2 min von Hand gestoppt: kein Befund");
+}
+
+scenario("WW validate prueft Physik < Deckel < Alarm (v1.0.87)");
+{
+    # Die Konfiguration vom 29.08.: Timeout 12 unter einem Deckel von 14.
+    my $h = build(attr => { barrelFillTimeout => 12, ibcToBarrelDuration => 14 });
+    my $r = Gartenbewaesserung_ValidateConfig($h);
+    ok_true(!!($r =~ /barrelFillTimeout \(12 min\) is not above ibcToBarrelDuration/),
+            "Timeout unter dem Deckel wird angemahnt");
+
+    # Ohne Timeout: dazu keine Zeile. Der Deckel 14 gegen 148/12,2 = 12,1 min
+    # ist knapp und wird zu Recht angemahnt - das ist eine andere Meldung.
+    my $h2 = build(attr => { barrelFillTimeout => 0, ibcToBarrelDuration => 14 });
+    my $r2 = Gartenbewaesserung_ValidateConfig($h2);
+    ok_true(!!($r2 !~ /barrelFillTimeout/), "ohne Timeout keine Meldung dazu");
+    ok_true(!!($r2 =~ /ibcToBarrelDuration \(14 min\) leaves little room/),
+            "Deckel zu knapp ueber der Physik wird angemahnt");
+
+    # Deckel 20 gegen 12,1 min Bedarf: in Ordnung, keine Warnung dazu.
+    my $h3 = build(attr => { barrelFillTimeout => 0, ibcToBarrelDuration => 20 });
+    my $r3 = Gartenbewaesserung_ValidateConfig($h3);
+    ok_true(!!($r3 !~ /leaves little room/), "Deckel 20 ist nicht knapp");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);
