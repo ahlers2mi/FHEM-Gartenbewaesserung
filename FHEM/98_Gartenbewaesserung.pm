@@ -13,6 +13,28 @@
 #
 ##############################################################################
 #
+# 1.0.86 - 2026-09-01  Regen waehrend eines Pumpenlaufs wurde nicht gebucht.
+#                      Am 31.08. buchte eine siebenminuetige Ernte 179 l,
+#                      waehrend die Pumpe in derselben Zeit rund 217 l bewegt
+#                      hat: waehrend des Pumpens regnete es weiter, das Wasser
+#                      lief ins Fass nach und wurde mitgefoerdert - gebucht
+#                      wurde aber nur Fassmass plus Schwimmerzulauf. Die
+#                      Differenz fehlt dem IBC, und weil sie sich ueber Tage
+#                      aufsummiert, faellt sie erst beim Ablesen auf.
+#                      Die Regenzahl ist bei Starkregen selbst unzuverlaessig
+#                      (137 l Dachertrag gerechnet gegen rund 59, die ankamen -
+#                      die Rinne nimmt keine 20 l/min), deshalb wird sie nicht
+#                      addiert, sondern an der Pumpenkapazitaet gedeckelt: mehr
+#                      als Rate x Laufzeit kann die Pumpe nicht bewegt haben.
+#                      Der Deckel aus v1.0.80, hier konstruktiv benutzt statt
+#                      nur begrenzend - eine unsichere Zahl, eingefangen von
+#                      einer sicheren Obergrenze.
+#                      Er darf dabei hart auf Rate x Laufzeit sitzen: aus einem
+#                      verregneten Lauf wird seit v1.0.83 ohnehin nichts
+#                      gelernt, ein enger Deckel kann die Rate also nicht am
+#                      Steigen hindern. Im trockenen Fall bleibt alles wie es
+#                      war, samt der Luft, die die Rate zum Wachsen braucht.
+#
 # 1.0.85 - 2026-09-01  Der Kalibrierlauf meldete den falschen Wert und schwieg
 #                      zu einem Filter, der schon zu war.
 #                      1. calibrationPumpFlow_lpm/-GravityFlow_lpm lasen das
@@ -928,7 +950,7 @@ use POSIX;
 # greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
 # gerade selbst geladen) oder die Liste ihr Format aendert.
 {
-    my $FALLBACK = '1.0.85';
+    my $FALLBACK = '1.0.86';
     my $cached;
     sub Gartenbewaesserung_Version {
         return $cached if(defined($cached));
@@ -5900,6 +5922,10 @@ sub Gartenbewaesserung_RecordIbcFillRun {
     my $volume = AttrVal($name, "barrelUsableVolume", 0);
     my $float  = AttrVal($name, "barrelFloatLevel", 0);
     my $rate   = Gartenbewaesserung_FlowRate($hash, "ibcFillFlow_lpm");
+    # Mehr als ein Zwanzigstel des Fassmasses an Regen macht den Lauf zu einer
+    # Mischung aus bekannter Menge und Zulauf: gebucht wird er weiterhin (das
+    # Wasser ist im IBC angekommen), gelernt wird daraus nicht.
+    my $verregnet = (defined($regen) && $volume > 0 && $regen > 0.05 * $volume) ? 1 : 0;
     $rate = 0 if($rate !~ /^\d+(?:\.\d+)?$/);
 
     # A run from a full barrel down to empty moved a known volume - but only
@@ -5961,6 +5987,37 @@ sub Gartenbewaesserung_RecordIbcFillRun {
                 $name, $minutes, $moved, $rate, $schranke);
             $moved = $schranke;
             $gekappt = 1;
+        }
+
+        # Regen, der WAEHREND des Laufs ins Fass fiel, wurde mitgepumpt - er
+        # gehoert also in die Buchung. Bis v1.0.86 fehlte er: am 31.08. buchte
+        # eine siebenminuetige Ernte 179 l, waehrend die Pumpe in derselben Zeit
+        # rund 217 l bewegt hat. Die Differenz fehlt dem IBC, und weil sie sich
+        # ueber Tage aufsummiert, faellt sie erst beim Ablesen auf.
+        #
+        # Die Regenzahl selbst ist bei Starkregen unzuverlaessig - am 31.08.
+        # rechneten 137 l Dachertrag gegen rund 59, die wirklich ankamen (die
+        # Rinne nimmt keine 20 l/min). Deshalb wird sie NICHT einfach addiert,
+        # sondern an der Pumpenkapazitaet gedeckelt: mehr als Rate x Laufzeit
+        # kann die Pumpe nicht bewegt haben. Das ist der Deckel aus v1.0.80,
+        # hier konstruktiv benutzt statt nur begrenzend - die unsichere Zahl
+        # wird von einer sicheren Obergrenze eingefangen.
+        #
+        # Der Deckel darf hier hart auf Rate x Laufzeit sitzen (ohne die
+        # $topUp-Luft von oben): aus einem verregneten Lauf wird ohnehin nichts
+        # gelernt, ein zu enger Deckel kann die Rate also nicht am Steigen
+        # hindern. Im trockenen Fall braucht sie diese Luft, dort bleibt alles
+        # wie es war.
+        if($verregnet && $regen > 0) {
+            my $mitRegen = $moved + $regen;
+            my $obergrenze = $rate * $minutes;
+            $mitRegen = $obergrenze if($mitRegen > $obergrenze);
+            if($mitRegen > $moved) {
+                Log3 $name, 3, sprintf("%s: %.0f l of rain fell into the barrel during the "
+                    . "run - booking %.0f l instead of %.0f (pump can move %.0f l in %.1f min)",
+                    $name, $regen, $mitRegen, $moved, $obergrenze, $minutes);
+                $moved = $mitRegen;
+            }
         }
     }
     elsif($rate > 0) {
@@ -6048,7 +6105,6 @@ sub Gartenbewaesserung_RecordIbcFillRun {
     # Ein gekappter Lauf ist keine Messung mehr: die angesetzte Menge hat sich
     # gerade als unmoeglich erwiesen, also darf die Rate erst recht nicht daraus
     # lernen - sonst lernt sie genau den Fehler, der sie gekappt hat.
-    my $verregnet = (defined($regen) && $volume > 0 && $regen > 0.05 * $volume) ? 1 : 0;
     my $known = 0;
     $known = $volume + $topUp if($complete && !$gekappt);
     $known = $float  + $topUp if($floatRun && !$gekappt);

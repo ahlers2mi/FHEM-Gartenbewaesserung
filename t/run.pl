@@ -963,6 +963,46 @@ scenario("RR Ein sauberer Filter wird nicht angemahnt (v1.0.85)");
             "kein Fehlalarm (ist: " . rd("calibrationFilter") . ")");
 }
 
+scenario("SS Regen waehrend der Ernte wird mitgebucht (v1.0.86)");
+{
+    # Der Lauf vom 31.08. 14:14-14:21: volles Fass, 7 Minuten Pumpe, und es
+    # regnete durch. Gebucht wurden 148 (Fassmass), obwohl die Pumpe in der Zeit
+    # rund 217 l bewegt hat - das Regenwasser lief waehrend des Pumpens nach.
+    # Die Differenz fehlte dem IBC und summierte sich ueber Tage auf.
+    my $h = build(attr => { rainAmountDevice => "sens:regen_mm",
+                            roofArea => 45, runoffCoefficient => 0.8 });
+    main::readingsSingleUpdate($h, ".rainAccum", 10.0, 0);
+    Gartenbewaesserung_SetIbcLevel($h, 100, "test", 1);
+    sens("barrelFull", "yes");
+    Gartenbewaesserung_StartIBCFill($h, 1);
+    main::advance(420);                               # 7 min
+    main::readingsSingleUpdate($h, ".rainAccum", 13.8, 0);   # 3,8 mm = 137 l
+    sens("barrelEmpty", "yes");
+
+    # 34,2 l/min x 7 min = 239 l Pumpenkapazitaet; 148 + 137 = 285 waeren zu
+    # viel, gedeckelt wird auf die Kapazitaet.
+    my $g = rd("lastIbcFillVolume_l");
+    ok_true($g > 148, "mehr als das blosse Fassmass gebucht (ist: $g)");
+    ok_true($g <= 240, "aber nie mehr als die Pumpe schafft (ist: $g)");
+    is(rd("ibcFillFlow_lpm"), "34.2", "gelernt wird aus dem Lauf weiterhin nichts");
+}
+
+scenario("TT Ohne Regen bleibt die Buchung auf dem Fassmass (v1.0.86)");
+{
+    # Gegenprobe zu SS: ohne Regen darf sich an der Buchung nichts aendern,
+    # sonst schreibt der Fix dem IBC Wasser gut, das es nicht gab.
+    my $h = build(attr => { rainAmountDevice => "sens:regen_mm",
+                            roofArea => 45, runoffCoefficient => 0.8 });
+    main::readingsSingleUpdate($h, ".rainAccum", 10.0, 0);
+    Gartenbewaesserung_SetIbcLevel($h, 100, "test", 1);
+    sens("barrelFull", "yes");
+    Gartenbewaesserung_StartIBCFill($h, 1);
+    main::advance(300);
+    sens("barrelEmpty", "yes");                       # kein Regen dazwischen
+
+    is(rd("lastIbcFillVolume_l"), 148, "genau das Fassmass, kein Zuschlag");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);
