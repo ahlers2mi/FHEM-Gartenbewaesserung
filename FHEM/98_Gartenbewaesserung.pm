@@ -58,6 +58,16 @@
 #                      (Pumpenrate nur noch per calibrate) und warnt, wenn der
 #                      Hahn schneller als die Pumpe ist (Fass wird beim Pumpen
 #                      nie leer).
+#                      5. Die Fass-leer-Nachfuellpause oeffnete das IBC-Ventil,
+#                         ohne zu fragen, ob das Fass voll ist - und
+#                         CheckBarrelFull kannte diese Pause nicht, der Waechter
+#                         meldete "stopping" und schloss nichts. Am 03.09. um
+#                         21:21 kamen barrelFull und barrelEmpty=no in derselben
+#                         Sekunde: POWER5 stand 14 Minuten offen in ein volles
+#                         Fass, rund 190 l gingen ueber den Ueberlauf ins
+#                         Fallrohr. Jetzt: bei vollem Fass keine Pause, sondern
+#                         sofort weiter; und barrelFull waehrend der Pause macht
+#                         zu (StopBarrelEmptyRefillPause) und setzt fort.
 #
 # 1.0.87 - 2026-09-01  Der Alarm "Fass wurde nicht voll" haengt jetzt am Ende
 #                      des Transfers statt an einer eigenen Uhr.
@@ -4044,6 +4054,25 @@ sub Gartenbewaesserung_CheckBarrelFull {
         }
     }
 
+    # Fass-leer-Nachfuellpause. Bis v1.0.88 fehlte dieser Zweig: die Flanke
+    # barrelFull wurde in Notify behandelt, der ZUSTAND aber nirgends. War das
+    # Fass beim Oeffnen schon voll, fand IbcToBarrelWatchdog hierher, meldete
+    # "stopping" - und nichts ging zu, weil keiner der Zweige unten diese Pause
+    # kennt. Am 03.09. stand POWER5 so von 21:21 bis 21:35 offen in ein volles
+    # Fass. StopBarrelEmptyRefillPause schliesst je nach Quelle die richtigen
+    # Armaturen.
+    if($hash->{HELPER}{barrelEmptyRefillPause}) {
+        my $src = $hash->{HELPER}{barrelEmptyRefillPauseSource} || "";
+        Log3 $name, 3, "$name: Barrel full during barrel-empty refill pause ($src) - closing and resuming";
+        if($src eq "ibc") {
+            Gartenbewaesserung_NoteNonRainFill($hash, "IBC-to-barrel (refill pause)");
+            Gartenbewaesserung_NoteIbcToBarrelStop($hash, "barrelFull");
+        }
+        Gartenbewaesserung_StopBarrelEmptyRefillPause($hash);
+        Gartenbewaesserung_ResumeAfterBarrelEmpty($hash) if($hash->{HELPER}{barrelEmptyResumePending});
+        return;
+    }
+
     # If pause is active (during watering cycle OR circuit mode)
     if($hash->{HELPER}{pauseActive}) {
         Log3 $name, 3, "$name: Barrel full during pause, closing valves and ending pause early";
@@ -4403,6 +4432,19 @@ sub Gartenbewaesserung_StartBarrelEmptyRefillPause {
     my $name = $hash->{NAME};
 
     return if($hash->{HELPER}{barrelEmptyRefillPause});
+
+    # Ist das Fass schon voll, gibt es nichts nachzufuellen. Die Giess- und
+    # Kreis-Pause fragen das seit v1.0.62 (BarrelNeedsRefill) - hier fehlte die
+    # Frage. Am 03.09. 21:21:21 kam barrelFull, in derselben Sekunde ging
+    # barrelEmpty auf "no", und diese Pause oeffnete das IBC-Ventil in ein volles
+    # Fass. CheckBarrelFull kannte die Fass-leer-Pause nicht (siehe dort), also
+    # blieb es 14 Minuten offen: rund 190 l ueber den Ueberlauf ins Fallrohr.
+    if(ReadingsVal($name, "barrelFull", "no") eq "yes") {
+        Log3 $name, 3, "$name: Barrel is already full - no refill pause needed, resuming right away";
+        $hash->{HELPER}{lastPauseEnd} = time();
+        Gartenbewaesserung_ResumeAfterBarrelEmpty($hash) if($hash->{HELPER}{barrelEmptyResumePending});
+        return;
+    }
 
     my $pauseDuration = AttrVal($name, "wateringPauseDuration", 20);
 

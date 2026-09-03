@@ -841,9 +841,12 @@ scenario("MM Unterbrochener Lauf verfaellt statt Stunden spaeter anzulaufen (v1.
 
     main::advance(7 * 3600);                          # sieben Stunden spaeter
     sens("barrelEmpty", "no");                        # jetzt kaeme Wasser
+    # Seit v1.0.88 laesst die Fass-leer-Pause bei vollem Fass (der Kontakt
+    # steht hier noch) gar nicht erst warten, sondern ruft Resume selbst - der
+    # Verfall steht dann schon im Reading, ein zweiter Aufruf liefert "none".
     my $st = Gartenbewaesserung_ResumeAfterBarrelEmpty($h);
-
-    is($st, "expired", "Lauf ist verfallen");
+    ok_true($st eq "expired" || rd("lastCycleAborted") =~ /expired/,
+            "Lauf ist verfallen (Resume: $st)");
     main::advance(10);                                # Resume oeffnet erst nach 2 s
     is(relay("POWER1"), "OFF", "und Kreis 1 laeuft NICHT wieder an");
     ok_true(rd("lastCycleAborted") ne "(fehlt)", "als verfallen protokolliert");
@@ -1210,6 +1213,61 @@ scenario("BBB Aendern von mainsFillFlow_lpm friert den Zaehlerstand ein (v1.0.88
     Gartenbewaesserung_Set($h, "bw", "resetHarvestStats");
     main::advance(120);
     is(rd("mainsDirect_total_l"), 0, "Reset nimmt die eingefrorenen Liter mit");
+}
+
+scenario("EEE Fass-leer-Pause oeffnet das IBC-Ventil nicht in ein volles Fass (v1.0.88)");
+{
+    # 03.09. 21:21:21: barrelFull und barrelEmpty=no in derselben Sekunde. Die
+    # Pause fragte nicht nach dem Kontakt und oeffnete POWER5 - 14 Minuten in
+    # ein volles Fass, rund 190 l ins Fallrohr.
+    my $h = build(mains => "on", attr => { %PEKI, wateringPauseInterval => 0 });
+    Gartenbewaesserung_SetIbcLevel($h, 500, "test", 1);
+    Gartenbewaesserung_SetBarrelLevel($h, 161, "test", 1);
+    sens("barrelFull", "yes");
+    Gartenbewaesserung_StartWatering($h);
+    main::advance(60);
+    sens("barrelEmpty", "yes");                       # Schwimmerschalter luegt
+    main::advance(5);
+    is(relay("POWER5"), "OFF", "vor der Freigabe: Ventil zu");
+    sens("barrelEmpty", "no");                        # Fass ist aber VOLL
+    main::advance(5);
+    is(relay("POWER5"), "OFF", "kein IBC-Transfer in ein volles Fass");
+    ok_true(!$h->{HELPER}{barrelEmptyRefillPause}, "keine Nachfuellpause");
+    is(relay("POWER1"), "ON", "Kreis 1 laeuft sofort weiter");
+}
+
+scenario("FFF barrelFull als ZUSTAND schliesst das Ventil auch in der Fass-leer-Pause (v1.0.88)");
+{
+    # Der Weg vom 03.09. 21:21: Nachfuellen aus dem IBC laeuft, barrelFull
+    # kommt, barrelEmpty steht noch -> "Resume blocked". Dann barrelEmpty=no ->
+    # Fass-leer-PAUSE (nicht das Nachfuellen) oeffnet POWER5. Kommt barrelFull
+    # jetzt nur als ZUSTAND (keine Flanke - das Reading stand ja schon), fand
+    # der Waechter zu CheckBarrelFull, und dort kannte kein Zweig diese Pause.
+    my $h = build(mains => "off", attr => { %PEKI, wateringPauseInterval => 0 });
+    Gartenbewaesserung_SetIbcLevel($h, 500, "test", 1);
+    Gartenbewaesserung_SetBarrelLevel($h, 161, "test", 1);
+    sens("barrelFull", "yes");
+    Gartenbewaesserung_StartWatering($h);
+    main::advance(60);
+    sens("barrelFull", "no");
+    sens("barrelEmpty", "yes");                       # Nachfuellen aus dem IBC
+    main::advance(5);
+    is(relay("POWER5"), "ON", "automatisches Nachfuellen laeuft");
+    sens("barrelFull", "yes");                        # Flanke: Nachfuellen stoppt
+    main::advance(2);
+    is(relay("POWER5"), "OFF", "Flanke hat zugemacht");
+    ok_true(!!$h->{HELPER}{barrelEmptyResumePending}, "Resume steht noch aus (barrelEmpty aktiv)");
+    sens("barrelFull", "no");                         # Kontakt flackert kurz weg ...
+    sens("barrelEmpty", "no");                        # ... Pause startet aus dem IBC
+    main::advance(5);
+    ok_true(!!$h->{HELPER}{barrelEmptyRefillPause}, "Fass-leer-Pause laeuft");
+    is(relay("POWER5"), "ON", "Ventil offen");
+    setr("sens", "barrelFull", "yes");                # nur ZUSTAND, keine Flanke
+    main::readingsSingleUpdate($h, "barrelFull", "yes", 0);
+    main::advance(45);                                # Waechter tickt alle 30 s
+    is(relay("POWER5"), "OFF", "Waechter hat das Ventil zugemacht");
+    ok_true(!$h->{HELPER}{barrelEmptyRefillPause}, "Pause beendet");
+    is(relay("POWER1"), "ON", "Kreis 1 laeuft weiter");
 }
 
 scenario("CCC validate ordnet einen schnellen Hahn ein (v1.0.88)");
