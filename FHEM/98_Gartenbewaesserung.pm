@@ -13,6 +13,52 @@
 #
 ##############################################################################
 #
+# 1.0.88 - 2026-09-03  Ein schneller Hahn. Am 03.09. ersetzte ein Peki-
+#                      Schwimmerventil das Toilettenventil: 22,5 statt 4,4 l/min,
+#                      also zwei Drittel der Pumpenrate statt einem Achtel. Vier
+#                      Stellen im Modul hatten den Hahn als vernachlaessigbar
+#                      eingebaut, und alle vier fielen am ersten Abend auf:
+#                      1. RecordIbcFillRun rechnete den Zulauf ueber die GANZE
+#                         Laufzeit und lernte daraus die Pumpenrate. Aus einem
+#                         7,6-min-Lauf aus vollem Fass (161 l) wurden so 332 l
+#                         "bekannte Menge" und 29,3 l/min gelernt, waehrend die
+#                         Pumpe rund 290 l bewegt hat. Jetzt zaehlt der Zulauf nur
+#                         fuer die Minuten UNTER Schwimmerhoehe (darueber ist das
+#                         Ventil zu), und ab einem Zulauf von 20 % der Nennrate
+#                         wird aus einem Lauf mit offenem Hahn gar nicht mehr
+#                         gelernt - die Pumpenrate kommt dann nur noch aus
+#                         "set calibrate" (Hahn zu, Vorbedingung dort).
+#                      2. Eine Pause, die das Fass aus der Leitung fuellt, wartete
+#                         die volle wateringPauseDuration ab (20 min), obwohl das
+#                         Fass nach vier Minuten auf Schwimmerhoehe stand: sie
+#                         endete nur an barrelFull oder am Timer, und ueber den
+#                         Schwimmer kommt barrelFull nie. Jetzt beendet
+#                         MainsPauseTick eine Pause mit Quelle Stadtwasser, sobald
+#                         die Schaetzung die Schwimmerhoehe erreicht - alle drei
+#                         Pausenarten (Giess-, Kreis-, Fass-leer-Pause). Dafuer
+#                         laeuft MainsFillTick in so einer Pause jetzt mit.
+#                      3. mainsDirect_total_l war beim Giessen blind: der Zaehler
+#                         tickt nur unter Schwimmerhoehe, die Schaetzung bewegt
+#                         sich waehrend eines Kreises aber nicht (NoteValveDraw
+#                         bucht erst beim Schliessen). Mit 22,5 l/min traegt der
+#                         Hahn Kreis 1/3/8 komplett - hunderte Liter je Nacht am
+#                         Gartenzaehler, null im Modul. Jetzt rechnet
+#                         MainsDuringDraw mit: Ventil zieht R, ab Schwimmerhoehe
+#                         liefert der Hahn min(R, M). Der Zaehler zaehlt das je
+#                         Minute mit, NoteValveDraw zieht es beim Schliessen von
+#                         der Entnahme ab (das Fass endet dann auf Schwimmerhoehe
+#                         statt bei 5 l), und der Lauf gilt als drawTainted.
+#                      4. Der Zaehler fuehrte Sekunden und rechnete die ganze
+#                         Historie mit der AKTUELLEN Rate - beim Ventiltausch
+#                         sprang er von 5400 auf 27722 l. Beim Aendern von
+#                         mainsFillFlow_lpm werden die bisherigen Sekunden jetzt
+#                         zum alten Wert in Liter eingefroren
+#                         (.mainsDirectFrozen_l); der Stand bleibt stehen.
+#                      validate meldet einen Hahn ueber 20 % der Pumpen-Nennrate
+#                      (Pumpenrate nur noch per calibrate) und warnt, wenn der
+#                      Hahn schneller als die Pumpe ist (Fass wird beim Pumpen
+#                      nie leer).
+#
 # 1.0.87 - 2026-09-01  Der Alarm "Fass wurde nicht voll" haengt jetzt am Ende
 #                      des Transfers statt an einer eigenen Uhr.
 #                      barrelFillTimeout war ein zweiter Timer neben dem Deckel
@@ -979,7 +1025,7 @@ use POSIX;
 # greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
 # gerade selbst geladen) oder die Liste ihr Format aendert.
 {
-    my $FALLBACK = '1.0.87';
+    my $FALLBACK = '1.0.88';
     my $cached;
     sub Gartenbewaesserung_Version {
         return $cached if(defined($cached));
@@ -1259,6 +1305,7 @@ sub Gartenbewaesserung_Set {
         readingsBulkUpdate($hash, "pumpedOther_total_l", "0");
         readingsBulkUpdate($hash, "mainsDirect_total_l", "0");
         readingsBulkUpdate($hash, ".mainsDirectSeconds", "0");
+        readingsBulkUpdate($hash, ".mainsDirectFrozen_l", "0");
         readingsBulkUpdate($hash, "mainsDirectSince", TimeNow());
         readingsEndUpdate($hash, 1);
         Log3 $name, 3, "$name: harvest statistics reset";
@@ -1368,6 +1415,35 @@ sub Gartenbewaesserung_Attr {
     if($cmd eq "set" && $attrName eq "runoffCoefficient") {
         return "runoffCoefficient must be a number between 0 and 1 (e.g. 0.8)"
             if($attrVal !~ /^\d*(?:\.\d+)?$/ || $attrVal <= 0 || $attrVal > 1);
+    }
+
+    # Der Leitungswasser-Zaehler fuehrt Sekunden und rechnet sie mit der Rate in
+    # Liter um. Eine neue Rate gilt deshalb rueckwirkend - beabsichtigt, solange
+    # nur die Messung genauer wird. Beim Tausch des Schwimmerventils am 03.09.
+    # (4,4 -> 22,5 l/min) sprang der Zaehler so von rund 5400 auf 27722 l: die
+    # Historie war zur alten Rate richtig und wurde verfuenffacht. Darum werden
+    # die bisherigen Sekunden hier zum ALTEN Wert in Liter eingefroren; ab jetzt
+    # zaehlt die neue Rate. AttrFn laeuft in fhem.pl VOR dem Setzen des
+    # Attributs, AttrVal liefert also noch den alten Wert.
+    if($attrName eq "mainsFillFlow_lpm") {
+        return "mainsFillFlow_lpm must be a number (litres per minute, 0 = off)"
+            if($cmd eq "set" && $attrVal !~ /^\d+(?:\.\d+)?$/);
+        my $old = AttrVal($name, "mainsFillFlow_lpm", 0);
+        $old = 0 if($old !~ /^\d+(?:\.\d+)?$/);
+        my $sek = ReadingsVal($name, ".mainsDirectSeconds", 0);
+        $sek = 0 if($sek !~ /^\d+(?:\.\d+)?$/);
+        if($old > 0 && $sek > 0) {
+            my $frozen = ReadingsVal($name, ".mainsDirectFrozen_l", 0);
+            $frozen = 0 if($frozen !~ /^-?\d+(?:\.\d+)?$/);
+            $frozen += $old * $sek / 60;
+            readingsBeginUpdate($hash);
+            readingsBulkUpdate($hash, ".mainsDirectFrozen_l", sprintf("%.1f", $frozen));
+            readingsBulkUpdate($hash, ".mainsDirectSeconds", "0");
+            readingsEndUpdate($hash, 0);
+            Log3 $name, 3, sprintf("%s: mainsFillFlow_lpm changes %.1f -> %s: %.0f l counted so far "
+                . "are frozen at the old rate, mainsDirect_total_l keeps its value",
+                $name, $old, ($cmd eq "set" ? $attrVal : "off"), $frozen);
+        }
     }
 
     # Update sensor readings when sensor attributes change
@@ -2079,6 +2155,25 @@ sub Gartenbewaesserung_ValidateConfig {
         push @warnings, "wateringPauseDuration ($pauseDuration min) is below ibcToBarrelDuration "
             . "($ibcDur min): an IBC refill during a pause is cut off at pauseEnd before it "
             . "could fill the barrel.";
+    }
+
+    # Ein schneller Hahn aendert, was das Modul lernen kann und was die Pumpe
+    # ueberhaupt leer bekommt (v1.0.88).
+    my $mRate = AttrVal($name, "mainsFillFlow_lpm", 0);
+    my $pNenn = AttrVal($name, "ibcFillFlow_lpm", 0);
+    $mRate = 0 if($mRate !~ /^\d+(?:\.\d+)?$/);
+    $pNenn = 0 if($pNenn !~ /^\d+(?:\.\d+)?$/);
+    if($mRate > 0 && $pNenn > 0) {
+        if($mRate >= $pNenn) {
+            push @warnings, sprintf("mainsFillFlow_lpm (%g) is not below ibcFillFlow_lpm (%g): with "
+                . "the tap open the pump can never empty the barrel, every barrel->IBC run ends "
+                . "at the watchdog.", $mRate, $pNenn);
+        }
+        elsif($mRate >= 0.2 * $pNenn) {
+            push @info, sprintf("mains tap %g l/min is %.0f%% of the pump rate: runs with the tap "
+                . "open book the inflow but do not learn the pump rate - use 'set %s calibrate' "
+                . "(tap closed) for that", $mRate, 100 * $mRate / $pNenn, $name);
+        }
     }
 
     # Check pump
@@ -2923,6 +3018,8 @@ sub Gartenbewaesserung_RunCircuit {
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "phase", "watering circuit $circuitLabel");
     $hash->{HELPER}{valveOpenTime} = int(time());
+    $hash->{HELPER}{valveOpenLevel} = Gartenbewaesserung_BarrelLevelExact($hash);
+    delete $hash->{HELPER}{drawMainsCounted};
     readingsBulkUpdate($hash, "currentValve", $circuitNum);
     readingsBulkUpdate($hash, "currentValveName", Gartenbewaesserung_ValveName($hash, $circuitNum));
     readingsEndUpdate($hash, 1);
@@ -3022,8 +3119,9 @@ sub Gartenbewaesserung_StartCircuitPause {
         if($fillValve ne "") {
             Gartenbewaesserung_SwitchDevice($name, $fillValve, "on");
             Gartenbewaesserung_NoteNonRainFill($hash, "mains supply");
-            $hash->{HELPER}{pauseSource} = "water_supply";
         }
+        # Quelle unabhaengig vom Fuellventil festhalten (siehe StartWateringPause).
+        $hash->{HELPER}{pauseSource} = "water_supply";
     }
     else {
         # Fill from IBC
@@ -3458,9 +3556,12 @@ sub Gartenbewaesserung_StartWateringPause {
         if($fillValve ne "") {
             Gartenbewaesserung_SwitchDevice($name, $fillValve, "on");
             Gartenbewaesserung_NoteNonRainFill($hash, "mains supply");
-            $hash->{HELPER}{pauseSource} = "water_supply";
             Log3 $name, 4, "$name: Opened water supply valve (barrelFillValveDevice)";
         }
+        # Auch ohne eigenes Fuellventil fuellt die Leitung - ueber das
+        # Schwimmerventil. Die Quelle steht deshalb unabhaengig davon fest;
+        # MainsPauseTick braucht sie, um die Pause auf Schwimmerhoehe zu beenden.
+        $hash->{HELPER}{pauseSource} = "water_supply";
     }
     else {
         # IBC has water, fill from IBC
@@ -3756,6 +3857,8 @@ sub Gartenbewaesserung_OpenValve {
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "phase", "watering");
     $hash->{HELPER}{valveOpenTime} = int(time());
+    $hash->{HELPER}{valveOpenLevel} = Gartenbewaesserung_BarrelLevelExact($hash);
+    delete $hash->{HELPER}{drawMainsCounted};
     readingsBulkUpdate($hash, "currentValve", $valveNum);
     readingsBulkUpdate($hash, "currentValveName", Gartenbewaesserung_ValveName($hash, $valveNum));
     readingsBulkUpdate($hash, "cycleProgress", "$index/$total");
@@ -4942,6 +5045,8 @@ sub Gartenbewaesserung_StartSingleValve {
     readingsBulkUpdate($hash, "state", "manual");
     readingsBulkUpdate($hash, "phase", "manual watering");
     $hash->{HELPER}{valveOpenTime} = int(time());
+    $hash->{HELPER}{valveOpenLevel} = Gartenbewaesserung_BarrelLevelExact($hash);
+    delete $hash->{HELPER}{drawMainsCounted};
     readingsBulkUpdate($hash, "currentValve", $valveNum);
     readingsBulkUpdate($hash, "currentValveName", Gartenbewaesserung_ValveName($hash, $valveNum));
     readingsEndUpdate($hash, 1);
@@ -5349,9 +5454,17 @@ sub Gartenbewaesserung_MainsFillTick {
 
     # Laeuft gerade ein anderer Transport, hat der seine eigene Buchhaltung -
     # sonst zaehlte dasselbe Wasser zweimal.
-    if($hash->{HELPER}{watering}   || $hash->{HELPER}{circuitMode}
-    || $hash->{HELPER}{ibcFilling} || $hash->{HELPER}{ibcToBarrelActive}
-    || $hash->{HELPER}{barrelFilling} || $hash->{HELPER}{pauseActive}) {
+    # Ausnahme seit v1.0.88: eine Pause, die das Fass aus der LEITUNG fuellt.
+    # Dort fuehrt niemand sonst Buch, und MainsPauseTick braucht den steigenden
+    # Stand, um die Pause auf Schwimmerhoehe zu beenden.
+    # In der Giess- und Kreis-Pause bleiben watering bzw. circuitMode gesetzt,
+    # deshalb wird die Ausnahme vor diesen Flags geprueft.
+    my $mainsPause = ($hash->{HELPER}{pauseActive}
+                      && ($hash->{HELPER}{pauseSource} || "") eq "water_supply") ? 1 : 0;
+    if($hash->{HELPER}{ibcFilling} || $hash->{HELPER}{ibcToBarrelActive}
+    || $hash->{HELPER}{barrelFilling}
+    || (!$mainsPause && ($hash->{HELPER}{watering} || $hash->{HELPER}{circuitMode}
+                         || $hash->{HELPER}{pauseActive}))) {
         delete $hash->{HELPER}{mainsFillAnchor};
         return;
     }
@@ -5418,17 +5531,50 @@ sub Gartenbewaesserung_MainsMeterTick {
     my $float = AttrVal($name, "barrelFloatLevel", 0);
     my $level = Gartenbewaesserung_BarrelLevelExact($hash);
 
-    # Kein Zulauf, wenn der Hahn zu ist oder das Fass auf Hoehe steht - dann hat
-    # das Schwimmerventil geschlossen. Anker verwerfen, damit die Pause nicht
-    # beim naechsten Oeffnen mitgezaehlt wird.
-    if($rate !~ /^\d+(?:\.\d+)?$/ || $rate <= 0 || $float <= 0
-       || !defined($level) || $level >= $float
+    if($rate !~ /^\d+(?:\.\d+)?$/ || $rate <= 0 || $float <= 0 || !defined($level)
        || Gartenbewaesserung_MainsSupplyState($hash) ne "on") {
         delete $hash->{HELPER}{mainsMeterAnchor};
         return;
     }
 
     my $now = int(time());
+
+    # Waehrend ein Kreis laeuft, steht die Schaetzung still - NoteValveDraw bucht
+    # erst beim Schliessen. Der Hahn aber nicht: sobald der Kreis das Fass unter
+    # die Schwimmerhoehe gezogen hat, liefert er nach, und zwar bis zu seiner
+    # vollen Rate oder bis zur Entnahme des Kreises, je nachdem, was kleiner
+    # ist. Bis v1.0.87 fiel das in den blinden Fleck "Stand ueber Schwimmerhoehe
+    # = Ventil zu" (der Stand war der vom Ventilstart). Bei 4,4 l/min war das
+    # ein Rundungsfehler, bei 22,5 traegt der Hahn ganze Kreise.
+    # Gezaehlt wird in AEQUIVALENT-Sekunden bei voller Rate, damit der Zaehler
+    # eine Einheit behaelt: drosselt das Ventil (Entnahme < Zulauf), zaehlt eine
+    # Minute nur R/M Minuten.
+    my $opened = $hash->{HELPER}{valveOpenTime};
+    my $valve  = ReadingsVal($name, "currentValve", "none");
+    if($opened && $valve =~ /^\d+$/ && defined($hash->{HELPER}{valveOpenLevel})) {
+        my $draw = Gartenbewaesserung_ValveFlow($hash, $valve);
+        if($draw > 0) {
+            my $soFar = Gartenbewaesserung_MainsDuringDraw($hash,
+                $hash->{HELPER}{valveOpenLevel}, $draw, ($now - $opened) / 60);
+            my $done = $hash->{HELPER}{drawMainsCounted} || 0;
+            my $add = $soFar - $done;
+            $hash->{HELPER}{drawMainsCounted} = $soFar;
+            delete $hash->{HELPER}{mainsMeterAnchor};
+            # Auch mit Zulauf ist der Lauf keine Messung der Giessrate mehr.
+            $hash->{HELPER}{drawTainted} = 1 if($soFar > 0);
+            Gartenbewaesserung_MainsMeterAdd($hash, $add * 60 / $rate) if($add > 0);
+            return;
+        }
+    }
+
+    # Kein Zulauf, wenn das Fass auf Hoehe steht - dann hat das Schwimmerventil
+    # geschlossen. Anker verwerfen, damit die Pause nicht beim naechsten Oeffnen
+    # mitgezaehlt wird.
+    if($level >= $float) {
+        delete $hash->{HELPER}{mainsMeterAnchor};
+        return;
+    }
+
     my $anchor = $hash->{HELPER}{mainsMeterAnchor};
     if(!defined($anchor) || $anchor > $now) {
         # Erster Takt: nur den Anker setzen. Wann der Hahn wirklich aufging,
@@ -5438,15 +5584,105 @@ sub Gartenbewaesserung_MainsMeterTick {
     }
     return if($now == $anchor);
 
-    my $sek = ReadingsVal($name, ".mainsDirectSeconds", 0);
-    $sek = 0 if($sek !~ /^\d+$/);
-    $sek += $now - $anchor;
     $hash->{HELPER}{mainsMeterAnchor} = $now;
+    Gartenbewaesserung_MainsMeterAdd($hash, $now - $anchor);
+}
+
+# Sekunden (bei voller Rate) auf den Leitungswasser-Zaehler buchen.
+# Gesamt = eingefrorene Liter zu frueheren Raten + aktuelle Rate x Sekunden.
+sub Gartenbewaesserung_MainsMeterAdd {
+    my ($hash, $seconds) = @_;
+    my $name = $hash->{NAME};
+    return if(!defined($seconds) || $seconds <= 0);
+
+    my $rate = AttrVal($name, "mainsFillFlow_lpm", 0);
+    return if($rate !~ /^\d+(?:\.\d+)?$/ || $rate <= 0);
+
+    my $sek = ReadingsVal($name, ".mainsDirectSeconds", 0);
+    $sek = 0 if($sek !~ /^\d+(?:\.\d+)?$/);
+    $sek += $seconds;
+    my $frozen = ReadingsVal($name, ".mainsDirectFrozen_l", 0);
+    $frozen = 0 if($frozen !~ /^-?\d+(?:\.\d+)?$/);
 
     readingsBeginUpdate($hash);
-    readingsBulkUpdate($hash, ".mainsDirectSeconds", $sek);
-    readingsBulkUpdate($hash, "mainsDirect_total_l", sprintf("%.0f", $rate * $sek / 60));
+    readingsBulkUpdate($hash, ".mainsDirectSeconds", sprintf("%.1f", $sek));
+    readingsBulkUpdate($hash, "mainsDirect_total_l", sprintf("%.0f", $frozen + $rate * $sek / 60));
     readingsEndUpdate($hash, 1);
+}
+
+# Wieviel Leitungswasser laeuft nach, waehrend ein Kreis das Fass leert?
+#
+# Das Ventil zieht $draw l/min aus einem Fass, das beim Oeffnen $start l hatte.
+# Bis zur Schwimmerhoehe ist das Ventil zu. Darunter liefert der Hahn: seine
+# volle Rate, wenn der Kreis mehr zieht (das Fass sinkt weiter, netto um die
+# Differenz), sonst genau die Entnahme (das Ventil drosselt, das Fass steht auf
+# Hoehe). Mit dem Peki-Ventil (22,5 l/min) traegt der Hahn damit Kreis 1, 3 und
+# 8 (15,6 / 8,2 / 6,0) komplett; nur Kreis 2 (27,6) zieht das Fass noch leer -
+# mit 5 l/min statt 27.
+sub Gartenbewaesserung_MainsDuringDraw {
+    my ($hash, $start, $draw, $minutes) = @_;
+    my $name = $hash->{NAME};
+
+    return 0 if(!defined($minutes) || $minutes <= 0 || !defined($draw) || $draw <= 0);
+    return 0 if(Gartenbewaesserung_MainsSupplyState($hash) ne "on");
+    my $mains = AttrVal($name, "mainsFillFlow_lpm", 0);
+    my $float = AttrVal($name, "barrelFloatLevel", 0);
+    return 0 if($mains !~ /^\d+(?:\.\d+)?$/ || $mains <= 0 || $float <= 0);
+
+    $start = $float if(!defined($start) || $start !~ /^-?\d+(?:\.\d+)?$/);
+    my $bisSchwimmer = ($start > $float) ? ($start - $float) / $draw : 0;
+    my $offen = $minutes - $bisSchwimmer;
+    return 0 if($offen <= 0);
+
+    my $liefert = ($mains < $draw) ? $mains : $draw;
+    return $liefert * $offen;
+}
+
+# Pause mit Leitungswasser als Quelle beenden, sobald das Fass auf
+# Schwimmerhoehe steht.
+#
+# Die drei Pausen (Giess-, Kreis-, Fass-leer-Pause) enden an barrelFull oder am
+# Timer. Fuellt der IBC, kommt barrelFull nach 11 bis 14 Minuten. Fuellt die
+# Leitung, kommt es NIE - der Schwimmer schliesst bei barrelFloatLevel, weit
+# unter dem Kontakt - und die Pause wartete stur die volle Dauer ab. Mit dem
+# alten Ventil (4,4 l/min, 18 min bis zur Hoehe) fiel das kaum auf; mit 22,5
+# steht das Fass nach vier Minuten und wartete weitere sechzehn. MainsFillTick
+# rechnet den Stand in so einer Pause seit v1.0.88 mit; hier wird er gegen die
+# Schwimmerhoehe gehalten (dieselbe Toleranz wie in MainsFillIbcTick).
+sub Gartenbewaesserung_MainsPauseTick {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    my $refill = ($hash->{HELPER}{barrelEmptyRefillPause}
+                  && ($hash->{HELPER}{barrelEmptyRefillPauseSource} || "") eq "water_supply") ? 1 : 0;
+    my $pause  = ($hash->{HELPER}{pauseActive}
+                  && ($hash->{HELPER}{pauseSource} || "") eq "water_supply") ? 1 : 0;
+    return if(!$refill && !$pause);
+    return if($hash->{HELPER}{ibcToBarrelActive});
+
+    my $float = AttrVal($name, "barrelFloatLevel", 0);
+    return if($float !~ /^\d+(?:\.\d+)?$/ || $float <= 0);
+    my $level = Gartenbewaesserung_BarrelLevelExact($hash);
+    return if(!defined($level) || $level < $float - 2);
+
+    if($refill) {
+        Log3 $name, 3, sprintf("%s: barrel at float level (%.0f l) - ending the mains refill "
+            . "pause early instead of waiting out the timer", $name, $level);
+        Gartenbewaesserung_StopBarrelEmptyRefillPause($hash);
+        Gartenbewaesserung_ResumeAfterBarrelEmpty($hash) if($hash->{HELPER}{barrelEmptyResumePending});
+        return;
+    }
+
+    Log3 $name, 3, sprintf("%s: barrel at float level (%.0f l) - ending the mains-fed pause "
+        . "early instead of waiting out the timer", $name, $level);
+    if(defined($hash->{HELPER}{pausedCircuit})) {
+        RemoveInternalTimer($hash, "Gartenbewaesserung_EndCircuitPauseTimer");
+        Gartenbewaesserung_EndCircuitPause($hash, $hash->{HELPER}{pausedCircuit});
+    }
+    else {
+        RemoveInternalTimer($hash, "Gartenbewaesserung_EndWateringPause");
+        Gartenbewaesserung_EndWateringPause($hash);
+    }
 }
 
 # Foerderrate holen: gelerntes Reading zuerst, dann das gleichnamige Attribut.
@@ -5575,7 +5811,9 @@ sub Gartenbewaesserung_NoteValveDraw {
     }
 
     my $opened = $hash->{HELPER}{valveOpenTime};
+    my $openLevel = delete $hash->{HELPER}{valveOpenLevel};
     delete $hash->{HELPER}{valveOpenTime};
+    delete $hash->{HELPER}{drawMainsCounted};
     my $minutes = $opened ? (int(time()) - $opened) / 60 : 0;
     $minutes = 0 if($minutes < 0);
     $hash->{HELPER}{drawMinutes} = ($hash->{HELPER}{drawMinutes} || 0) + $minutes;
@@ -5597,6 +5835,18 @@ sub Gartenbewaesserung_NoteValveDraw {
         my $drawn;
         if($rate > 0 && $minutes > 0) {
             $drawn = $rate * $minutes;
+            # Was der Hahn waehrend des Kreises nachgeschoben hat, hat das Fass
+            # nie verlassen. Ohne den Abzug endete Kreis 1 (15,6 l/min, 10 min)
+            # rechnerisch bei 5 l, waehrend das Fass real auf Schwimmerhoehe
+            # stand - und die naechste Pause fuellte ein volles Fass.
+            my $nach = Gartenbewaesserung_MainsDuringDraw($hash, $openLevel, $rate, $minutes);
+            if($nach > 0) {
+                $drawn -= $nach;
+                $drawn = 0 if($drawn < 0);
+                $hash->{HELPER}{drawTainted} = 1;
+                Log3 $name, 4, sprintf("%s: valve %s drew %.0f l, the mains supply put %.0f l back "
+                    . "meanwhile", $name, defined($valveNum) ? $valveNum : "?", $rate * $minutes, $nach);
+            }
         }
         else {
             $drawn = $capacity * 0.12;
@@ -6059,7 +6309,33 @@ sub Gartenbewaesserung_RecordIbcFillRun {
     # MUSS, hiess das: nie wieder eine frische Pumpenrate.
     my $inflow = AttrVal($name, "mainsFillFlow_lpm", 0);
     $inflow = 0 if($inflow !~ /^\d+(?:\.\d+)?$/ || $source ne "mixed");
-    my $topUp = $inflow * $minutes;
+    # Das Ventil ist erst offen, wenn der Pegel UNTER die Schwimmerhoehe faellt.
+    # Bei einem Lauf aus vollem Fass sind das nicht alle Minuten: oberhalb der
+    # Hoehe leert die Pumpe allein. Bei 4,4 l/min war der Unterschied ein paar
+    # Liter, bei 22,5 sind es ueber 40 - und die landeten bis v1.0.87 in der
+    # "bekannten Menge" und damit in der gelernten Rate.
+    # Gerechnet wird mit dem ATTRIBUT als Nennrate, nicht mit dem gelernten
+    # Reading: die Zeit bis zur Schwimmerhoehe soll nicht von der Groesse
+    # abhaengen, die gerade gelernt werden soll.
+    my $nenn = AttrVal($name, "ibcFillFlow_lpm", 0);
+    $nenn = $rate if($nenn !~ /^\d+(?:\.\d+)?$/ || $nenn <= 0);
+    my $offen = $minutes;
+    if($inflow > 0 && $float > 0 && $nenn > 0) {
+        my $ueber = 0;
+        $ueber = $volume - $float if($complete && $volume > $float);
+        $ueber = $barrelAtStart - $float
+            if(!$complete && !$floatRun && defined($barrelAtStart) && $barrelAtStart > $float);
+        $offen = $minutes - $ueber / $nenn;
+        $offen = 0 if($offen < 0);
+    }
+    my $topUp = $inflow * $offen;
+    # Ab einem Fuenftel der Nennrate ist der Hahn keine Korrektur mehr, sondern
+    # die Haelfte der Rechnung - und die andere Haelfte (wann genau das Ventil
+    # aufging, ob es voll lieferte) kennt das Modul nicht. Gelernt wird aus so
+    # einem Lauf nichts; die Pumpenrate kommt dann aus "set calibrate", das den
+    # Hahn zu verlangt. Am 03.09. lernte ein 7,6-min-Lauf sonst 29,3 l/min aus
+    # einer Pumpe, die 37 macht.
+    my $hahnStark = ($inflow > 0 && $nenn > 0 && $inflow >= 0.2 * $nenn) ? 1 : 0;
 
     my $moved = 0;
     my $gekappt = 0;
@@ -6126,9 +6402,8 @@ sub Gartenbewaesserung_RecordIbcFillRun {
         # das 148 fasst).
         my $ceiling = $barrelAtStart;
         if(defined($ceiling)) {
-            my $inflow = AttrVal($name, "mainsFillFlow_lpm", 0);
-            $ceiling += $inflow * $minutes
-                if($source eq "mixed" && $inflow =~ /^\d+(?:\.\d+)?$/ && $inflow > 0);
+            # $topUp ist oben schon auf die Minuten unter Schwimmerhoehe begrenzt.
+            $ceiling += $topUp;
             if($moved > $ceiling) {
                 Log3 $name, 3, sprintf("%s: barrel->IBC booking capped at %.0f l "
                     . "(rate would have given %.0f l in %.1f min - stale rate?)",
@@ -6208,6 +6483,13 @@ sub Gartenbewaesserung_RecordIbcFillRun {
     if($known > 0 && $verregnet) {
         Log3 $name, 3, sprintf("%s: barrel->IBC run had %.0f l of rain falling in - the pump "
             . "moved more than the known %.0f l, rate left untouched", $name, $regen, $known);
+        readingsBulkUpdate($hash, "lastIbcFillVolume_l", sprintf("%.0f", $moved > 0 ? $moved : $known));
+    }
+    elsif($known > 0 && $hahnStark) {
+        Log3 $name, 3, sprintf("%s: barrel->IBC run with the mains tap open at %.1f l/min "
+            . "(%.0f%% of the pump's %.1f) - booked %.0f l, but no pump rate learned from it; "
+            . "use 'set %s calibrate' with the tap closed",
+            $name, $inflow, 100 * $inflow / $nenn, $nenn, $moved, $name);
         readingsBulkUpdate($hash, "lastIbcFillVolume_l", sprintf("%.0f", $moved > 0 ? $moved : $known));
     }
     elsif($known > 0) {
@@ -7439,6 +7721,9 @@ sub Gartenbewaesserung_CheckSchedule {
     # in der Nacht zum 25.08. waren genau das acht Nachfuellpausen a 81 l, die
     # dem Zaehler sonst entgingen.
     Gartenbewaesserung_MainsMeterTick($hash);
+    # Pause mit Leitungswasser als Quelle: fertig, sobald das Fass auf
+    # Schwimmerhoehe steht - nicht erst, wenn der Timer ablaeuft.
+    Gartenbewaesserung_MainsPauseTick($hash);
     Gartenbewaesserung_MainsFillIbcTick($hash);
     # Vorschau mitlaufen lassen: der Wert ist abends interessant, nicht erst
     # beim Start. Die Readings aendern sich nur, wenn sich ein Fuellstand
@@ -7912,7 +8197,12 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Typ: Slider (0–60 Minuten). Standardwert: 20 Minuten.<br>
             Dauer der automatischen Bewässerungs-Pause zum Nachfüllen des Fasses.
             Obergrenze, kein Fixwert – meldet der Fass-voll-Sensor früher, endet die Pause
-            sofort. Die Übertragung selbst begrenzt zusätzlich <code>ibcToBarrelDuration</code>.
+            sofort. Die Übertragung selbst begrenzt zusätzlich <code>ibcToBarrelDuration</code>.<br>
+            Füllt die Pause das Fass aus der <b>Leitung</b> (IBC leer), endet sie seit v1.0.88,
+            sobald der mitgerechnete Füllstand <code>barrelFloatLevel</code> erreicht – über ein
+            Schwimmerventil kommt der Fass-voll-Kontakt nie, und die volle Dauer abzuwarten wäre
+            bei 22 l/min Zulauf eine Viertelstunde Leerlauf. Voraussetzung ist ein gesetztes
+            <code>mainsFillFlow_lpm</code>.
         </li>
         <li><a id="Gartenbewaesserung-attr-rainDurationForIBC"></a>
             <b>rainDurationForIBC</b><br>
@@ -8327,6 +8617,18 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             <code>barrelUsableVolume</code>: über ein Schwimmerventil steigt der Pegel nur bis
             zur Schwimmerhöhe. Ohne dieses Attribut bleibt es beim bisherigen Verhalten – einem
             Sprung auf <code>barrelFloatLevel</code>.<br>
+            Ein <b>schneller Hahn</b> (ab einem Fünftel von <code>ibcFillFlow_lpm</code>) ändert
+            dreierlei (v1.0.88): Aus einem Pumpenlauf mit offenem Hahn wird die Pumpenrate nicht
+            mehr gelernt – der Zulauf ist dann kein Korrekturposten mehr, sondern die halbe
+            Rechnung; dafür gibt es <code>set &lt;name&gt; calibrate</code> mit zugedrehtem Hahn.
+            Während ein Gießkreis läuft, rechnet das Modul den Zulauf ab Schwimmerhöhe mit
+            (voll, wenn der Kreis mehr zieht als der Hahn liefert, sonst genau die Entnahme) und
+            zieht ihn beim Schließen des Ventils von der Entnahme ab. Und eine Pause, die das
+            Fass aus der Leitung füllt, endet auf Schwimmerhöhe statt am Timer.<br>
+            <b>Ändern des Werts</b> friert den bisherigen Stand von
+            <code>mainsDirect_total_l</code> zur alten Rate ein; erst ab dann zählt die neue.
+            Ein Ventiltausch verfälscht die Historie damit nicht mehr (beim Wechsel 4,4 → 22,5
+            sprang der Zähler vorher von 5400 auf 27722 l).<br>
             Messen: Wasserzähler ablesen, Hahn auf, nach ein paar Minuten wieder ablesen. Der
             Wert ist deutlich kleiner als der Nenndurchfluss der Leitung – in der Anlage des
             Autors 4,4 l/min bei geschätzten 12 l/min Zuleitung.
@@ -8400,7 +8702,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             <b>Achtung:</b> <code>mains_total_l</code> ist <b>nicht</b> der Leitungswasserverbrauch. Es zählt nur den Anteil, der anschließend weiter in den IBC gepumpt wurde. Was vom Fass direkt in die Gießkreise ging, steht in <code>mainsDirect_total_l</code>.</li>
         <li><b>mainsDirect_total_l</b> / <b>mainsDirectSince</b> - Gesamtes Leitungswasser, das durch das Schwimmerventil ins Fass gelaufen ist, seit dem Zeitstempel in <code>mainsDirectSince</code>. Das ist die Zahl, die man gegen einen Zwischenzähler halten kann.<br>
             Gerechnet wird aus der Zeit, in der das Ventil offen steht — Hahn auf (<code>mainsSupplyDevice</code>) und Fass unter <code>barrelFloatLevel</code> — mal <code>mainsFillFlow_lpm</code>. Am 25.08.2026 gegen einen Zwischenzähler geprüft: 1,860 m³ abgelesen gegen 1,8 m³ gerechnet, über drei Tage also auf rund 3&nbsp;% genau.<br>
-            Intern werden ganze Sekunden geführt, nicht Liter — ein Liter-Zähler verlöre je Takt seinen Nachkommaanteil. Wird <code>mainsFillFlow_lpm</code> später genauer bestimmt, rechnet sich die gesamte Historie mit; das ist beabsichtigt, weil die Rate die einzige Unbekannte der Rechnung ist. Zurücksetzen mit <code>set &lt;name&gt; resetHarvestStats</code>.</li>
+            Intern werden Sekunden bei voller Rate geführt, nicht Liter — ein Liter-Zähler verlöre je Takt seinen Nachkommaanteil. Wird <code>mainsFillFlow_lpm</code> geändert, werden die bisherigen Sekunden zur <b>alten</b> Rate in Liter eingefroren und nur die Zukunft mit der neuen gerechnet (bis v1.0.87 rechnete sich die ganze Historie um — richtig für eine genauere Messung, falsch für einen Ventiltausch). Seit v1.0.88 zählt der Zähler auch während eines Gießkreises mit: ab Schwimmerhöhe liefert der Hahn das Kleinere aus Zulaufrate und Entnahme des Kreises. Zurücksetzen mit <code>set &lt;name&gt; resetHarvestStats</code>.</li>
         <li><b>waterSource</b> - <code>rain</code> (Normalfall) oder <code>other</code>, siehe <code>set &lt;name&gt; waterSource</code>. Fällt beim nächsten <code>barrelEmpty</code> automatisch auf <code>rain</code> zurück.</li>
         <li><b>pumpedOther_total_l</b> - Insgesamt gefördertes Volumen aus Fremdwasser-Läufen. Bewusst getrennt von <code>pumpedRain_total_l</code>, damit der Abgleich gegen <code>harvest_total_l</code> und damit die Bestimmung von <code>roofArea</code> sauber bleibt.</li>
         <li><b>lastIbcFillRain_l</b> / <b>lastIbcFillMains_l</b> - Aufteilung des letzten Laufs. Nur gefüllt, wenn <code>mainsSupplyDevice</code> konfiguriert ist.</li>

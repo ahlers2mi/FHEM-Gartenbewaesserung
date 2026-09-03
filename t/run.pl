@@ -1062,6 +1062,171 @@ scenario("WW validate prueft Physik < Deckel < Alarm (v1.0.87)");
     ok_true(!!($r3 !~ /leaves little room/), "Deckel 20 ist nicht knapp");
 }
 
+# --- Der schnelle Hahn (Peki-Ventil 22,5 l/min, 03.09.2026) -------------------
+my %PEKI = (barrelUsableVolume => 161, barrelFloatLevel => 87,
+            mainsFillFlow_lpm => 22.5, ibcFillFlow_lpm => 37.4,
+            valve1Flow_lpm => 15.6, valve2Flow_lpm => 27.6, valve3Flow_lpm => 8.2);
+
+scenario("XX Ernte mit offenem schnellem Hahn: Zulauf nur unter Schwimmerhoehe, nichts gelernt (v1.0.88)");
+{
+    # Der Lauf vom 03.09. 20:16-20:23: volles Fass (161), Hahn auf mit 22,5,
+    # Pumpe 7,6 min bis leer. Alt: Zulauf ueber die ganze Zeit (171 l) -> 332 l
+    # "bekannte Menge" und 43,7 l/min in die gelernte Rate. Neu: das Ventil ist
+    # erst unter 87 l offen, also rund 5,6 der 7,6 Minuten -> ~287 l, und die
+    # Rate bleibt, wie sie war.
+    my $h = build(mains => "on", attr => { %PEKI });
+    main::readingsSingleUpdate($h, "ibcFillFlow_lpm", 37.4, 0);
+    Gartenbewaesserung_SetIbcLevel($h, 300, "test", 1);
+    sens("barrelFull", "yes");
+    Gartenbewaesserung_StartIBCFill($h, 1);
+    main::advance(456);                               # 7,6 min
+    sens("barrelEmpty", "yes");
+
+    my $g = rd("lastIbcFillVolume_l");
+    ok_true($g >= 270 && $g <= 300, "gebucht ~287 l, nicht 332 (ist: $g)");
+    is(rd("ibcFillFlow_lpm"), "37.4", "Pumpenrate aus einem Lauf mit offenem Hahn nicht gelernt");
+    my $n = grep { /no pump rate learned from it/ } @main::LOG;
+    ok_true($n == 1, "und das steht so im Log");
+}
+
+scenario("YY Fass-leer-Pause aus der Leitung endet auf Schwimmerhoehe (v1.0.88)");
+{
+    # IBC leer, kein Fuellventil (wie in der Anlage): die Pause fuellt ueber das
+    # Schwimmerventil. 87 l bei 22,5 l/min sind knapp vier Minuten - alt wartete
+    # die Pause trotzdem die vollen 20 ab.
+    my $h = build(mains => "on", attr => { %PEKI, wateringPauseDuration => 20,
+                                           wateringPauseInterval => 0 });
+    sens("ibcEmpty", "yes");
+    Gartenbewaesserung_SetBarrelLevel($h, 161, "test", 1);
+    sens("barrelFull", "yes");
+    Gartenbewaesserung_StartWatering($h);
+    main::advance(120);
+    is(relay("POWER1"), "ON", "Kreis 1 laeuft");
+    sens("barrelFull", "no");
+    sens("barrelEmpty", "yes");                       # Pumpe meldet leer
+    main::advance(5);
+    is(relay("POWER1"), "OFF", "Kreis 1 gestoppt");
+    sens("barrelEmpty", "no");                        # Schwimmerventil hat nachgefuellt
+    ok_true(!!$h->{HELPER}{barrelEmptyRefillPause}, "Nachfuellpause laeuft");
+    is($h->{HELPER}{barrelEmptyRefillPauseSource}, "water_supply", "Quelle ist die Leitung");
+
+    main::advance(8 * 60);                            # 87/22,5 = 3,9 min + Anker-Minute
+    ok_true(!$h->{HELPER}{barrelEmptyRefillPause}, "Pause nach 8 min vorbei, nicht erst nach 20");
+    my $l = rd("barrelLevel_l");
+    ok_true($l >= 85 && $l <= 87, "Fass steht auf Schwimmerhoehe (ist: $l)");
+    is(relay("POWER1"), "ON", "Kreis 1 laeuft weiter");
+}
+
+scenario("DDD Giess-Pause aus der Leitung endet ebenfalls auf Schwimmerhoehe (v1.0.88)");
+{
+    # Dieselbe Regel fuer die Pause nach wateringPauseInterval: IBC leer, Hahn
+    # auf, Fass nach vier Minuten auf Hoehe - weiter statt 20 Minuten warten.
+    my $h = build(mains => "on", attr => { %PEKI, wateringPauseInterval => 4,
+                                           wateringPauseDuration => 20 });
+    sens("ibcEmpty", "yes");
+    Gartenbewaesserung_SetBarrelLevel($h, 161, "test", 1);
+    Gartenbewaesserung_StartWatering($h);
+    main::advance(4 * 60 + 10);
+    ok_true(!!$h->{HELPER}{pauseActive}, "Giess-Pause laeuft");
+    is($h->{HELPER}{pauseSource}, "water_supply", "Quelle ist die Leitung");
+    is(relay("POWER1"), "OFF", "Ventil zu");
+    # Fass steht nach 4,2 min Kreis 1 bei 161 - 65 = 96, also schon UEBER der
+    # Schwimmerhoehe: die Pause hat nichts nachzufuellen und endet beim
+    # naechsten Takt.
+    main::advance(2 * 60);
+    ok_true(!$h->{HELPER}{pauseActive}, "Pause nach 2 min vorbei statt nach 20");
+    is(relay("POWER1"), "ON", "Kreis 1 laeuft weiter");
+}
+
+scenario("ZZ Zulauf waehrend eines Kreises wird gezaehlt und von der Entnahme abgezogen (v1.0.88)");
+{
+    # Kreis 1 (15,6 l/min) aus vollem Fass, Hahn 22,5: nach (161-87)/15,6 = 4,7
+    # Minuten steht das Fass auf Schwimmerhoehe, danach liefert der Hahn genau
+    # die Entnahme. 10 Minuten Kreis -> 5,3 min x 15,6 = 82 l Leitungswasser,
+    # das Fass endet bei 87 statt bei 5. Alt: Zaehler 0, Fass 5.
+    my $h = build(mains => "on", attr => { %PEKI });
+    Gartenbewaesserung_SetBarrelLevel($h, 161, "test", 1);
+    sens("barrelFull", "yes");
+    main::readingsSingleUpdate($h, "mainsDirect_total_l", 0, 0);
+    main::readingsSingleUpdate($h, ".mainsDirectSeconds", 0, 0);
+    Gartenbewaesserung_StartWatering($h);
+    main::advance(10 * 60 + 5);                       # Kreis 1 hat 10 min
+
+    my $z = rd("mainsDirect_total_l");
+    ok_true($z >= 70 && $z <= 90, "Zaehler ~82 l aus dem laufenden Kreis (ist: $z)");
+    my $l = rd("barrelLevel_l");
+    ok_true($l >= 84 && $l <= 90, "Fass endet auf Schwimmerhoehe, nicht bei 5 (ist: $l)");
+    ok_true(!!$h->{HELPER}{drawTainted}, "aus so einem Lauf wird keine Giessrate gelernt");
+}
+
+scenario("AAA Zulauf, der schneller ist als der Kreis, zaehlt nur die Entnahme; Hahn zu zaehlt nichts (v1.0.88)");
+{
+    # Gegenprobe zu ZZ: Kreis 2 zieht 27,6 > 22,5 - der Hahn laeuft voll, das
+    # Fass sinkt netto um 5 l/min. Und bei zugedrehtem Hahn darf sich nichts
+    # aendern, sonst erfindet der Fix Wasser.
+    my $h = build(mains => "on", attr => { %PEKI, activeValves => "2" });
+    Gartenbewaesserung_SetBarrelLevel($h, 161, "test", 1);
+    sens("barrelFull", "yes");
+    Gartenbewaesserung_StartWatering($h);
+    main::advance(10 * 60 + 5);                       # 10 von 20 min Kreis 2
+    # (161-87)/27,6 = 2,7 min bis Schwimmer, dann 7,3 min x 22,5 = 165 l
+    my $z = rd("mainsDirect_total_l");
+    ok_true($z >= 150 && $z <= 180, "Hahn voll offen: ~165 l in 7,3 min (ist: $z)");
+
+    my $h2 = build(mains => "off", attr => { %PEKI });
+    Gartenbewaesserung_SetBarrelLevel($h2, 161, "test", 1);
+    sens("barrelFull", "yes");
+    Gartenbewaesserung_StartWatering($h2);
+    main::advance(10 * 60 + 5);
+    is(rd("mainsDirect_total_l"), "(fehlt)", "Hahn zu: kein Zaehlerstand entsteht");
+    my $l = rd("barrelLevel_l");
+    ok_true($l >= 3 && $l <= 7, "Hahn zu: Kreis 1 zieht das Fass auf 5 l (ist: $l)");
+}
+
+scenario("BBB Aendern von mainsFillFlow_lpm friert den Zaehlerstand ein (v1.0.88)");
+{
+    # 03.09.: 4,4 -> 22,5 verfuenffachte die Historie (5400 -> 27722 l). Die
+    # bisherigen Sekunden gehoeren zur alten Rate.
+    my $h = build(mains => "on");                     # 4,4 l/min
+    $h->{HELPER}{watering} = 1;                       # MainsFillTick setzt aus (wie V)
+    main::readingsSingleUpdate($h, ".mainsDirectSeconds", 3600, 0);
+    main::readingsSingleUpdate($h, "mainsDirect_total_l", 264, 0);
+    Gartenbewaesserung_SetBarrelLevel($h, 81, "test", 1);   # Ventil zu, nichts laeuft
+
+    my $err = Gartenbewaesserung_Attr("set", "bw", "mainsFillFlow_lpm", 22.5);
+    $main::attr{bw}{mainsFillFlow_lpm} = 22.5;        # so setzt es fhem.pl nach AttrFn
+    ok_true(!defined($err), "Attribut wird angenommen");
+    main::advance(120);
+    is(rd("mainsDirect_total_l"), 264, "Stand bleibt 264, wird nicht 1350");
+
+    # Ab jetzt zaehlt die neue Rate: Fass leer, 10 Minuten offen = 225 l dazu.
+    Gartenbewaesserung_SetBarrelLevel($h, 0, "test", 1);
+    main::advance(60);                                # Anker
+    main::advance(10 * 60);
+    my $z = rd("mainsDirect_total_l");
+    ok_true($z >= 485 && $z <= 492, "264 + 10 min x 22,5 = 489 (ist: $z)");
+
+    Gartenbewaesserung_SetBarrelLevel($h, 81, "test", 1);  # Ventil zu
+    Gartenbewaesserung_Set($h, "bw", "resetHarvestStats");
+    main::advance(120);
+    is(rd("mainsDirect_total_l"), 0, "Reset nimmt die eingefrorenen Liter mit");
+}
+
+scenario("CCC validate ordnet einen schnellen Hahn ein (v1.0.88)");
+{
+    my $h = build(attr => { %PEKI });
+    my $r = Gartenbewaesserung_ValidateConfig($h);
+    ok_true(!!($r =~ /mains tap 22.5 l\/min is 60% of the pump rate/), "60 % werden gemeldet");
+
+    my $h2 = build(attr => { %PEKI, mainsFillFlow_lpm => 40 });
+    my $r2 = Gartenbewaesserung_ValidateConfig($h2);
+    ok_true(!!($r2 =~ /is not below ibcFillFlow_lpm/), "Hahn schneller als Pumpe wird angemahnt");
+
+    my $h3 = build();                                 # 4,4 gegen 34,2 = 13 %
+    my $r3 = Gartenbewaesserung_ValidateConfig($h3);
+    ok_true(!!($r3 !~ /mains tap/), "langsamer Hahn: keine Meldung");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);
