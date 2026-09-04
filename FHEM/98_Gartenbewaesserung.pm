@@ -13,6 +13,23 @@
 #
 ##############################################################################
 #
+# 1.0.90 - 2026-09-04  Ernte bei offenem Hahn schoepft nur den Regen ab. Ein
+#                      Erntelauf pumpte von barrelFull bis barrelEmpty; sobald
+#                      der Pegel unter die Schwimmerhoehe faellt, oeffnet das
+#                      Schwimmerventil, und die Pumpe hebt Leitungswasser in
+#                      den IBC. Mit 4,4 l/min waren das ~10 l je Lauf, mit dem
+#                      Peki-Ventil (22,5 gegen 37 der Pumpe) ~130 l - fast so
+#                      viel wie der Regen selbst (161 - 87 = 74 l). Jetzt setzt
+#                      ArmHarvestSkim beim Start einer AUTOMATISCHEN Ernte mit
+#                      Hahn auf einen Timer auf (Volumen - Schwimmerhoehe) /
+#                      Pumpenrate; HarvestSkimStop beendet den Lauf dort mit
+#                      Endgrund "floatLevel". Das Ventil oeffnet gar nicht
+#                      erst. Attribut harvestToFloatLevel (Standard 1) schaltet
+#                      es ab. Nicht betroffen: manuelles startIBCFill,
+#                      mainsFillIbc (will Leitungswasser), calibrate (Hahn zu),
+#                      Ernte bei zugedrehtem Hahn. Fehlt Rate, Volumen oder
+#                      Schwimmerhoehe, laeuft die Ernte wie bisher bis leer.
+#
 # 1.0.89 - 2026-09-03  Neu: watered_today_l / watered_total_l - was in den
 #                      Garten ging, brutto aus Ventilzeit x Kreisrate, egal ob
 #                      Regen- oder Leitungswasser. Die watertank-Kachel zeigte
@@ -1045,7 +1062,7 @@ use POSIX;
 # greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
 # gerade selbst geladen) oder die Liste ihr Format aendert.
 {
-    my $FALLBACK = '1.0.89';
+    my $FALLBACK = '1.0.90';
     my $cached;
     sub Gartenbewaesserung_Version {
         return $cached if(defined($cached));
@@ -1118,7 +1135,7 @@ sub Gartenbewaesserung_Initialize {
         "wateringFlow_lpm:textField " .
         "ibcFillFlow_lpm:textField ibcToBarrelFlow_lpm:textField " .
         "ibcUsableVolume:textField ibcFullFromLevel:0,1 " .
-        "mainsSupplyDevice:textField mainsFillFlow_lpm:textField " .
+        "mainsSupplyDevice:textField mainsFillFlow_lpm:textField harvestToFloatLevel:0,1 " .
         "mainsSupplyActiveValue:textField mainsSupplyInactiveValue:textField " .
         "runoffCoefficient:textField " .
         "pumpStartDelay:slider,-30,1,30 " .
@@ -5275,6 +5292,7 @@ sub Gartenbewaesserung_StartIBCFill {
     $hash->{HELPER}{ibcFillBarrelAtStart} =
         ($lvlAtStart =~ /^-?\d+(?:\.\d+)?$/ && $lvlAtStart > 0) ? $lvlAtStart : undef;
     Gartenbewaesserung_ArmIbcFullByLevel($hash);
+    Gartenbewaesserung_ArmHarvestSkim($hash, $manual);
 
     if($pumpDevice ne "") {
         my $delay = AttrVal($name, "pumpStartDelay", 3);
@@ -6091,6 +6109,59 @@ sub Gartenbewaesserung_ArmIbcFullByLevel {
     InternalTimer(gettimeofday() + $minutes * 60, "Gartenbewaesserung_IbcFullByLevel", $hash);
 }
 
+# Ernte bei offenem Hahn: nur den Regen abschoepfen.
+#
+# Ein Erntelauf pumpte bisher von barrelFull bis barrelEmpty. Bei offenem Hahn
+# oeffnet das Schwimmerventil, sobald der Pegel unter die Schwimmerhoehe faellt,
+# und ab da pumpt die Pumpe Leitungswasser in den IBC: mit dem alten Ventil
+# (4,4 l/min) rund 10 l je Lauf, mit dem Peki (22,5 l/min gegen 37 der Pumpe,
+# netto 15) rund 130 l - fast so viel wie der Regen selbst (161 - 87 = 74 l).
+# Gebucht wurde das seit v1.0.88 richtig als mains_total_l, gepumpt und bezahlt
+# war es trotzdem.
+#
+# Deshalb endet eine automatische Ernte bei offenem Hahn jetzt auf der
+# Schwimmerhoehe: (barrelUsableVolume - barrelFloatLevel) / Pumpenrate Minuten
+# nach dem Start, per Timer. Das Ventil oeffnet dann gar nicht erst. Nur die
+# automatische Ernte (Regen): mainsFillIbc will gerade Leitungswasser hochheben,
+# calibrate verlangt den Hahn zu, und ein manuelles startIBCFill darf das Fass
+# leeren, wenn der Nutzer das will. Bei zugedrehtem Hahn bleibt alles wie bisher.
+# Fehlt eine der drei Zahlen, laeuft die Ernte bis barrelEmpty - lieber ein
+# teurer Lauf als ein geratener Stopp.
+sub Gartenbewaesserung_ArmHarvestSkim {
+    my ($hash, $manual) = @_;
+    my $name = $hash->{NAME};
+
+    RemoveInternalTimer($hash, "Gartenbewaesserung_HarvestSkimStop");
+    return if($manual);
+    return if(!AttrVal($name, "harvestToFloatLevel", 1));
+    return if(!$hash->{HELPER}{ibcFillFromFull});
+    return if(Gartenbewaesserung_MainsSupplyState($hash) ne "on");
+
+    my $volume = AttrVal($name, "barrelUsableVolume", 0);
+    my $float  = AttrVal($name, "barrelFloatLevel", 0);
+    my $rate   = Gartenbewaesserung_FlowRate($hash, "ibcFillFlow_lpm");
+    return if($volume !~ /^\d+(?:\.\d+)?$/ || $float !~ /^\d+(?:\.\d+)?$/
+              || $volume <= 0 || $float <= 0 || $float >= $volume || $rate <= 0);
+
+    my $minutes = ($volume - $float) / $rate;
+    Log3 $name, 3, sprintf("%s: mains tap is open - harvesting only the %.0f l above the float "
+        . "level, pump stops in %.1f min instead of running to empty",
+        $name, $volume - $float, $minutes);
+    InternalTimer(gettimeofday() + $minutes * 60, "Gartenbewaesserung_HarvestSkimStop", $hash);
+}
+
+sub Gartenbewaesserung_HarvestSkimStop {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    RemoveInternalTimer($hash, "Gartenbewaesserung_HarvestSkimStop");
+    return if(!$hash->{HELPER}{ibcFilling});
+    # Kam barrelEmpty oder ibcFull schon, hat StopIBCFill den Timer geloescht.
+    Log3 $name, 3, "$name: barrel is down to the float level - rain harvested, stopping before "
+        . "the float valve starts feeding mains water into the IBC";
+    Gartenbewaesserung_StopIBCFill($hash, "floatLevel");
+}
+
 sub Gartenbewaesserung_IbcFullByLevel {
     my ($hash) = @_;
     my $name = $hash->{NAME};
@@ -6655,6 +6726,7 @@ sub Gartenbewaesserung_StopIBCFill {
     my $name = $hash->{NAME};
 
     RemoveInternalTimer($hash, "Gartenbewaesserung_IbcFullByLevel");
+    RemoveInternalTimer($hash, "Gartenbewaesserung_HarvestSkimStop");
 
     # Nach einem Neustart oder Modul-Reload mitten im Lauf ist HELPER leer - das
     # ist reiner Arbeitsspeicher. Die Readings wissen es noch, also von dort
@@ -8710,6 +8782,20 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             Werte, an denen <code>mainsSupplyDevice</code> „Zufuhr offen“ bzw. „Zufuhr zu“ erkennt.
             Nur nötig, wenn das Gerät eigene Begriffe verwendet.
         </li>
+        <li><a id="Gartenbewaesserung-attr-harvestToFloatLevel"></a>
+            <b>harvestToFloatLevel</b><br>
+            Typ: 0/1. Standardwert: 1.<br>
+            Bei offenem Hahn (<code>mainsSupplyDevice</code> auf <code>on</code>) endet eine
+            <b>automatische</b> Ernte auf der Schwimmerhöhe statt bei <code>barrelEmpty</code>:
+            gepumpt wird nur <code>barrelUsableVolume − barrelFloatLevel</code>, per Timer aus
+            der Pumpenrate. Grund: unterhalb der Schwimmerhöhe öffnet das Schwimmerventil und die
+            Pumpe hebt Leitungswasser in den IBC – mit einem schnellen Ventil (22,5 l/min gegen
+            37 der Pumpe) rund 130 l je Lauf, fast so viel wie der Regen selbst. Endgrund im
+            Reading <code>lastIbcFillEnd</code>: <code>floatLevel</code>.<br>
+            Nicht betroffen: <code>set startIBCFill</code> von Hand, <code>mainsFillIbc</code>,
+            <code>calibrate</code> und jede Ernte bei zugedrehtem Hahn. Fehlt eine der drei Zahlen
+            (Pumpenrate, Volumen, Schwimmerhöhe), läuft die Ernte wie bisher bis leer.
+        </li>
         <li><a id="Gartenbewaesserung-attr-mainsFillFlow_lpm"></a>
             <b>mainsFillFlow_lpm</b><br>
             Typ: Text (Liter pro Minute). Ohne Angabe: kein Mitrechnen.<br>
@@ -8815,7 +8901,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>ibcLevel_l</b> / <b>ibcLevel_pct</b> / <b>ibcLevelAnchor</b> - Geschätzter IBC-Füllstand in Litern bzw. Prozent, und woher der Wert zuletzt verankert wurde (<code>ibcEmpty</code>, <code>ibcFull</code>, <code>manual</code>) mit Zeitstempel. Setzt <code>ibcUsableVolume</code> voraus. <b>Eine Schätzung, keine Messung</b> – siehe dort.</li>
         <li><b>ibcToBarrelFlow_lpm</b> / <b>lastIbcToBarrelVolume_l</b> - Gelernte Rate der Schwerkraftrichtung IBC&nbsp;&rarr;&nbsp;Fass und die daraus geschätzte Menge des letzten Rücklaufs. Gelernt wird nur aus Läufen, die bei leerem Fass beginnen und mit <code>barrelFull</code> enden – die haben <code>barrelUsableVolume</code> bewegt.</li>
         <li><b>lastIbcToBarrelDuration</b> / <b>lastIbcToBarrelEnd</b> - Dauer (Minuten) und Endgrund (<code>barrelFull</code>, <code>pauseEnd</code>) des letzten Laufs IBC&nbsp;&rarr;&nbsp;Fass, einschließlich der Schwerkraft-Nachspeisung während einer Gießpause.</li>
-        <li><b>lastIbcFillDuration</b> / <b>lastIbcFillEnd</b> / <b>lastIbcFillVolume_l</b> - Dauer (Minuten), Endgrund (<code>barrelEmpty</code>, <code>ibcFull</code>, <code>watering</code>, <code>rainStopped</code>, <code>ibcToBarrel</code>, <code>manual</code>) und bewegtes Volumen der letzten Befüllung Fass&nbsp;&rarr;&nbsp;IBC.</li>
+        <li><b>lastIbcFillDuration</b> / <b>lastIbcFillEnd</b> / <b>lastIbcFillVolume_l</b> - Dauer (Minuten), Endgrund (<code>barrelEmpty</code>, <code>ibcFull</code>, <code>floatLevel</code> – Regen abgeschöpft, siehe <code>harvestToFloatLevel</code>, <code>watering</code>, <code>rainStopped</code>, <code>ibcToBarrel</code>, <code>manual</code>) und bewegtes Volumen der letzten Befüllung Fass&nbsp;&rarr;&nbsp;IBC.</li>
         <li><b>ibcFillFlow_lpm</b> - Gelernte Förderrate in Litern pro Minute, gedämpft gemittelt, sinkt also automatisch mit, wenn der Filter zusetzt. Fortgeschrieben wird sie aus den beiden Läufen mit <b>bekannter Menge</b>: aus dem vollen Fass bis <code>barrelEmpty</code> (das sind <code>barrelUsableVolume</code>, braucht aber Regen) und – seit v1.0.74 – aus einer Stadtwasser-Runde von der Schwimmerhöhe bis <code>barrelEmpty</code> (das sind <code>barrelFloatLevel</code>). Ohne den zweiten Fall bliebe die Rate in einer regenlosen Woche stehen, während die Pumpe längst langsamer geworden ist. Zwei Sicherungen halten das Lernen im Zaum (seit v1.0.79): eine Stadtwasser-Runde zählt nur, wenn das Fass beim Pumpenstart wirklich auf Schwimmerhöhe stand — dass <code>mainsFillIbc</code> den Lauf angestoßen hat, reicht nicht, denn dessen Entscheidung hängt selbst an der Füllstandsschätzung. Und ein Wert über dem 1,5-fachen oder unter 40&nbsp;% des <b>Attributs</b> wird verworfen. Bewusst das Attribut und nicht das gelernte Reading: an letzterem festgemacht wandert die Grenze mit dem Fehler mit, jeder Schritt bleibt für sich plausibel, und die Rate schaukelt sich hoch — am 25.08.2026 von 34 auf 49,6, was wiederum die Notbremse der Trockenlauferkennung auf 4,8 Minuten stellte.<br>
             Steht der Hahn dabei offen, kommt <code>mainsFillFlow_lpm × Laufzeit</code> als Zulauf hinzu (seit v1.0.76). Das Schwimmerventil liefert nur einen Bruchteil dessen, was die Pumpe nimmt, hält also nie mit – über einen Lauf summiert es sich aber auf gut zehn Liter, und ohne diesen Term hielte das Modul eine gesunde Pumpe für verschlissen. Für die Statistik gilt: was von der Schwimmerhöhe abwärts gepumpt wird, ist <b>immer</b> Leitungswasser und wird nie als Ernte gebucht – bis dorthin füllt nur das Ventil, Regen ginge darüber hinaus bis zum Fass-voll-Kontakt.</li>
         <li><b>watered_today_l</b> / <b>watered_total_l</b> - Gegossene Menge in Litern, heute und seit dem letzten <code>resetHarvestStats</code>. Brutto aus Ventilzeit × Kreisrate (<code>valve&lt;N&gt;Flow_lpm</code>), unabhängig davon, ob das Wasser aus Regen oder aus der Leitung kam. Der Tageswert springt beim Tageswechsel auf 0 (Minutentakt), nicht erst beim nächsten Gießen. Die <code>watertank</code>-Kachel zeigt ihn als „heute gegossen“.</li>
