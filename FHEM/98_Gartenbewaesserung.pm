@@ -13,6 +13,16 @@
 #
 ##############################################################################
 #
+# 1.0.89 - 2026-09-03  Neu: watered_today_l / watered_total_l - was in den
+#                      Garten ging, brutto aus Ventilzeit x Kreisrate, egal ob
+#                      Regen- oder Leitungswasser. Die watertank-Kachel zeigte
+#                      bisher nur, was gesammelt wurde (harvest_today_l); ob
+#                      und wie viel gegossen wurde, war ihr nicht zu entnehmen.
+#                      Der Tageswert faellt im Minutentakt auf 0, sobald der
+#                      Tag wechselt (WateredDayTick) - nicht erst beim naechsten
+#                      Giessen, sonst staende morgens noch die Nacht drin.
+#                      resetHarvestStats setzt beide mit zurueck.
+#
 # 1.0.88 - 2026-09-03  Ein schneller Hahn. Am 03.09. ersetzte ein Peki-
 #                      Schwimmerventil das Toilettenventil: 22,5 statt 4,4 l/min,
 #                      also zwei Drittel der Pumpenrate statt einem Achtel. Vier
@@ -1035,7 +1045,7 @@ use POSIX;
 # greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
 # gerade selbst geladen) oder die Liste ihr Format aendert.
 {
-    my $FALLBACK = '1.0.88';
+    my $FALLBACK = '1.0.89';
     my $cached;
     sub Gartenbewaesserung_Version {
         return $cached if(defined($cached));
@@ -1313,6 +1323,8 @@ sub Gartenbewaesserung_Set {
         readingsBulkUpdate($hash, "pumpedRain_total_l", "0");
         readingsBulkUpdate($hash, "mains_total_l", "0");
         readingsBulkUpdate($hash, "pumpedOther_total_l", "0");
+        readingsBulkUpdate($hash, "watered_today_l", "0");
+        readingsBulkUpdate($hash, "watered_total_l", "0");
         readingsBulkUpdate($hash, "mainsDirect_total_l", "0");
         readingsBulkUpdate($hash, ".mainsDirectSeconds", "0");
         readingsBulkUpdate($hash, ".mainsDirectFrozen_l", "0");
@@ -5840,6 +5852,50 @@ sub Gartenbewaesserung_ApplyBarrelFloatFloor {
 }
 
 # One valve has just closed: book its draw and remember how long it was open.
+# Gegossene Menge mitzaehlen: heute und insgesamt.
+#
+# Die Kachel zeigte bisher, was gesammelt wurde (harvest_today_l), aber nicht,
+# was in den Garten ging - dabei ist das die Zahl, die man morgens wissen will.
+# Gezaehlt wird BRUTTO, Ventilzeit x Kreisrate: was der Kreis verteilt hat,
+# egal ob es aus Regen oder aus der Leitung kam. Der Tageszaehler laeuft ueber
+# .wateredDay wie harvest_today_l ueber .harvestDay; WateredDayTick setzt ihn
+# im Minutentakt auf 0, sobald der Tag wechselt - sonst staende um 09:00 noch
+# die Nacht von gestern in der Kachel.
+sub Gartenbewaesserung_AddWatered {
+    my ($hash, $liters) = @_;
+    my $name = $hash->{NAME};
+    return if(!defined($liters) || $liters !~ /^-?\d+(?:\.\d+)?$/ || $liters <= 0);
+
+    my @lt = localtime(time());
+    my $day = sprintf("%04d-%02d-%02d", $lt[5] + 1900, $lt[4] + 1, $lt[3]);
+    my $today = (ReadingsVal($name, ".wateredDay", "") eq $day)
+                ? ReadingsVal($name, "watered_today_l", 0) : 0;
+    $today = 0 if($today !~ /^-?\d+(?:\.\d+)?$/);
+    my $total = ReadingsVal($name, "watered_total_l", 0);
+    $total = 0 if($total !~ /^-?\d+(?:\.\d+)?$/);
+
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, ".wateredDay", $day);
+    readingsBulkUpdate($hash, "watered_today_l", sprintf("%.0f", $today + $liters));
+    readingsBulkUpdate($hash, "watered_total_l", sprintf("%.0f", $total + $liters));
+    readingsEndUpdate($hash, 1);
+}
+
+sub Gartenbewaesserung_WateredDayTick {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+    my $seen = ReadingsVal($name, ".wateredDay", "");
+    return if($seen eq "");
+    my @lt = localtime(time());
+    my $day = sprintf("%04d-%02d-%02d", $lt[5] + 1900, $lt[4] + 1, $lt[3]);
+    return if($seen eq $day);
+    return if(ReadingsVal($name, "watered_today_l", "0") eq "0");
+    readingsBeginUpdate($hash);
+    readingsBulkUpdate($hash, ".wateredDay", $day);
+    readingsBulkUpdate($hash, "watered_today_l", "0");
+    readingsEndUpdate($hash, 1);
+}
+
 sub Gartenbewaesserung_NoteValveDraw {
     my ($hash, $valveNum) = @_;
     my $name = $hash->{NAME};
@@ -5877,6 +5933,8 @@ sub Gartenbewaesserung_NoteValveDraw {
         my $drawn;
         if($rate > 0 && $minutes > 0) {
             $drawn = $rate * $minutes;
+            # Brutto in den Garten, vor dem Abzug des Zulaufs.
+            Gartenbewaesserung_AddWatered($hash, $drawn);
             # Was der Hahn waehrend des Kreises nachgeschoben hat, hat das Fass
             # nie verlassen. Ohne den Abzug endete Kreis 1 (15,6 l/min, 10 min)
             # rechnerisch bei 5 l, waehrend das Fass real auf Schwimmerhoehe
@@ -5932,6 +5990,9 @@ sub Gartenbewaesserung_NoteOpenValveDrawTime {
     # Pauschalabzug von 12 % samt irrefuehrender Log-Zeile.
     delete $hash->{HELPER}{valveOpenTime};
     $hash->{HELPER}{drawBooked} = 1;
+    # Auch diese Minuten sind gegossen worden.
+    my $rate = Gartenbewaesserung_ValveFlow($hash, $valveNum);
+    Gartenbewaesserung_AddWatered($hash, $rate * $minutes) if($rate > 0);
 
     Log3 $name, 4, sprintf("%s: booked %.1f min of still-open valve %s before learning",
         $name, $minutes, $valveNum);
@@ -7766,6 +7827,7 @@ sub Gartenbewaesserung_CheckSchedule {
     # Pause mit Leitungswasser als Quelle: fertig, sobald das Fass auf
     # Schwimmerhoehe steht - nicht erst, wenn der Timer ablaeuft.
     Gartenbewaesserung_MainsPauseTick($hash);
+    Gartenbewaesserung_WateredDayTick($hash);
     Gartenbewaesserung_MainsFillIbcTick($hash);
     # Vorschau mitlaufen lassen: der Wert ist abends interessant, nicht erst
     # beim Start. Die Readings aendern sich nur, wenn sich ein Fuellstand
@@ -8756,6 +8818,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>lastIbcFillDuration</b> / <b>lastIbcFillEnd</b> / <b>lastIbcFillVolume_l</b> - Dauer (Minuten), Endgrund (<code>barrelEmpty</code>, <code>ibcFull</code>, <code>watering</code>, <code>rainStopped</code>, <code>ibcToBarrel</code>, <code>manual</code>) und bewegtes Volumen der letzten Befüllung Fass&nbsp;&rarr;&nbsp;IBC.</li>
         <li><b>ibcFillFlow_lpm</b> - Gelernte Förderrate in Litern pro Minute, gedämpft gemittelt, sinkt also automatisch mit, wenn der Filter zusetzt. Fortgeschrieben wird sie aus den beiden Läufen mit <b>bekannter Menge</b>: aus dem vollen Fass bis <code>barrelEmpty</code> (das sind <code>barrelUsableVolume</code>, braucht aber Regen) und – seit v1.0.74 – aus einer Stadtwasser-Runde von der Schwimmerhöhe bis <code>barrelEmpty</code> (das sind <code>barrelFloatLevel</code>). Ohne den zweiten Fall bliebe die Rate in einer regenlosen Woche stehen, während die Pumpe längst langsamer geworden ist. Zwei Sicherungen halten das Lernen im Zaum (seit v1.0.79): eine Stadtwasser-Runde zählt nur, wenn das Fass beim Pumpenstart wirklich auf Schwimmerhöhe stand — dass <code>mainsFillIbc</code> den Lauf angestoßen hat, reicht nicht, denn dessen Entscheidung hängt selbst an der Füllstandsschätzung. Und ein Wert über dem 1,5-fachen oder unter 40&nbsp;% des <b>Attributs</b> wird verworfen. Bewusst das Attribut und nicht das gelernte Reading: an letzterem festgemacht wandert die Grenze mit dem Fehler mit, jeder Schritt bleibt für sich plausibel, und die Rate schaukelt sich hoch — am 25.08.2026 von 34 auf 49,6, was wiederum die Notbremse der Trockenlauferkennung auf 4,8 Minuten stellte.<br>
             Steht der Hahn dabei offen, kommt <code>mainsFillFlow_lpm × Laufzeit</code> als Zulauf hinzu (seit v1.0.76). Das Schwimmerventil liefert nur einen Bruchteil dessen, was die Pumpe nimmt, hält also nie mit – über einen Lauf summiert es sich aber auf gut zehn Liter, und ohne diesen Term hielte das Modul eine gesunde Pumpe für verschlissen. Für die Statistik gilt: was von der Schwimmerhöhe abwärts gepumpt wird, ist <b>immer</b> Leitungswasser und wird nie als Ernte gebucht – bis dorthin füllt nur das Ventil, Regen ginge darüber hinaus bis zum Fass-voll-Kontakt.</li>
+        <li><b>watered_today_l</b> / <b>watered_total_l</b> - Gegossene Menge in Litern, heute und seit dem letzten <code>resetHarvestStats</code>. Brutto aus Ventilzeit × Kreisrate (<code>valve&lt;N&gt;Flow_lpm</code>), unabhängig davon, ob das Wasser aus Regen oder aus der Leitung kam. Der Tageswert springt beim Tageswechsel auf 0 (Minutentakt), nicht erst beim nächsten Gießen. Die <code>watertank</code>-Kachel zeigt ihn als „heute gegossen“.</li>
         <li><b>harvest_today_l</b> / <b>harvest_month_l</b> / <b>harvest_year_l</b> / <b>harvest_total_l</b> - Aufgefangene Regenwassermenge in Litern (heute, laufender Monat, laufendes Jahr, seit Inbetriebnahme). Berechnet als <code>Regenmenge (mm) × roofArea × runoffCoefficient</code>; nur aktiv, wenn <code>roofArea</code> gesetzt ist. Die Perioden-Zähler starten bei Tages-, Monats- bzw. Jahreswechsel automatisch neu, <code>harvest_total_l</code> läuft weiter. Zurücksetzen mit <code>set &lt;name&gt; resetHarvestStats</code>.<br>
             <i>Grenze:</i> Der Wert beziffert, was am Fallrohr ankommt. Was bei vollem Fass überläuft, kann nicht abgezogen werden – die tatsächlich gespeicherte Menge liegt also darunter.</li>
     </ul>

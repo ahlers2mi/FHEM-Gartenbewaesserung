@@ -1270,6 +1270,35 @@ scenario("FFF barrelFull als ZUSTAND schliesst das Ventil auch in der Fass-leer-
     is(relay("POWER1"), "ON", "Kreis 1 laeuft weiter");
 }
 
+scenario("GGG watered_today_l zaehlt Ventilzeit x Rate, brutto, und faellt beim Tageswechsel (v1.0.89)");
+{
+    # Kreis 1, 10 min bei 15,6 l/min, Hahn offen: netto verlaesst das Fass
+    # weniger (der Hahn schiebt nach), gegossen wurden trotzdem 156 l.
+    my $h = build(mains => "on", attr => { %PEKI, wateringPauseInterval => 0 });
+    is(rd("watered_today_l"), "(fehlt)", "vorher nichts");
+    Gartenbewaesserung_SetBarrelLevel($h, 161, "test", 1);
+    sens("barrelFull", "yes");
+    Gartenbewaesserung_StartWatering($h);
+    main::advance(10 * 60 + 5);
+    my $w = rd("watered_today_l");
+    ok_true($w >= 150 && $w <= 160, "Kreis 1: ~156 l gegossen, brutto (ist: $w)");
+
+    # Kreis 2 laeuft weiter (27,6 l/min); mitten drin faellt das Fass leer -
+    # die bis dahin offene Ventilzeit zaehlt ebenfalls.
+    main::advance(4 * 60);
+    sens("barrelEmpty", "yes");
+    main::advance(5);
+    my $w2 = rd("watered_today_l");
+    ok_true($w2 >= $w + 100, "abgebrochener Kreis zaehlt bis zum Abbruch mit (ist: $w2)");
+    is(rd("watered_total_l"), $w2, "Gesamtzaehler laeuft mit");
+
+    # Tageswechsel: der Minutentakt setzt den Tageswert auf 0, ohne Giessen.
+    Gartenbewaesserung_StopAll($h);
+    main::advance(25 * 3600);
+    is(rd("watered_today_l"), 0, "am naechsten Tag steht 0");
+    is(rd("watered_total_l"), $w2, "Gesamt bleibt");
+}
+
 scenario("CCC validate ordnet einen schnellen Hahn ein (v1.0.88)");
 {
     my $h = build(attr => { %PEKI });
