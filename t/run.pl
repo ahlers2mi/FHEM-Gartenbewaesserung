@@ -1299,6 +1299,61 @@ scenario("GGG watered_today_l zaehlt Ventilzeit x Rate, brutto, und faellt beim 
     is(rd("watered_total_l"), $w2, "Gesamt bleibt");
 }
 
+scenario("HHH Ernte bei offenem Hahn stoppt auf Schwimmerhoehe (v1.0.90)");
+{
+    # Volles Fass (161), Hahn auf, automatische Ernte: nur 74 l ueber der
+    # Schwimmerhoehe sind Regen. Bei 37,4 l/min sind das 2,0 min - danach muss
+    # die Pumpe aus sein, sonst hebt sie ab da Leitungswasser in den IBC.
+    my $h = build(mains => "on", attr => { %PEKI });
+    main::readingsSingleUpdate($h, "ibcFillFlow_lpm", 37.4, 0);
+    Gartenbewaesserung_SetIbcLevel($h, 300, "test", 1);
+    Gartenbewaesserung_SetBarrelLevel($h, 161, "test", 1);
+    sens("barrelFull", "yes");
+    Gartenbewaesserung_StartIBCFill($h, 0);              # 0 = automatisch (Regen)
+    main::advance(90);
+    is(relay("POWER8"), "ON", "nach 1,5 min pumpt sie noch");
+    main::advance(60);
+    is(relay("POWER8"), "OFF", "nach 2,5 min ist sie aus - auf Schwimmerhoehe");
+    is(rd("lastIbcFillEnd"), "floatLevel", "Endgrund floatLevel");
+    my $b = rd("barrelLevel_l");
+    ok_true($b >= 82 && $b <= 92, "Fass steht auf Schwimmerhoehe (ist: $b)");
+    my $i = rd("ibcLevel_l");
+    ok_true($i >= 365 && $i <= 380, "IBC hat die ~74 l Regen bekommen (ist: $i)");
+    my $m = rd("mains_total_l");
+    ok_true($m eq "(fehlt)" || $m == 0, "kein Leitungswasser im IBC gebucht (ist: $m)");
+}
+
+scenario("III Ohne Hahn oder von Hand laeuft die Ernte weiter bis leer (v1.0.90)");
+{
+    # Gegenproben: Hahn zu -> voll bis leer wie immer; von Hand gestartet ->
+    # der Nutzer will das Fass leeren, auch bei offenem Hahn.
+    my $h = build(mains => "off", attr => { %PEKI });
+    main::readingsSingleUpdate($h, "ibcFillFlow_lpm", 37.4, 0);
+    Gartenbewaesserung_SetBarrelLevel($h, 161, "test", 1);
+    sens("barrelFull", "yes");
+    Gartenbewaesserung_StartIBCFill($h, 0);
+    main::advance(180);
+    is(relay("POWER8"), "ON", "Hahn zu: nach 3 min laeuft sie noch");
+    my $n = grep { /harvesting only/ } @main::LOG;
+    is($n, 0, "und kein Abschoepfen im Log");
+
+    my $h2 = build(mains => "on", attr => { %PEKI });
+    main::readingsSingleUpdate($h2, "ibcFillFlow_lpm", 37.4, 0);
+    Gartenbewaesserung_SetBarrelLevel($h2, 161, "test", 1);
+    sens("barrelFull", "yes");
+    Gartenbewaesserung_StartIBCFill($h2, 1);             # 1 = von Hand
+    main::advance(180);
+    is(relay("POWER8"), "ON", "von Hand: nach 3 min laeuft sie noch");
+
+    my $h3 = build(mains => "on", attr => { %PEKI, harvestToFloatLevel => 0 });
+    main::readingsSingleUpdate($h3, "ibcFillFlow_lpm", 37.4, 0);
+    Gartenbewaesserung_SetBarrelLevel($h3, 161, "test", 1);
+    sens("barrelFull", "yes");
+    Gartenbewaesserung_StartIBCFill($h3, 0);
+    main::advance(180);
+    is(relay("POWER8"), "ON", "Attribut 0: nach 3 min laeuft sie noch");
+}
+
 scenario("CCC validate ordnet einen schnellen Hahn ein (v1.0.88)");
 {
     my $h = build(attr => { %PEKI });
