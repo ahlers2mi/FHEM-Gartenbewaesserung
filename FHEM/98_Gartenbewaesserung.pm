@@ -5675,6 +5675,15 @@ sub Gartenbewaesserung_MainsMeterTick {
     # sich nicht ins Gehege kommen: StartIBCFill lehnt waehrend einer
     # Bewaesserung ab, der Zweig darueber hat also Vorrang und trifft nie
     # gleichzeitig zu.
+    # Hier steht bewusst die GELERNTE Rate (FlowRate: Reading, sonst Attribut)
+    # und nicht das Attribut wie in RecordIbcFillRun. Der Unterschied hat einen
+    # Grund: dort geht die Rate ueber $topUp in $moved und damit in die Groesse
+    # ein, die gerade gelernt wird - mit dem Reading waere das ein Kreis. Hier
+    # gibt es keinen: aus mainsDirect_total_l lernt nichts zurueck, gefragt ist
+    # allein die Physik. Wie schnell das Fass wirklich unter die Schwimmerhoehe
+    # faellt und ob die Pumpe ueberhaupt mehr zieht als der Hahn nachliefert,
+    # entscheidet die tatsaechliche Foerderrate - bei zugesetztem Filter also
+    # die kleinere. Fehlt das Reading, greift ohnehin das Attribut.
     my $fillSince = $hash->{HELPER}{ibcFillStartTime};
     if($hash->{HELPER}{ibcFilling} && $fillSince) {
         my $pump = Gartenbewaesserung_FlowRate($hash, "ibcFillFlow_lpm");
