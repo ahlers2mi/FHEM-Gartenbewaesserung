@@ -902,15 +902,21 @@ scenario("PP Ohne rotateCircuits bleibt die Reihenfolge fest (v1.0.84)");
     is(join(",", @start), "1,1,1", "immer Kreis 1, altes Verhalten unveraendert");
 }
 
-scenario("QQ Kalibrierlauf meldet die Messung, nicht den Mittelwert (v1.0.85)");
+scenario("QQ Kalibrierlauf SETZT die gelernte Pumpenrate (v1.0.85 / v1.0.92)");
 {
     # Der Fall vom 31.08.: gemessen 148 l in 4,8 min = 30,8 l/min, im Reading
     # stand danach 31,6 - die gedaempfte Mischung 0,7 x alt + 0,3 x neu. Ein
     # Kalibrierlauf verschluckte damit 70 % seiner eigenen Neuigkeit, und die
     # Filteraussage haengt daran. Hier auf die Spitze getrieben: das Reading
     # steht auf 50, die Messung liegt bei gut 30.
+    #
+    # v1.0.85 trennte Messung und gelernten Wert; seit v1.0.92 UEBERNIMMT ein
+    # geglueckter Lauf die Messung auch ins Reading. Die Schwerkraft bleibt
+    # gedaempft, sie haengt am IBC-Stand - deshalb steht sie hier auf 18 und
+    # muss oben bleiben.
     my $h = build();
     main::readingsSingleUpdate($h, "ibcFillFlow_lpm", 50, 0);
+    main::readingsSingleUpdate($h, "ibcToBarrelFlow_lpm", 18, 0);
     Gartenbewaesserung_SetIbcLevel($h, 500, "test", 1);
     Gartenbewaesserung_SetBarrelLevel($h, 81, "test", 1);
     Gartenbewaesserung_CalibrateStart($h);
@@ -930,8 +936,11 @@ scenario("QQ Kalibrierlauf meldet die Messung, nicht den Mittelwert (v1.0.85)");
     my $gemessen = rd("calibrationPumpFlow_lpm");
     ok_true($gemessen >= 28 && $gemessen <= 33,
             "gemeldet wird die Messung ~30, nicht der Mittelwert 44 (ist: $gemessen)");
-    ok_true(rd("ibcFillFlow_lpm") > 40,
-            "das gelernte Reading bleibt gedaempft (ist: " . rd("ibcFillFlow_lpm") . ")");
+    is(rd("ibcFillFlow_lpm"), $gemessen,
+       "das gelernte Reading uebernimmt die Messung (v1.0.92)");
+    ok_true(rd("ibcToBarrelFlow_lpm") > 15,
+            "die Schwerkraft bleibt gedaempft, sie haengt am IBC-Stand (ist: "
+            . rd("ibcToBarrelFlow_lpm") . ")");
 
     # 30 von 34,2 sind 88 % - unter der neuen Schwelle 93, ueber der alten 85.
     ok_true(!!(rd("calibrationFilter") =~ /check the filter/),
@@ -939,6 +948,40 @@ scenario("QQ Kalibrierlauf meldet die Messung, nicht den Mittelwert (v1.0.85)");
     ok_true(rd("calibrationGravityAtIbc_l") ne "(fehlt)",
             "IBC-Stand zur Schwerkraftmessung dabei (ist: "
             . rd("calibrationGravityAtIbc_l") . ")");
+}
+
+scenario("KKK Eine unglaubwuerdige Kalibrierung laesst die Rate stehen (v1.0.92)");
+{
+    # Gegenstueck zu QQ. Liegt die Messung voellig neben dem ATTRIBUT, darf
+    # sie die gelernte Rate nicht setzen - sonst reisst ein misslungener Lauf
+    # sie um. Erzwungen ueber ein absurd kleines Attribut (5 gegen gemessene
+    # ~30), das ist der einzige Eingang, den beide Bremsen teilen.
+    #
+    # Der Test wird gegen v1.0.91 NICHT rot - dort gibt es die Uebernahme ja
+    # gar nicht. Er sichert die Bremse der Uebernahme ab: faellt sie weg,
+    # steht hier 30 statt 33.
+    my $h = build(attr => { ibcFillFlow_lpm => 5 });
+    main::readingsSingleUpdate($h, "ibcFillFlow_lpm", 33, 0);
+    Gartenbewaesserung_SetIbcLevel($h, 500, "test", 1);
+    Gartenbewaesserung_SetBarrelLevel($h, 81, "test", 1);
+    Gartenbewaesserung_CalibrateStart($h);
+
+    main::advance(170);
+    sens("barrelEmpty", "yes");
+    main::advance(20);
+    sens("barrelEmpty", "no");
+    main::advance(600);
+    sens("barrelFull", "yes");
+    main::advance(20);
+    sens("barrelFull", "no");
+    main::advance(280);
+    sens("barrelEmpty", "yes");
+    main::advance(20);
+
+    my $gem = rd("calibrationPumpFlow_lpm");
+    ok_true($gem > 4 * 5,
+            "die Messung liegt weit ueber dem Attribut 5 (ist: $gem)");
+    is(rd("ibcFillFlow_lpm"), "33", "die gelernte Rate bleibt unangetastet");
 }
 
 scenario("RR Ein sauberer Filter wird nicht angemahnt (v1.0.85)");
