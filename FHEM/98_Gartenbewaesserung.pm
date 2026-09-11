@@ -13,6 +13,29 @@
 #
 ##############################################################################
 #
+# 1.0.92 - 2026-09-11  Ein geglueckter Kalibrierlauf SETZT die gelernte
+#                      Pumpenrate, statt sie nur zu daempfen. v1.0.85 hatte
+#                      Messung (calibrationPumpFlow_lpm) und gelernten Wert
+#                      getrennt und den Lernpfad bewusst gedaempft gelassen;
+#                      das war zu vorsichtig. Ein Kalibrierlauf ist die beste
+#                      Messung der Anlage - Hahn zu, volles Fass von Kontakt zu
+#                      Kontakt, Regen bricht ab - und die Daempfung 0,7 x alt +
+#                      0,3 x neu verschluckt 70 % genau der Neuigkeit,
+#                      derentwegen jemand kalibriert.
+#                      Anlass: eine Filterwarnung, die am gelernten Reading
+#                      gegen das Attribut haengt (unter 90 % warnen, ab 95 %
+#                      entwarnen). Am 11.09. mass die Kalibrierung 31,6 gegen
+#                      nominell 37,4 = 84 %, im Reading stand danach 35,7 =
+#                      95 %: die Warnung kam nicht, eine bestehende waere sogar
+#                      geloescht worden. Der Lauf, der die Verschmutzung
+#                      nachweist, deckte sie zu.
+#                      Die Ausreisser-Bremse bleibt (0,4x bis 1,5x gegen das
+#                      ATTRIBUT, v1.0.79) - ein misslungener Lauf reisst die
+#                      Rate nicht um. Die SCHWERKRAFT bleibt bewusst gedaempft:
+#                      sie haengt an der Wassersaeule im IBC (11,6 bei 198 l
+#                      gegen 14,4 bei 547 l), eine Messung bei einem Stand darf
+#                      den Mittelwert ueber alle Staende nicht ersetzen.
+#
 # 1.0.91 - 2026-09-10  mainsDirect_total_l zaehlt jetzt auch waehrend eines
 #                      PUMPENLAUFS mit. MainsMeterTick steigt bei
 #                      "Stand >= Schwimmerhoehe" aus - richtig, dann hat das
@@ -1083,7 +1106,7 @@ use POSIX;
 # greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
 # gerade selbst geladen) oder die Liste ihr Format aendert.
 {
-    my $FALLBACK = '1.0.91';
+    my $FALLBACK = '1.0.92';
     my $cached;
     sub Gartenbewaesserung_Version {
         return $cached if(defined($cached));
@@ -7710,10 +7733,55 @@ sub Gartenbewaesserung_CalibrateFinish {
         $filter .= ($pct < $warn) ? " - check the filter" : " - ok";
     }
 
+    # Ein Kalibrierlauf ist die beste Messung, die die Anlage hinbekommt: Hahn
+    # zu, volles Fass von Kontakt zu Kontakt, Regen bricht ab, Giessen ist
+    # ausgeschlossen. Die Daempfung 0,7 x alt + 0,3 x neu im normalen Lernpfad
+    # ist dafuer gebaut, dass ein einzelner SCHIEFER Lauf die Rate nicht
+    # umreisst - hier gibt es keinen schiefen Lauf, und sie verschluckt 70 %
+    # genau der Neuigkeit, derentwegen jemand kalibriert hat.
+    #
+    # Der Anlass war eine Filterwarnung, die am gelernten Reading gegen das
+    # Attribut haengt (unter 90 % warnen, ab 95 % entwarnen). Am 11.09. mass
+    # die Kalibrierung 31,6 l/min gegen nominell 37,4 - also 84 %. Im Reading
+    # stand danach 35,7, die gedaempfte Mischung aus Attribut und Messung, das
+    # sind 95 %: die Warnung kam nicht, und eine bestehende waere sogar
+    # geloescht worden. Der Lauf, der die Verschmutzung nachweist, hat sie
+    # damit zugedeckt.
+    #
+    # Die Ausreisser-Bremse bleibt und misst weiter gegen das ATTRIBUT, nicht
+    # gegen das Reading (v1.0.79) - ein misslungener Lauf soll die Rate
+    # trotzdem nicht umreissen.
+    my $vorher = ReadingsVal($name, "ibcFillFlow_lpm", "-");
+    my $uebernehmen = 0;
+    if($c->{pump} =~ /^\d+(?:\.\d+)?$/ && $c->{pump} > 0) {
+        my $anker = AttrVal($name, "ibcFillFlow_lpm", 0);
+        $anker = 0 if($anker !~ /^\d+(?:\.\d+)?$/);
+        if($anker > 0 && ($c->{pump} > 1.5 * $anker || $c->{pump} < 0.4 * $anker)) {
+            Log3 $name, 3, sprintf("%s: calibration measured %.1f l/min against a nominal "
+                . "%.1f - implausible, the learned rate is left untouched",
+                $name, $c->{pump}, $anker);
+        }
+        else {
+            $uebernehmen = 1;
+        }
+    }
+
     readingsBeginUpdate($hash);
     readingsBulkUpdate($hash, "calibration", "idle");
     readingsBulkUpdate($hash, "calibrationResult", "ok");
     readingsBulkUpdate($hash, "lastCalibration", TimeNow());
+    if($uebernehmen) {
+        readingsBulkUpdate($hash, "ibcFillFlow_lpm", $c->{pump});
+        Log3 $name, 3, sprintf("%s: learned pump rate set to the calibration result "
+            . "%s l/min (was %s)", $name, $c->{pump}, $vorher);
+    }
+    # Die SCHWERKRAFT bleibt bewusst gedaempft. Sie ist keine Konstante der
+    # Anlage, sondern haengt an der Wassersaeule im IBC (gemessen 11,6 bei
+    # 198 l gegen 14,4 bei 547 l). Eine Kalibrierung misst sie bei genau einem
+    # Stand - den `calibrationGravityAtIbc_l` festhaelt -, und dieser eine
+    # Stand darf den Mittelwert ueber alle Staende nicht ersetzen. Fuer die
+    # Pumpe gilt das nicht: ihre Rate ist eine Eigenschaft von Pumpe und
+    # Filter, nicht des Fuellstands.
     readingsBulkUpdate($hash, "calibrationPumpFlow_lpm", $c->{pump})
         if($c->{pump} ne "");
     readingsBulkUpdate($hash, "calibrationGravityFlow_lpm", $c->{gravity})
@@ -8250,7 +8318,9 @@ sub Gartenbewaesserung_UpdateNotifyDev {
           <li><b>Phase 2</b> – Fass → IBC bis <code>barrelEmpty</code>: <code>ibcFillFlow_lpm</code> über genau ein Fass.</li>
         </ul>
         Ergebnis in <code>lastCalibration</code>, <code>calibrationPumpFlow_lpm</code>, <code>calibrationGravityFlow_lpm</code>, <code>calibrationGravityAtIbc_l</code> und <code>calibrationFilter</code>.<br>
-        Die beiden Raten sind die <b>Messung dieses Laufs</b> (gebuchte Menge ÷ Laufzeit), nicht die gelernten Readings – die sind die gedämpfte Mischung <code>0,7 × alt + 0,3 × neu</code> und würden 70 % der Neuigkeit verschlucken, ausgerechnet bei der ersten Messung nach einer Veränderung.<br>
+        Die beiden Raten sind die <b>Messung dieses Laufs</b> (gebuchte Menge &divide; Laufzeit), nicht die gedämpfte Mischung <code>0,7 &times; alt + 0,3 &times; neu</code> des normalen Lernpfads.<br>
+        <b>Ab v1.0.92 setzt ein geglückter Lauf die gelernte Pumpenrate <code>ibcFillFlow_lpm</code> direkt auf die Messung</b>, statt sie nur zu dämpfen. Ein Kalibrierlauf ist die beste Messung der Anlage – Hahn zu, volles Fass von Kontakt zu Kontakt, Regen bricht ab –, und die Dämpfung verschluckt 70&nbsp;% genau der Neuigkeit, derentwegen jemand kalibriert. Anlass war eine Filterwarnung, die am gelernten Reading gegen das Attribut hängt: gemessene 31,6 gegen nominell 37,4 sind 84&nbsp;%, im Reading standen danach 35,7 = 95&nbsp;% – die Warnung kam nicht, eine bestehende wäre sogar gelöscht worden. Eine <b>unglaubwürdige</b> Messung (unter 0,4&times; oder über 1,5&times; des Attributs) wird weiterhin verworfen und lässt die gelernte Rate stehen.<br>
+        Die <b>Schwerkraftrate bleibt gedämpft</b>: sie ist keine Konstante, sondern hängt am IBC-Stand (11,6 l/min bei 198&nbsp;l gegen 14,4 bei 547), und eine Messung bei einem Stand darf den Mittelwert über alle Stände nicht ersetzen.<br>
         <code>calibrationGravityAtIbc_l</code> ist der IBC-Stand vor dem Transfer: die Schwerkraftrate hängt an der Wassersäule (gemessen 13,6 l/min bei 198 l gegen 15,4 bei 494 l), ohne den Stand sind zwei Läufe nicht vergleichbar.<br>
         <code>calibrationFilter</code> ist die gemessene Pumpenrate in Prozent des <b>Attributs</b> <code>ibcFillFlow_lpm</code>, siehe <code>calibrationFilterWarn</code>.<br>
         Startet nur, wenn nicht gegossen wird, kein anderer Transport läuft, der IBC mindestens ein Fass plus 20 l hergibt, es nicht regnet – und <b>der Hahn zu ist</b>. Bei offenem Hahn speist das Schwimmerventil beide Richtungen mit; das Ergebnis wäre ein Modell statt einer Messung. Während des Laufs brechen Regen, ein geöffneter Hahn oder ein startender Gießzyklus ab, statt eine verdorbene Messung zu lernen – der Lauf lässt sich ja einfach wiederholen.</li>
