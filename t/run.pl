@@ -1369,6 +1369,45 @@ scenario("CCC validate ordnet einen schnellen Hahn ein (v1.0.88)");
     ok_true(!!($r3 !~ /mains tap/), "langsamer Hahn: keine Meldung");
 }
 
+scenario("JJJ Zaehler laeuft waehrend eines Pumpenlaufs mit (v1.0.91)");
+{
+    # Der Lauf vom 10.09. 20:48-20:59: Fass auf Schwimmerhoehe, Hahn auf,
+    # Pumpe hebt in den IBC. Die Schaetzung bleibt die ganze Zeit auf 93,5,
+    # weil erst am Laufende gebucht wird - MainsMeterTick fiel deshalb in den
+    # Zweig "Stand auf Hoehe = Ventil zu" und schwieg, waehrend der Hahn
+    # 22,5 l/min nachlieferte. Real 232 l, gezaehlt 30.
+    my $h = build(mains => "on", attr => { %PEKI, barrelFloatLevel => 93.5 });
+    Gartenbewaesserung_SetBarrelLevel($h, 93.5, "test", 1);
+    main::advance(70);                      # Anker setzen lassen, Stand = Hoehe
+    my $vorher = rd("mainsDirect_total_l");
+    $vorher = 0 if($vorher !~ /^\d+(?:\.\d+)?$/);
+
+    Gartenbewaesserung_StartIBCFill($h, 1);
+    main::advance(10);                      # pumpStartDelay: erst Ventil, dann Pumpe
+    is(relay("POWER8"), "ON", "JJJ Pumpe laeuft");
+    main::advance(10 * 60);                 # zehn Minuten Pumpenlauf
+    my $nachher = rd("mainsDirect_total_l");
+    $nachher = 0 if($nachher !~ /^\d+(?:\.\d+)?$/);
+    my $delta = $nachher - $vorher;
+
+    # 22,5 l/min x 10 min = 225 l. Der erste Takt setzt nur den Anker, also
+    # grosszuegig pruefen - entscheidend ist, dass ueberhaupt gezaehlt wird.
+    ok_true($delta > 180 && $delta < 240,
+            sprintf("JJJ Zulauf waehrend des Pumpenlaufs gebucht (%.0f l)", $delta));
+
+    # Gegenprobe: bei zugedrehtem Hahn darf nichts dazukommen.
+    my $h2 = build(mains => "off", attr => { %PEKI, barrelFloatLevel => 93.5 });
+    Gartenbewaesserung_SetBarrelLevel($h2, 93.5, "test", 1);
+    main::advance(70);
+    my $vor2 = rd("mainsDirect_total_l");
+    $vor2 = 0 if($vor2 !~ /^\d+(?:\.\d+)?$/);
+    Gartenbewaesserung_StartIBCFill($h2, 1);
+    main::advance(10 * 60);
+    my $nach2 = rd("mainsDirect_total_l");
+    $nach2 = 0 if($nach2 !~ /^\d+(?:\.\d+)?$/);
+    is($nach2 - $vor2, 0, "JJJ Hahn zu: der Zaehler bleibt stehen");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);
