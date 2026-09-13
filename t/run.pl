@@ -1561,6 +1561,115 @@ scenario("NNN manualMode haelt den Zeitplan an, nicht die Buchhaltung (v1.0.94)"
     is(rd("currentValve"), 1, "NNN ohne manualMode startet derselbe Zeitpunkt sehr wohl");
 }
 
+scenario("OOO Die Verfallsfrist zaehlt ab dem ersten Abbruch (v1.0.95)");
+{
+    # Der Zyklus vom 12.09.2026 nachgestellt: alle zwei Stunden ein kurzer
+    # Anlauf, dazwischen leeres Fass. Bis v1.0.94 stellte jeder Abbruch
+    # createdAt neu, damit erreichte der Lauf die 6-Stunden-Frist nie.
+    my $h = build(mains => "off", attr => { wateringPauseInterval => 0,
+                                            barrelEmptyResumeMaxAge => 6,
+                                            barrelEmptyMaxRefillAttempts => 0 });
+    Gartenbewaesserung_SetBarrelLevel($h, 148, "test", 1);
+    Gartenbewaesserung_StartWatering($h);
+    main::advance(60);
+    sens("barrelEmpty", "yes");                       # erster Abbruch, Uhr laeuft
+
+    # Ein Anlauf: zwei Stunden warten, Wasser da, fortsetzen - und gleich wieder
+    # leerlaufen, damit ein NEUER Abbruch entsteht. Genau so hangelt sich der
+    # Lauf im Betrieb von Schauer zu Schauer.
+    my $wieder = sub {
+        main::advance(2 * 3600);
+        Gartenbewaesserung_SetBarrelLevel($defs{bw}, 148, "test", 1);
+        sens("barrelEmpty", "no");
+        my $r = Gartenbewaesserung_ResumeAfterBarrelEmpty($defs{bw});
+        if($r eq "resumed") {
+            main::advance(60);
+            sens("barrelEmpty", "yes");               # naechster Abbruch
+        }
+        return $r;
+    };
+
+    my @ergebnis;
+    push @ergebnis, $wieder->() for(1 .. 4);          # 2, 4, 6 und 8 Stunden
+
+    # Nach vier Runden ist der Lauf 8 h alt - laenger als die Frist von 6.
+    ok_true(!!(grep { $_ eq "expired" } @ergebnis),
+            "OOO der Lauf verfaellt trotz Anlaeufen alle zwei Stunden (@ergebnis)");
+    ok_true(!!(rd("lastCycleAborted") =~ /interrupted run expired/),
+            "OOO lastCycleAborted haelt es fest");
+
+    # Gegenprobe: ein FRISCHER Lauf erbt die Uhr nicht.
+    my $h2 = build(mains => "off", attr => { wateringPauseInterval => 0,
+                                             barrelEmptyResumeMaxAge => 6,
+                                             barrelEmptyMaxRefillAttempts => 0 });
+    Gartenbewaesserung_SetBarrelLevel($h2, 148, "test", 1);
+    Gartenbewaesserung_StartWatering($h2);
+    main::advance(60);
+    sens("barrelEmpty", "yes");
+    main::advance(8 * 3600);                          # alter Lauf waere jetzt hin
+    Gartenbewaesserung_SetBarrelLevel($h2, 148, "test", 1);
+    sens("barrelEmpty", "no");
+    Gartenbewaesserung_StartWatering($h2);            # neuer Zyklus
+    main::advance(60);
+    sens("barrelEmpty", "yes");
+    main::advance(60);
+    Gartenbewaesserung_SetBarrelLevel($h2, 148, "test", 1);
+    sens("barrelEmpty", "no");
+    my $r2 = Gartenbewaesserung_ResumeAfterBarrelEmpty($defs{bw});
+    ok_true($r2 ne "expired", "OOO ein frischer Zyklus erbt die alte Uhr nicht (ist: $r2)");
+}
+
+scenario("PPP Unproduktiv heisst Anteil der Sollzeit, nicht eine feste Minute (v1.0.95)");
+{
+    # 13.09.2026: Kreis 2 lief 74 Sekunden von 10,85 geplanten Minuten - 11 %.
+    # Das galt als produktiv, setzte den Zaehler der Schleifenbremse zurueck,
+    # und die kam nie auf drei.
+    #
+    # Geprueft wird die Bewertung selbst. Der Weg dorthin (Fass leer ->
+    # Nachfuellpause -> Resume) haengt an einem halben Dutzend HELPER-Flags und
+    # sagt ueber DIESE Aenderung nichts aus.
+    my $h = build();
+    # Gegen eine Fassung ohne die Sub darf der Lauf nicht sterben - sonst sagt
+    # die Gegenprobe nur "gestorben" statt "diese Zusicherungen werden rot".
+    # Fehlt die Sub, gilt die ALTE Regel - die feste Minute. Damit vergleicht die
+    # Gegenprobe Verhalten gegen Verhalten und meldet nicht bloss "Sub fehlt".
+    my $gibts = defined(&Gartenbewaesserung_RunWasUnproductive) ? 1 : 0;
+    my $lauf = sub {
+        my ($sekunden, $sollMinuten) = @_;
+        $h->{HELPER}{lastWateringStart} = time() - $sekunden;
+        if(defined($sollMinuten)) { $h->{HELPER}{lastWateringPlanned} = $sollMinuten }
+        else                      { delete $h->{HELPER}{lastWateringPlanned} }
+        return $gibts ? Gartenbewaesserung_RunWasUnproductive($h)
+                      : (($sekunden < 60) ? 1 : 0);
+    };
+
+    is($lauf->(74, 10.85), 1, "PPP 74 s von 10,85 min = 11 % -> unproduktiv");
+    is($lauf->(5 * 60, 10), 0, "PPP 5 von 10 min = 50 % -> produktiv");
+    is($lauf->(2 * 60, 10), 0, "PPP genau 20 % zaehlt als produktiv");
+    is($lauf->(2 * 60 - 1, 10), 1, "PPP eine Sekunde darunter nicht mehr");
+    is($lauf->(3 * 60, 20), 1, "PPP 3 von 20 min = 15 % -> unproduktiv (alt: produktiv)");
+    is($lauf->(150, 10), 0, "PPP 2,5 von 10 min = 25 % -> produktiv");
+
+    # Strenger stellen wirkt.
+    $attr{bw}{barrelEmptyMinRunShare} = 50;
+    is($lauf->(5 * 60 - 1, 10), 1, "PPP bei 50 % reicht die halbe Zeit knapp nicht");
+
+    # 0 schaltet die Anteilspruefung ab - zurueck zur festen Minute.
+    $attr{bw}{barrelEmptyMinRunShare} = 0;
+    is($lauf->(74, 10), 0, "PPP Anteil aus: 74 s gelten wieder als produktiv");
+    is($lauf->(30, 10), 1, "PPP Anteil aus: 30 s bleiben unproduktiv");
+
+    # Ohne bekannte Sollzeit ebenso.
+    delete $attr{bw}{barrelEmptyMinRunShare};
+    is($lauf->(74, undef), 0, "PPP ohne Sollzeit gilt die alte Minute");
+    is($lauf->(30, undef), 1, "PPP ohne Sollzeit: 30 s unproduktiv");
+
+    # Und ohne laufenden Anlauf wird gar nicht geurteilt.
+    delete $h->{HELPER}{lastWateringStart};
+    is($gibts ? Gartenbewaesserung_RunWasUnproductive($h) : 0, 0,
+       "PPP kein Anlauf -> kein Urteil");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);
