@@ -13,6 +13,30 @@
 #
 ##############################################################################
 #
+# 1.0.94 - 2026-09-13  manualMode haelt nur noch den ZEITPLAN an, nicht die
+#                      Buchhaltung. Es stand in derselben Bedingung wie
+#                      disable, also vor den sechs Ticks in CheckSchedule -
+#                      und CheckSchedule ist der einzige Minutentakt des
+#                      Moduls. Wer die Nachtzyklen abstellen wollte, hielt
+#                      damit auch mainsDirect_total_l an (MainsMeterTick), den
+#                      mitlaufenden Fuellstand bei offenem Hahn
+#                      (MainsFillTick), das Ende einer Leitungspause auf
+#                      Schwimmerhoehe (MainsPauseTick), "set mainsFillIbc"
+#                      (MainsFillIbcTick), die Zyklusvorschau und den
+#                      Tageswechsel von watered_today_l (WateredDayTick) - der
+#                      faellt am ehesten auf, der Wert von gestern blieb
+#                      stehen. Der manualMode-Ausstieg sitzt jetzt HINTER den
+#                      Ticks, direkt vor der Auswertung von startTime1..3.
+#                      disable bleibt, wo es war: dort ist "gar nichts tun" die
+#                      Absicht. Und CheckRain hat manualMode noch nie gefragt -
+#                      die Regenernte war nie betroffen, genau darum ist
+#                      manualMode die richtige Antwort auf "Giessen aus,
+#                      Sammeln an".
+#                      Dasselbe Muster wie v1.0.82, eine Ebene tiefer: damals
+#                      nahm sich disable den ganzen Takt, hier uebersprang
+#                      manualMode Ticks, die mit dem Zeitplan nichts zu tun
+#                      haben.
+#
 # 1.0.93 - 2026-09-13  Eine Entnahme wird nicht mehr groesser gebucht, als die
 #                      Quelle hergab, und es gibt einen Zeitstempel dafuer,
 #                      dass ueberhaupt Wasser geflossen ist.
@@ -1137,7 +1161,7 @@ use POSIX;
 # greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
 # gerade selbst geladen) oder die Liste ihr Format aendert.
 {
-    my $FALLBACK = '1.0.93';
+    my $FALLBACK = '1.0.94';
     my $cached;
     sub Gartenbewaesserung_Version {
         return $cached if(defined($cached));
@@ -8115,14 +8139,17 @@ sub Gartenbewaesserung_CheckSchedule {
     RemoveInternalTimer($hash, "Gartenbewaesserung_CheckSchedule");
 
     # Abgeschaltet heisst: nichts tun - nicht: nie wieder aufwachen. Bis v1.0.81
-    # stand hinter diesen beiden Bedingungen ein blankes return, waehrend das
+    # stand hinter dieser Bedingung ein blankes return, waehrend das
     # RemoveInternalTimer oben schon gelaufen war. Damit war der Minutentakt nach
     # einem einzigen "attr <geraet> disable 1" tot, und ein "disable 0" holte ihn
     # nicht zurueck: der Attr-Handler kennt CheckSchedule nicht, neu armiert wird
     # nur in Define und StopAll. Mit dem Takt weg waren auch MainsFillTick,
     # MainsMeterTick (also mainsDirect_total_l) und MainsFillIbcTick weg - der
     # Zeitplan lief danach nie wieder an, ohne dass irgendetwas es gemeldet haette.
-    if(IsDisabled($name) || AttrVal($name, "manualMode", 0)) {
+    #
+    # disable gilt fuer das ganze Geraet: es fasst weder Aktoren an noch fuehrt
+    # es Buch. manualMode ist etwas anderes - dazu unten.
+    if(IsDisabled($name)) {
         InternalTimer(gettimeofday() + 60, "Gartenbewaesserung_CheckSchedule", $hash);
         return;
     }
@@ -8144,6 +8171,22 @@ sub Gartenbewaesserung_CheckSchedule {
     # beim Start. Die Readings aendern sich nur, wenn sich ein Fuellstand
     # aendert, es entstehen also keine Ereignisse im Leerlauf.
     Gartenbewaesserung_UpdateCycleForecast($hash);
+
+    # manualMode heisst "kein Zeitplan", nicht "keine Buchhaltung". Bis v1.0.93
+    # stand es in derselben Bedingung wie disable, also VOR den Ticks daueber -
+    # wer die Nachtzyklen abstellen wollte, hielt damit auch den Zaehler
+    # mainsDirect_total_l an, den mitlaufenden Fuellstand bei offenem Hahn, das
+    # Ende einer Leitungspause auf Schwimmerhoehe, "set mainsFillIbc" und den
+    # Tageswechsel von watered_today_l. Der letzte faellt am ehesten auf: der
+    # Wert von gestern blieb dann stehen.
+    #
+    # Von Hand gestartetes Giessen laeuft ohnehin weiter, und CheckRain fragt
+    # manualMode gar nicht erst - die Ernte ist davon nie betroffen gewesen.
+    # Ab hier geht es nur noch um startTime1..3, und genau das ist gemeint.
+    if(AttrVal($name, "manualMode", 0)) {
+        InternalTimer(gettimeofday() + 60, "Gartenbewaesserung_CheckSchedule", $hash);
+        return;
+    }
 
     my ($sec, $min, $hour, $mday, $mon, $year, $wday) = localtime(time);
     my $currentTime = sprintf("%02d:%02d", $hour, $min);
@@ -8981,6 +9024,16 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             <b>manualMode</b><br>
             Typ: 0/1. Standardwert: 0.<br>
             1 = Automatischer Zeitplan deaktiviert (nur manuelle Steuerung per Set-Befehlen).
+            Betroffen sind ausschließlich <i>startTime1..3</i>.<br>
+            <b>Die Regenernte läuft weiter</b> – <i>CheckRain</i> fragt
+            <i>manualMode</i> nicht ab. Damit ist das der Schalter für „Gießen aus,
+            Sammeln an". Ebenso laufen Buchhaltung und Füllstandsrechnung weiter
+            (<i>mainsDirect_total_l</i>, der mitlaufende Füllstand bei offenem
+            Hahn, das Ende einer Leitungspause auf Schwimmerhöhe,
+            <i>set mainsFillIbc</i>, die Zyklusvorschau und der Tageswechsel von
+            <i>watered_today_l</i>); bis v1.0.93 standen die mit still.<br>
+            Unterschied zu <i>disable</i>: das schaltet das ganze Gerät ab,
+            <b>samt Ernte</b>.
         </li>
         <li><a id="Gartenbewaesserung-attr-moistureSensorInvert"></a>
             <b>moistureSensorInvert</b><br>

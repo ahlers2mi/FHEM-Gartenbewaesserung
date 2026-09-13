@@ -1519,6 +1519,48 @@ scenario("MMM lastWaterFlow steht auch dann, wenn der Lauf abbricht (v1.0.93)");
     ok_true(rd("lastWaterFlow") ne "(fehlt)", "MMM lastWaterFlow ebenso");
 }
 
+scenario("NNN manualMode haelt den Zeitplan an, nicht die Buchhaltung (v1.0.94)");
+{
+    # CheckSchedule ist der einzige Minutentakt. manualMode stand bis v1.0.93 in
+    # derselben Bedingung wie disable, also VOR den Ticks - wer die Nachtzyklen
+    # abstellen wollte, hielt damit auch den Zaehler an.
+    my $h = build(mains => "on", attr => { %PEKI, manualMode => 1 });
+    Gartenbewaesserung_SetBarrelLevel($h, 0, "test", 1);
+    main::advance(70);
+    my $vorher = rd("mainsDirect_total_l");
+    $vorher = 0 if($vorher !~ /^\d+(?:\.\d+)?$/);
+    main::advance(3 * 60);
+    my $nachher = rd("mainsDirect_total_l");
+    $nachher = 0 if($nachher !~ /^\d+(?:\.\d+)?$/);
+    ok_true($nachher - $vorher > 0,
+            sprintf("NNN der Zaehler laeuft trotz manualMode (%.0f l)", $nachher - $vorher));
+
+    # Und der Fuellstand steigt mit - MainsFillTick haengt am selben Takt.
+    ok_true(rd("barrelLevel_l") > 0,
+            "NNN der Fuellstand steigt bei offenem Hahn mit (ist: " . rd("barrelLevel_l") . ")");
+
+    # Gegenprobe 1: disable bleibt, was es war - gar nichts tun.
+    my $h2 = build(mains => "on", attr => { %PEKI, disable => 1 });
+    Gartenbewaesserung_SetBarrelLevel($h2, 0, "test", 1);
+    main::advance(4 * 60);
+    my $aus = rd("mainsDirect_total_l");
+    ok_true($aus eq "(fehlt)" || $aus == 0, "NNN disable zaehlt weiterhin nicht (ist: $aus)");
+
+    # Gegenprobe 2: der Zeitplan bleibt bei manualMode wirklich aus. startTime
+    # gegen die Wanduhr zu pruefen waere mit der virtuellen Uhr unsauber -
+    # gemessen wird deshalb direkt, dass CheckSchedule nicht startet.
+    my $h3 = build(attr => { manualMode => 1 });
+    Gartenbewaesserung_SetBarrelLevel($h3, 148, "test", 1);
+    my ($s, $m, $hh) = localtime(int($main::NOW));
+    $attr{bw}{startTime1} = sprintf("%02d:%02d", $hh, $m);
+    Gartenbewaesserung_CheckSchedule($defs{bw});
+    is(rd("currentValve"), "none", "NNN manualMode: der Zeitplan startet nicht");
+
+    delete $attr{bw}{manualMode};
+    Gartenbewaesserung_CheckSchedule($defs{bw});
+    is(rd("currentValve"), 1, "NNN ohne manualMode startet derselbe Zeitpunkt sehr wohl");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);
