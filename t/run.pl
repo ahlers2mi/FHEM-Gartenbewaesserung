@@ -1451,6 +1451,74 @@ scenario("JJJ Zaehler laeuft waehrend eines Pumpenlaufs mit (v1.0.91)");
     is($nach2 - $vor2, 0, "JJJ Hahn zu: der Zaehler bleibt stehen");
 }
 
+scenario("LLL Eine Entnahme wird nicht groesser gebucht, als die Quelle hergab (v1.0.93)");
+{
+    # 13.09.2026 nachgestellt: Fass nach einer Regennacht bei 51 l, IBC leer,
+    # Hahn zu. Ventil 2 lief 4,2 min, dann meldete die Pumpe "Fass leer".
+    # Gebucht wurden 4,2 x 27,6 = 117 l - aus einem Fass mit 51.
+    my $h = build(mains => "off",
+                  attr => { valve2Flow_lpm => 27.6, wateringPauseInterval => 0 });
+    Gartenbewaesserung_SetBarrelLevel($h, 51, "test", 1);
+    Gartenbewaesserung_StartCircuit($h, 2);
+    main::advance(10);
+    is(rd("currentValve"), 2, "LLL Kreis 2 laeuft");
+    main::advance(4 * 60 + 12);
+    sens("barrelEmpty", "yes");
+
+    my $gebucht = rd("watered_today_l");
+    $gebucht = 0 if($gebucht !~ /^-?\d+(?:\.\d+)?$/);
+    # 51 l waren da, mehr kann nicht geflossen sein. Ohne Deckel stehen hier
+    # 117 - das ist die Zusicherung, die gegen v1.0.92 rot wird.
+    ok_true($gebucht > 0 && $gebucht <= 55,
+            "LLL hoechstens der Fassinhalt wird gebucht (ist: $gebucht l, ohne Deckel 117)");
+    ok_true(!!(grep { /booking 51 l instead/ } @main::LOG),
+            "LLL die Kappung steht im Log");
+
+    # Gegenprobe: ein Lauf, den das Fass traegt, wird NICHT angefasst.
+    my $h2 = build(mains => "off",
+                   attr => { valve2Flow_lpm => 27.6, wateringPauseInterval => 0 });
+    Gartenbewaesserung_SetBarrelLevel($h2, 148, "test", 1);
+    Gartenbewaesserung_StartCircuit($h2, 2);
+    main::advance(10);
+    main::advance(4 * 60 + 12);
+    sens("barrelEmpty", "yes");
+    my $voll = rd("watered_today_l");
+    $voll = 0 if($voll !~ /^-?\d+(?:\.\d+)?$/);
+    ok_true($voll > 110 && $voll < 125,
+            "LLL volles Fass: die volle Ventilzeit bleibt gebucht (ist: $voll l)");
+
+    # Und der gekappte Lauf darf keine Rate mehr lernen - sonst lernte
+    # LearnWateringFlow genau die Rate, an der die Buchung gescheitert ist.
+    is(rd("valve2Flow_lpm"), "(fehlt)", "LLL aus dem gekappten Lauf wird nichts gelernt");
+}
+
+scenario("MMM lastWaterFlow steht auch dann, wenn der Lauf abbricht (v1.0.93)");
+{
+    # lastWatering/lastCircuitWatering entstehen nur in FinishWatering bzw.
+    # FinishCircuit. Am 13.09. brach jeder Lauf am leeren Fass ab: das
+    # Dashboard zeigte "397 l heute gegossen" neben "zuletzt gegossen vor 40
+    # Stunden", weil es keinen Zeitstempel fuer "es floss Wasser" gab.
+    my $h = build(mains => "off", attr => { wateringPauseInterval => 0 });
+    Gartenbewaesserung_SetBarrelLevel($h, 148, "test", 1);
+    Gartenbewaesserung_StartWatering($h);
+    main::advance(5 * 60);
+    sens("barrelEmpty", "yes");
+
+    ok_true(rd("watered_today_l") > 0, "MMM es ist Wasser geflossen");
+    is(rd("lastWatering"), "(fehlt)", "MMM kein regulaerer Abschluss, also kein lastWatering");
+    ok_true(rd("lastWaterFlow") ne "(fehlt)",
+            "MMM lastWaterFlow haelt trotzdem fest, dass gegossen wurde");
+
+    # Gegenprobe: laeuft ein Einzelkreis regulaer durch, stehen beide.
+    my $h2 = build(mains => "off", attr => { wateringPauseInterval => 0 });
+    Gartenbewaesserung_SetBarrelLevel($h2, 148, "test", 1);
+    Gartenbewaesserung_StartCircuit($h2, 3);
+    main::advance(11 * 60 + 30);
+    is(rd("currentValve"), "none", "MMM Kreis 3 regulaer fertig");
+    ok_true(rd("lastCircuitWatering") ne "(fehlt)", "MMM lastCircuitWatering gesetzt");
+    ok_true(rd("lastWaterFlow") ne "(fehlt)", "MMM lastWaterFlow ebenso");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);
