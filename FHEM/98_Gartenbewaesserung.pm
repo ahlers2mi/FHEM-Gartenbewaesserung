@@ -13,6 +13,37 @@
 #
 ##############################################################################
 #
+# 1.0.93 - 2026-09-13  Eine Entnahme wird nicht mehr groesser gebucht, als die
+#                      Quelle hergab, und es gibt einen Zeitstempel dafuer,
+#                      dass ueberhaupt Wasser geflossen ist.
+#                      Gebucht wurde bisher stur Rate x Ventilzeit. Dieselbe
+#                      Luecke ist bei den IBC-Transfers dreimal zugemacht
+#                      worden (v1.0.74 Ziel, v1.0.77 Quelle, v1.0.80
+#                      Durchsatz) - beim Verbraucher stand sie noch offen.
+#                      Am 13.09. war das Fass nach einer Regennacht leer, der
+#                      IBC leer, der Hahn zu. Ventil 2 lief fuenfmal an, jedes
+#                      Mal bis "Fass leer": gebucht wurden 397 l, verfuegbar
+#                      waren an dem Tag 279 l Regenertrag. Groesster Posten
+#                      4,2 min x 27,6 l/min = 117 l aus einem Fass mit
+#                      geschaetzten 51 l. CapValveDraw deckelt jetzt auf
+#                      Fassstand beim Oeffnen plus Zulauf waehrend des Laufs
+#                      (Regen und IBC ueber den neuen Zaehler drawInflow, der
+#                      Hahn wie bisher ueber MainsDuringDraw) - in BEIDEN
+#                      Buchungspfaden, auch in NoteOpenValveDrawTime, der beim
+#                      Leermelden greift und die 117 l gebucht hat. Ein
+#                      gekappter Lauf gilt als drawTainted und wird nicht mehr
+#                      gelernt, sonst lernte LearnWateringFlow genau die Rate,
+#                      an der die Buchung gescheitert ist.
+#                      Neues Reading lastWaterFlow (in AddWatered, also in
+#                      jedem Buchungspfad). lastWatering und
+#                      lastCircuitWatering entstehen in FinishWatering bzw.
+#                      FinishCircuit, also NUR beim regulaeren Abschluss; ein
+#                      an leerem Fass abgebrochener Lauf laesst beide stehen.
+#                      Deshalb zeigte das Dashboard am 13.09. gleichzeitig
+#                      "397 l heute gegossen" und "zuletzt gegossen vor 40
+#                      Stunden" - zwei richtige Antworten auf zwei
+#                      verschiedene Fragen, unter einer Beschriftung.
+#
 # 1.0.92 - 2026-09-11  Ein geglueckter Kalibrierlauf SETZT die gelernte
 #                      Pumpenrate, statt sie nur zu daempfen. v1.0.85 hatte
 #                      Messung (calibrationPumpFlow_lpm) und gelernten Wert
@@ -1106,7 +1137,7 @@ use POSIX;
 # greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
 # gerade selbst geladen) oder die Liste ihr Format aendert.
 {
-    my $FALLBACK = '1.0.92';
+    my $FALLBACK = '1.0.93';
     my $cached;
     sub Gartenbewaesserung_Version {
         return $cached if(defined($cached));
@@ -3103,6 +3134,7 @@ sub Gartenbewaesserung_RunCircuit {
     $hash->{HELPER}{valveOpenTime} = int(time());
     $hash->{HELPER}{valveOpenLevel} = Gartenbewaesserung_BarrelLevelExact($hash);
     delete $hash->{HELPER}{drawMainsCounted};
+    delete $hash->{HELPER}{drawInflow};
     readingsBulkUpdate($hash, "currentValve", $circuitNum);
     readingsBulkUpdate($hash, "currentValveName", Gartenbewaesserung_ValveName($hash, $circuitNum));
     readingsEndUpdate($hash, 1);
@@ -3942,6 +3974,7 @@ sub Gartenbewaesserung_OpenValve {
     $hash->{HELPER}{valveOpenTime} = int(time());
     $hash->{HELPER}{valveOpenLevel} = Gartenbewaesserung_BarrelLevelExact($hash);
     delete $hash->{HELPER}{drawMainsCounted};
+    delete $hash->{HELPER}{drawInflow};
     readingsBulkUpdate($hash, "currentValve", $valveNum);
     readingsBulkUpdate($hash, "currentValveName", Gartenbewaesserung_ValveName($hash, $valveNum));
     readingsBulkUpdate($hash, "cycleProgress", "$index/$total");
@@ -5162,6 +5195,7 @@ sub Gartenbewaesserung_StartSingleValve {
     $hash->{HELPER}{valveOpenTime} = int(time());
     $hash->{HELPER}{valveOpenLevel} = Gartenbewaesserung_BarrelLevelExact($hash);
     delete $hash->{HELPER}{drawMainsCounted};
+    delete $hash->{HELPER}{drawInflow};
     readingsBulkUpdate($hash, "currentValve", $valveNum);
     readingsBulkUpdate($hash, "currentValveName", Gartenbewaesserung_ValveName($hash, $valveNum));
     readingsEndUpdate($hash, 1);
@@ -5523,7 +5557,14 @@ sub Gartenbewaesserung_AdjustBarrelLevel {
 
     # Anything that puts water in makes the accumulated valve time useless for
     # learning the draw rate - the barrel no longer empties on watering alone.
-    $hash->{HELPER}{drawTainted} = 1 if($delta > 0);
+    if($delta > 0) {
+        $hash->{HELPER}{drawTainted} = 1;
+        # Waehrend ein Ventil offen steht, gehoert der Zulauf zum Deckel: er
+        # ist Wasser, das der Kreis zusaetzlich zum Fassinhalt bekommen hat.
+        # Der Hahn zaehlt hier NICHT mit, der laeuft ueber MainsDuringDraw.
+        $hash->{HELPER}{drawInflow} = ($hash->{HELPER}{drawInflow} || 0) + $delta
+            if($hash->{HELPER}{valveOpenTime});
+    }
 
     return 1 if(!$delta);
     # Vom EXAKTEN Stand aus weiterrechnen, nicht vom gerundeten Reading - sonst
@@ -5963,6 +6004,48 @@ sub Gartenbewaesserung_ApplyBarrelFloatFloor {
 # .wateredDay wie harvest_today_l ueber .harvestDay; WateredDayTick setzt ihn
 # im Minutentakt auf 0, sobald der Tag wechselt - sonst staende um 09:00 noch
 # die Nacht von gestern in der Kachel.
+# Mehr, als im Fass stand und waehrenddessen zulief, kann ein Kreis nicht
+# entnommen haben.
+#
+# Gebucht wurde bisher stur Rate x Ventilzeit, ohne die Quelle zu fragen -
+# dieselbe Luecke, die bei den IBC-Transfers dreimal zugemacht wurde
+# (v1.0.74 Ziel, v1.0.77 Quelle, v1.0.80 Durchsatz). Beim Verbraucher gab es
+# sie noch.
+#
+# Beleg vom 13.09.2026: das Fass stand nach einer Regennacht leer, IBC leer,
+# Hahn zu. Ventil 2 lief fuenfmal an, jedes Mal bis "Fass leer" - gebucht
+# wurden 397 l, obwohl an dem Tag nur 279 l Regenertrag zur Verfuegung
+# standen. Der groesste Einzelposten: 4,2 min x 27,6 l/min = 117 l aus einem
+# Fass, in dem 51 l geschaetzt waren.
+#
+# Wird gekappt, ist der Lauf auch als MESSUNG nichts mehr wert: sonst lernte
+# LearnWateringFlow genau die Rate, an der die Buchung gescheitert ist.
+sub Gartenbewaesserung_CapValveDraw {
+    my ($hash, $drawn, $openLevel, $inflow, $valveNum, $minutes) = @_;
+    my $name = $hash->{NAME};
+
+    return $drawn if(!defined($drawn) || $drawn <= 0);
+    # Ohne bekannten Ausgangsstand gibt es keinen Deckel - lieber die alte
+    # Schaetzung als eine erfundene Grenze.
+    return $drawn if(!defined($openLevel) || $openLevel !~ /^-?\d+(?:\.\d+)?$/);
+
+    $inflow = 0 if(!defined($inflow) || $inflow !~ /^-?\d+(?:\.\d+)?$/ || $inflow < 0);
+    my $moeglich = $openLevel + $inflow;
+    $moeglich = 0 if($moeglich < 0);
+    # Eine halbe Minute Spiel: Ventilzeiten sind sekundengenau, der Fassstand
+    # ist eine Schaetzung. Ohne Toleranz kappte jeder normale Lauf um Zentiliter.
+    my $rate = ($minutes && $minutes > 0) ? $drawn / $minutes : 0;
+    return $drawn if($drawn <= $moeglich + $rate * 0.5);
+
+    Log3 $name, 3, sprintf("%s: valve %s ran %.1f min = %.0f l at the configured rate, but the "
+        . "barrel held %.0f l and %.0f l flowed in meanwhile - booking %.0f l instead. If this "
+        . "repeats, measure valve%sFlow_lpm again.",
+        $name, defined($valveNum) ? $valveNum : "?", $minutes || 0, $drawn,
+        $openLevel, $inflow, $moeglich, defined($valveNum) ? $valveNum : "");
+    $hash->{HELPER}{drawTainted} = 1;
+    return $moeglich;
+}
+
 sub Gartenbewaesserung_AddWatered {
     my ($hash, $liters) = @_;
     my $name = $hash->{NAME};
@@ -5980,6 +6063,14 @@ sub Gartenbewaesserung_AddWatered {
     readingsBulkUpdate($hash, ".wateredDay", $day);
     readingsBulkUpdate($hash, "watered_today_l", sprintf("%.0f", $today + $liters));
     readingsBulkUpdate($hash, "watered_total_l", sprintf("%.0f", $total + $liters));
+    # "Wann floss zuletzt Wasser" - und zwar unabhaengig davon, ob der Lauf
+    # dabei zu Ende kam. lastWatering und lastCircuitWatering entstehen in
+    # FinishWatering/FinishCircuit, also nur beim regulaeren Abschluss; ein an
+    # leerem Fass abgebrochener Lauf laesst beide stehen. Am 13.09.2026 zeigte
+    # das Dashboard deshalb gleichzeitig "397 l heute gegossen" und "zuletzt
+    # gegossen vor 40 Stunden" - beide Zahlen richtig, aber zu verschiedenen
+    # Fragen. Hier ist die dritte.
+    readingsBulkUpdate($hash, "lastWaterFlow", TimeNow());
     readingsEndUpdate($hash, 1);
 }
 
@@ -6007,11 +6098,13 @@ sub Gartenbewaesserung_NoteValveDraw {
     # nichts mehr zu tun - sonst zaehlten dieselben Minuten doppelt.
     if(delete $hash->{HELPER}{drawBooked}) {
         delete $hash->{HELPER}{valveOpenTime};
+        delete $hash->{HELPER}{drawInflow};
         return;
     }
 
     my $opened = $hash->{HELPER}{valveOpenTime};
     my $openLevel = delete $hash->{HELPER}{valveOpenLevel};
+    my $inflow = delete $hash->{HELPER}{drawInflow} || 0;
     delete $hash->{HELPER}{valveOpenTime};
     delete $hash->{HELPER}{drawMainsCounted};
     my $minutes = $opened ? (int(time()) - $opened) / 60 : 0;
@@ -6035,19 +6128,25 @@ sub Gartenbewaesserung_NoteValveDraw {
         my $drawn;
         if($rate > 0 && $minutes > 0) {
             $drawn = $rate * $minutes;
-            # Brutto in den Garten, vor dem Abzug des Zulaufs.
-            Gartenbewaesserung_AddWatered($hash, $drawn);
             # Was der Hahn waehrend des Kreises nachgeschoben hat, hat das Fass
             # nie verlassen. Ohne den Abzug endete Kreis 1 (15,6 l/min, 10 min)
             # rechnerisch bei 5 l, waehrend das Fass real auf Schwimmerhoehe
             # stand - und die naechste Pause fuellte ein volles Fass.
             my $nach = Gartenbewaesserung_MainsDuringDraw($hash, $openLevel, $rate, $minutes);
+            # Deckel VOR der Buchung: was der Kreis nicht haben konnte, ist auch
+            # nicht in den Garten geflossen. Der Hahn zaehlt dabei als Zulauf mit,
+            # er speist ja waehrend des Laufs nach.
+            $drawn = Gartenbewaesserung_CapValveDraw($hash, $drawn, $openLevel,
+                $inflow + $nach, $valveNum, $minutes);
+            # Brutto in den Garten, vor dem Abzug des Zulaufs.
+            Gartenbewaesserung_AddWatered($hash, $drawn);
             if($nach > 0) {
+                my $brutto = $drawn;
                 $drawn -= $nach;
                 $drawn = 0 if($drawn < 0);
                 $hash->{HELPER}{drawTainted} = 1;
                 Log3 $name, 4, sprintf("%s: valve %s drew %.0f l, the mains supply put %.0f l back "
-                    . "meanwhile", $name, defined($valveNum) ? $valveNum : "?", $rate * $minutes, $nach);
+                    . "meanwhile", $name, defined($valveNum) ? $valveNum : "?", $brutto, $nach);
             }
         }
         else {
@@ -6092,9 +6191,19 @@ sub Gartenbewaesserung_NoteOpenValveDrawTime {
     # Pauschalabzug von 12 % samt irrefuehrender Log-Zeile.
     delete $hash->{HELPER}{valveOpenTime};
     $hash->{HELPER}{drawBooked} = 1;
-    # Auch diese Minuten sind gegossen worden.
+    # Auch diese Minuten sind gegossen worden - aber auch hier nur so viel, wie
+    # das Fass hergab. Dieser Pfad laeuft beim Leermelden, also genau dann, wenn
+    # die Entnahme den Vorrat erschoepft hat: ohne Deckel bucht er die volle
+    # Ventilzeit gegen ein Fass, von dem das Modul im selben Atemzug sagt, es
+    # sei leer.
     my $rate = Gartenbewaesserung_ValveFlow($hash, $valveNum);
-    Gartenbewaesserung_AddWatered($hash, $rate * $minutes) if($rate > 0);
+    if($rate > 0) {
+        my $openLevel = $hash->{HELPER}{valveOpenLevel};
+        my $nach = Gartenbewaesserung_MainsDuringDraw($hash, $openLevel, $rate, $minutes);
+        my $drawn = Gartenbewaesserung_CapValveDraw($hash, $rate * $minutes, $openLevel,
+            ($hash->{HELPER}{drawInflow} || 0) + $nach, $valveNum, $minutes);
+        Gartenbewaesserung_AddWatered($hash, $drawn);
+    }
 
     Log3 $name, 4, sprintf("%s: booked %.1f min of still-open valve %s before learning",
         $name, $minutes, $valveNum);
@@ -9008,7 +9117,8 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <li><b>pauseActive</b> / <b>pauseTimeRemaining</b> - Ob gerade eine Nachfüllpause läuft und wie lange noch. Pausen entstehen aus <code>wateringPauseInterval</code> oder weil das Fass leer wurde.</li>
         <li><b>nextValve</b> / <b>cycleProgress</b> - Nächstes Ventil der Warteschlange und Fortschritt im Zyklus (<code>3/5</code>).</li>
         <li><b>remainingTime</b> - Restlaufzeit des aktuellen Ventils in Minuten.</li>
-        <li><b>lastWatering</b> / <b>lastCircuitWatering</b> - Zeitpunkt der letzten kompletten Bewässerung bzw. des letzten Einzelkreises.</li>
+        <li><b>lastWatering</b> / <b>lastCircuitWatering</b> - Zeitpunkt der letzten kompletten Bewässerung bzw. des letzten Einzelkreises. Beide werden <b>nur beim regulären Abschluss</b> gesetzt: ein Lauf, der am leeren Fass abbricht, lässt sie stehen, obwohl Wasser geflossen ist.</li>
+        <li><b>lastWaterFlow</b> - Zeitpunkt, zu dem zuletzt tatsächlich Wasser in den Garten floss, unabhängig davon, ob der Lauf zu Ende kam. Liegt dieser Wert deutlich später als <i>lastWatering</i>, kommt seit einer Weile kein Gießprogramm mehr durch - üblicherweise, weil das Fass jedes Mal vorher leer ist.</li>
         <li><b>raining</b> / <b>rainDetectedSince</b> - Zustand des <code>rainSensorDevice</code> und seit wann Regen gemeldet wird. <code>raining</code> allein ist träge – für Mengen ist <code>rainAmount_mm</code> die bessere Quelle.</li>
         <li><b>soilMoisture</b> - Letzter Wert des <code>soilSensorDevice</code> in Prozent.</li>
         <li><b>currentValveName</b> - Klartext-Name des aktuell aktiven Kreises (aus <code>valveNName</code>) oder <code>none</code>.</li>
