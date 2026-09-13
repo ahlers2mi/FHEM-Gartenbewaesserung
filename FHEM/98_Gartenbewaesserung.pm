@@ -13,6 +13,34 @@
 #
 ##############################################################################
 #
+# 1.0.95 - 2026-09-13  Ein unterbrochener Lauf wird jetzt wirklich aufgegeben.
+#                      Zwei Bremsen sollten das tun, beide liefen ins Leere.
+#                      (1) barrelEmptyResumeMaxAge misst das Alter des Laufs,
+#                      createdAt wurde aber bei JEDEM Abbruch neu gesetzt - die
+#                      Uhr fing also immer wieder von vorn an. Der Zyklus vom
+#                      12.09. 22:30 war am naechsten Nachmittag 19 Stunden alt
+#                      (Frist: 6) und goss um 16:17 weiter; seine sechs
+#                      Abbrueche lagen 1,3 bis 4,6 h auseinander, keiner ueber
+#                      der Frist. Je haeufiger es regnete, desto laenger
+#                      ueberlebte er. createdAt wird jetzt uebernommen, solange
+#                      es derselbe Lauf ist - erkennbar an der unveraenderten
+#                      wateringStartTime/circuitStartTime, die der Kontext
+#                      ohnehin durchreicht. Ein frischer Zyklus erbt sie nicht.
+#                      (2) barrelEmptyMaxRefillAttempts zaehlte Anlaeufe, bei
+#                      denen das Fass binnen 60 Sekunden wieder leer war. Eine
+#                      feste Minute taugt nicht, wenn ein Kreis das Fass in ein
+#                      bis vier Minuten leerzieht: am 13.09. lief Kreis 2 einmal
+#                      74 Sekunden - 34 l von 20 vorgesehenen Minuten - und galt
+#                      als "hat lange genug Wasser gehalten", was den Zaehler
+#                      auf 0 zuruecksetzte. Die Bremse kam nie auf drei.
+#                      Gemessen wird jetzt am ANTEIL der geplanten Ventilzeit
+#                      dieses Anlaufs, neues Attribut barrelEmptyMinRunShare
+#                      (Prozent, Standard 20). Ohne bekannte Sollzeit bleibt es
+#                      bei der alten Minute.
+#                      Nebenbei: die commandref nannte bei stopCalibrate einen
+#                      Befehl "stopAll", den es nie gab - die Set-Liste kennt
+#                      nur "stop" (die Sub dahinter heisst StopAll).
+#
 # 1.0.94 - 2026-09-13  manualMode haelt nur noch den ZEITPLAN an, nicht die
 #                      Buchhaltung. Es stand in derselben Bedingung wie
 #                      disable, also vor den sechs Ticks in CheckSchedule -
@@ -1161,7 +1189,7 @@ use POSIX;
 # greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
 # gerade selbst geladen) oder die Liste ihr Format aendert.
 {
-    my $FALLBACK = '1.0.94';
+    my $FALLBACK = '1.0.95';
     my $cached;
     sub Gartenbewaesserung_Version {
         return $cached if(defined($cached));
@@ -1241,6 +1269,7 @@ sub Gartenbewaesserung_Initialize {
         "pumpMaxRuntime:slider,0,1,240 " .
         "barrelFillTimeout:slider,0,1,120 " .
         "barrelEmptyMaxRefillAttempts:slider,0,1,10 " .
+        "barrelEmptyMinRunShare:slider,0,5,100 " .
         "barrelEmptyResumeMaxAge:slider,0,1,24 " .
         "rotateCircuits:0,1 " .
         "calibrationFilterWarn:slider,50,1,100 " .
@@ -2951,6 +2980,7 @@ sub Gartenbewaesserung_StartCircuit {
     # Fresh run -> reset the no-water loop-breaker state
     $hash->{HELPER}{barrelEmptyRefillAttempts} = 0;
     delete $hash->{HELPER}{lastWateringStart};
+    delete $hash->{HELPER}{lastWateringPlanned};
     delete $hash->{HELPER}{noWaterAbort};
 
     # Make absolutely sure IBC fill is stopped
@@ -3097,6 +3127,11 @@ sub Gartenbewaesserung_RunCircuit {
             Log3 $name, 4, "$name: Circuit $circuitNum will run for $duration minutes until pause";
         }
     }
+
+    # Die geplante Laufzeit dieses Anlaufs - Massstab fuer die Schleifenbremse in
+    # HandleBarrelEmpty. Erst HIER, nach dem Pausen-Block: wird der Lauf durch
+    # eine Pause geteilt, ist die gekuerzte Zeit das Soll dieses Anlaufs.
+    $hash->{HELPER}{lastWateringPlanned} = $duration;
 
     # Get pump and delay
     my $pumpDevice = AttrVal($name, "pumpDevice", "");
@@ -3399,6 +3434,7 @@ sub Gartenbewaesserung_FinishCircuit {
     # Circuit completed normally -> reset the no-water loop-breaker state
     $hash->{HELPER}{barrelEmptyRefillAttempts} = 0;
     delete $hash->{HELPER}{lastWateringStart};
+    delete $hash->{HELPER}{lastWateringPlanned};
     delete $hash->{HELPER}{noWaterAbort};
 
     Gartenbewaesserung_ClearEndTime($hash);
@@ -3510,6 +3546,7 @@ sub Gartenbewaesserung_StartWatering {
     # Fresh run -> reset the no-water loop-breaker state
     $hash->{HELPER}{barrelEmptyRefillAttempts} = 0;
     delete $hash->{HELPER}{lastWateringStart};
+    delete $hash->{HELPER}{lastWateringPlanned};
     delete $hash->{HELPER}{noWaterAbort};
 
     readingsBeginUpdate($hash);
@@ -3935,6 +3972,11 @@ sub Gartenbewaesserung_OpenValve {
             Log3 $name, 4, "$name: Valve $valveNum will run for $duration minutes until pause";
         }
     }
+
+    # Die geplante Laufzeit dieses Anlaufs - Massstab fuer die Schleifenbremse in
+    # HandleBarrelEmpty. Erst HIER, nach dem Pausen-Block: wird der Lauf durch
+    # eine Pause geteilt, ist die gekuerzte Zeit das Soll dieses Anlaufs.
+    $hash->{HELPER}{lastWateringPlanned} = $duration;
 
     # Get pump and delay
     my $pumpDevice = AttrVal($name, "pumpDevice", "");
@@ -4363,6 +4405,8 @@ sub Gartenbewaesserung_ResumeAfterBarrelEmpty {
         return "none";
     }
 
+    my $mode_fuer_alter = $context->{mode} || "";
+
     # Verfallsdatum. Ein unterbrochener Lauf wartet sonst BELIEBIG lange auf
     # Wasser: bei zugedrehtem Hahn hebt nur neuer Regen die barrelEmpty-Sperre
     # auf, und der kann Tage auf sich warten lassen. Dann faengt die
@@ -4370,9 +4414,25 @@ sub Gartenbewaesserung_ResumeAfterBarrelEmpty {
     # Sonne, zum denkbar schlechtesten Zeitpunkt, und ohne dass irgendjemand
     # damit rechnet. Nach Ablauf wird der Rest verworfen statt nachgeholt; der
     # naechste regulaere Zyklus faengt ohnehin von vorne an.
+    # Gemessen wird das Alter des LAUFS, nicht das des letzten Abbruchs. Bis
+    # v1.0.94 zaehlte createdAt, und das entsteht bei JEDEM Abbruch neu - ein
+    # Lauf, der sich von Regenschauer zu Regenschauer hangelt, konnte die Frist
+    # damit gar nicht erreichen. Je haeufiger es regnete, desto laenger
+    # ueberlebte er. Der Zyklus vom 12.09.2026 22:30 goss am naechsten
+    # Nachmittag um 16:17 weiter, 19 Stunden alt bei einer Frist von 6; seine
+    # sechs Abbrueche lagen 1,3 bis 4,6 Stunden auseinander, keiner darueber.
+    #
+    # wateringStartTime bzw. circuitStartTime ueberleben den Resume - der
+    # Kontext reicht sie durch -, und sie sind genau das, was die Frist meinen
+    # soll: wie lange laeuft dieser Lauf schon. createdAt bleibt der Rueckfall,
+    # falls die Startzeit fehlt.
     my $maxAge = AttrVal($name, "barrelEmptyResumeMaxAge", 6);
-    if($maxAge > 0 && defined($context->{createdAt})) {
-        my $alter = (time() - $context->{createdAt}) / 3600;
+    my $seit = $context->{createdAt};
+    my $laufStart = ($mode_fuer_alter eq "circuit") ? $context->{circuitStartTime}
+                                                    : $context->{wateringStartTime};
+    $seit = $laufStart if(defined($laufStart) && (!defined($seit) || $laufStart < $seit));
+    if($maxAge > 0 && defined($seit)) {
+        my $alter = (time() - $seit) / 3600;
         if($alter > $maxAge) {
             Log3 $name, 3, sprintf("%s: interrupted run is %.1f h old (limit %s h) - "
                 . "discarding instead of resuming at an unplanned hour", $name, $alter, $maxAge);
@@ -4726,6 +4786,36 @@ sub Gartenbewaesserung_TriggerBarrelRefillIfPossible {
 # Stops everything, keeps the resume context, and waits for water to return
 # (handled by RecoverFromNoWater). Prevents endless refill<->drain cycling.
 ##############################################################################
+# Hat der letzte Anlauf ueberhaupt nennenswert gegossen?
+#
+# "Unproduktiv" hiess bis v1.0.94: das Fass war binnen 60 Sekunden wieder leer.
+# Eine feste Minute ist der falsche Massstab, sobald ein Kreis das Fass in ein
+# bis vier Minuten leerzieht - am 13.09.2026 lief Kreis 2 einmal 74 Sekunden
+# (34 l von 20 vorgesehenen Minuten, ein Sechstel) und galt als "hat lange genug
+# Wasser gehalten". Das setzte den Zaehler der Schleifenbremse auf 0 zurueck,
+# und die kam nie auf drei.
+#
+# Gemessen wird deshalb am ANTEIL der geplanten Ventilzeit dieses Anlaufs
+# (barrelEmptyMinRunShare, Prozent). Ist die Sollzeit unbekannt, bleibt es bei
+# der alten Minute - lieber der grobe Massstab als gar keiner.
+sub Gartenbewaesserung_RunWasUnproductive {
+    my ($hash) = @_;
+    my $name = $hash->{NAME};
+
+    my $start = $hash->{HELPER}{lastWateringStart};
+    return 0 if(!defined($start));
+
+    my $lief  = (time() - $start) / 60;
+    my $soll  = $hash->{HELPER}{lastWateringPlanned};
+    my $share = AttrVal($name, "barrelEmptyMinRunShare", 20);
+
+    return ($lief < 1) ? 1 : 0
+        if($share <= 0 || !defined($soll) || $soll !~ /^\d+(?:\.\d+)?$/ || $soll <= 0);
+
+    return ($lief < $soll * $share / 100) ? 1 : 0;
+}
+
+##############################################################################
 sub Gartenbewaesserung_AbortNoWater {
     my ($hash) = @_;
     my $name = $hash->{NAME};
@@ -4764,6 +4854,7 @@ sub Gartenbewaesserung_RecoverFromNoWater {
     delete $hash->{HELPER}{noWaterAbort};
     $hash->{HELPER}{barrelEmptyRefillAttempts} = 0;
     delete $hash->{HELPER}{lastWateringStart};
+    delete $hash->{HELPER}{lastWateringPlanned};
 
     if(ReadingsVal($name, "barrelFillTimeoutAlert", "no") ne "no") {
         readingsSingleUpdate($hash, "barrelFillTimeoutAlert", "no", 1);
@@ -4828,8 +4919,7 @@ sub Gartenbewaesserung_HandleBarrelEmpty {
     # the pump forever; auto-recovers once a water source reports water again.
     my $maxAttempts = AttrVal($name, "barrelEmptyMaxRefillAttempts", 3);
     if($maxAttempts > 0 && ($hash->{HELPER}{watering} || $hash->{HELPER}{circuitMode})) {
-        my $unproductive = (defined($hash->{HELPER}{lastWateringStart})
-            && (time() - $hash->{HELPER}{lastWateringStart}) < 60) ? 1 : 0;
+        my $unproductive = Gartenbewaesserung_RunWasUnproductive($hash);
 
         if($unproductive) {
             $hash->{HELPER}{barrelEmptyRefillAttempts} =
@@ -5068,6 +5158,7 @@ sub Gartenbewaesserung_FinishWatering {
     # Cycle completed normally -> reset the no-water loop-breaker state
     $hash->{HELPER}{barrelEmptyRefillAttempts} = 0;
     delete $hash->{HELPER}{lastWateringStart};
+    delete $hash->{HELPER}{lastWateringPlanned};
     delete $hash->{HELPER}{noWaterAbort};
 
     Gartenbewaesserung_ClearEndTime($hash);
@@ -8476,7 +8567,7 @@ sub Gartenbewaesserung_UpdateNotifyDev {
         <code>calibrationGravityAtIbc_l</code> ist der IBC-Stand vor dem Transfer: die Schwerkraftrate hängt an der Wassersäule (gemessen 13,6 l/min bei 198 l gegen 15,4 bei 494 l), ohne den Stand sind zwei Läufe nicht vergleichbar.<br>
         <code>calibrationFilter</code> ist die gemessene Pumpenrate in Prozent des <b>Attributs</b> <code>ibcFillFlow_lpm</code>, siehe <code>calibrationFilterWarn</code>.<br>
         Startet nur, wenn nicht gegossen wird, kein anderer Transport läuft, der IBC mindestens ein Fass plus 20 l hergibt, es nicht regnet – und <b>der Hahn zu ist</b>. Bei offenem Hahn speist das Schwimmerventil beide Richtungen mit; das Ergebnis wäre ein Modell statt einer Messung. Während des Laufs brechen Regen, ein geöffneter Hahn oder ein startender Gießzyklus ab, statt eine verdorbene Messung zu lernen – der Lauf lässt sich ja einfach wiederholen.</li>
-        <li><a id="Gartenbewaesserung-set-stopCalibrate"></a><b>stopCalibrate</b> - Bricht einen laufenden Kalibrierlauf ab und schaltet Pumpe und Ventil aus. <code>stop</code> bzw. <code>stopAll</code> tut das ebenfalls.</li>
+        <li><a id="Gartenbewaesserung-set-stopCalibrate"></a><b>stopCalibrate</b> - Bricht einen laufenden Kalibrierlauf ab und schaltet Pumpe und Ventil aus. <code>stop</code> tut das ebenfalls.</li>
         <li><a id="Gartenbewaesserung-set-refreshSensors"></a><b>refreshSensors</b> - Liest alle konfigurierten Sensor-Readings sofort neu ein und aktualisiert die Readings (z. B. nach Neustart oder Gerätetausch)</li>
         <li><a id="Gartenbewaesserung-set-validate"></a><b>validate</b> - Prüft die komplette Konfiguration und zeigt Fehler, Warnungen und Infos an</li>
     </ul>
@@ -8950,7 +9041,10 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             die unterbrochene <i>Nacht</i>bewässerung anlaufen – bei Sonne, zum schlechtesten
             Zeitpunkt, und ohne dass jemand damit rechnet. Nach Ablauf wird der Rest deshalb
             <b>verworfen statt nachgeholt</b> (Reading <code>lastCycleAborted</code>); der nächste
-            reguläre Zyklus fängt ohnehin von vorne an.</li>
+            reguläre Zyklus fängt ohnehin von vorne an.<br>
+            Gezählt wird ab dem <b>ersten</b> Abbruch dieses Laufs, nicht ab dem letzten: bis
+            v1.0.94 stellte jeder weitere Abbruch die Uhr zurück, womit ein Lauf, der sich von
+            Regenschauer zu Regenschauer hangelt, die Frist nie erreichen konnte.</li>
         <li><a id="Gartenbewaesserung-attr-rotateCircuits"></a>
             <b>rotateCircuits</b><br>
             Typ: 0/1. Standardwert: 0 (aus, feste Reihenfolge wie in <code>activeValves</code>).<br>
@@ -8977,7 +9071,21 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             <code>barrelFull:yes</code> (maßgebliches Signal bei konfiguriertem
             <code>barrelFullSensorDevice</code>) oder <code>ibcEmpty:no</code> (IBC hat wieder Wasser).
             Regen allein zählt bewusst nicht — Nieselregen füllt das Fass nicht; füllt Regen es, meldet
-            das ohnehin der Fass-voll-Sensor. 0 = deaktiviert (altes Verhalten, endlose Versuche).
+            das ohnehin der Fass-voll-Sensor. 0 = deaktiviert (altes Verhalten, endlose Versuche).<br>
+            Was als erfolgloser Versuch zählt, legt <code>barrelEmptyMinRunShare</code> fest.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-barrelEmptyMinRunShare"></a>
+            <b>barrelEmptyMinRunShare</b><br>
+            Typ: Slider (0–100 %). Standardwert: 20.<br>
+            Ab welchem Anteil seiner geplanten Ventilzeit ein Anlauf als <b>produktiv</b> gilt und
+            damit den Zähler von <code>barrelEmptyMaxRefillAttempts</code> zurücksetzt. Ein Anlauf
+            darunter zählt als erfolglos.<br>
+            Bis v1.0.94 war das Maß eine feste Minute. Das taugt nicht, sobald ein Kreis das Fass in
+            ein bis vier Minuten leerzieht: 74 Sekunden von 20 vorgesehenen Minuten galten als
+            „hat lange genug Wasser gehalten" und setzten den Zähler zurück, sodass die Bremse nie
+            auslöste. Ist die geplante Zeit unbekannt, gilt weiterhin die Minute.<br>
+            Höher stellen heißt strenger: bei 50 muss ein Anlauf die Hälfte seiner Zeit schaffen.
+            0 = Anteilsprüfung aus, zurück zur festen Minute.
         </li>
 
         <p><b>Zeitplan-Attribute</b></p>
