@@ -1670,6 +1670,55 @@ scenario("PPP Unproduktiv heisst Anteil der Sollzeit, nicht eine feste Minute (v
        "PPP kein Anlauf -> kein Urteil");
 }
 
+scenario("QQQ Nach einem Abbruch wird der zweite Teil des Laufs gebucht (v1.0.96)");
+{
+    # Der Gewaechshaus-Lauf vom 18.09.2026, Schritt fuer Schritt:
+    #   21:00  Kreis 8 startet, 20 min geplant
+    #   21:15  Fass leer nach 15 min   -> watered_today_l 90
+    #   21:21  Fass wieder auf Schwimmerhoehe, Kreis laeuft weiter
+    #   21:26  fertig nach 4,95 min    -> nochmal 30 l
+    # Gebucht waren trotzdem nur 90. drawBooked stand seit dem Leermelden und
+    # verschluckte die zweite Buchung; geloescht wurde es nur bei barrelFull,
+    # und mit leerem IBC kommt kein volles Fass.
+    my $h = build(mains => "on", attr => { %PEKI, barrelFloatLevel => 93.5,
+                                           valve3Flow_lpm => 6, valve3Duration => 20,
+                                           wateringPauseInterval => 0,
+                                           barrelEmptyResumeMaxAge => 0 });
+    Gartenbewaesserung_SetBarrelLevel($h, 93.5, "test", 1);
+    Gartenbewaesserung_StartCircuit($h, 3);
+    main::advance(15 * 60);
+    sens("barrelEmpty", "yes");
+
+    my $ersteHaelfte = rd("watered_today_l");
+    $ersteHaelfte = 0 if($ersteHaelfte !~ /^\d+(?:\.\d+)?$/);
+    ok_true($ersteHaelfte > 0, "QQQ der erste Teil ist gebucht ($ersteHaelfte l)");
+    my $flussA = rd("lastWaterFlow");
+
+    # Das Schwimmerventil fuellt nach, die Pause endet auf Schwimmerhoehe und
+    # der Kreis laeuft seine Restminuten.
+    Gartenbewaesserung_SetBarrelLevel($h, 93.5, "test", 1);
+    sens("barrelEmpty", "no");
+    main::advance(25 * 60);
+
+    my $gesamt = rd("watered_today_l");
+    $gesamt = 0 if($gesamt !~ /^\d+(?:\.\d+)?$/);
+    ok_true($gesamt > $ersteHaelfte,
+            "QQQ der zweite Teil kommt dazu ($ersteHaelfte -> $gesamt l)");
+    ok_true(rd("lastWaterFlow") ne $flussA,
+            "QQQ lastWaterFlow zeigt auf das Ende, nicht auf den Abbruch");
+
+    # Gegenprobe: ohne Abbruch bucht ein Lauf unveraendert einmal.
+    my $h2 = build(mains => "off", attr => { valve3Flow_lpm => 6, valve3Duration => 5,
+                                             wateringPauseInterval => 0 });
+    Gartenbewaesserung_SetBarrelLevel($h2, 148, "test", 1);
+    Gartenbewaesserung_StartCircuit($h2, 3);
+    main::advance(5 * 60 + 30);
+    my $glatt = rd("watered_today_l");
+    $glatt = 0 if($glatt !~ /^\d+(?:\.\d+)?$/);
+    ok_true($glatt >= 28 && $glatt <= 32,
+            "QQQ glatter Lauf: 5 min x 6 l/min = 30 l, einmal gebucht (ist: $glatt)");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);
