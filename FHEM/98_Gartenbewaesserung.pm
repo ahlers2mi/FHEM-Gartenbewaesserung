@@ -13,6 +13,28 @@
 #
 ##############################################################################
 #
+# 1.0.96 - 2026-09-19  Nach einem Abbruch am leeren Fass wurde der ZWEITE
+#                      Teil des Laufs nicht gebucht. drawBooked wird beim
+#                      Leermelden gesetzt, damit NoteValveDraw die schon von
+#                      NoteOpenValveDrawTime gebuchte Ventilzeit nicht doppelt
+#                      nimmt. Danach schliesst aber StopAll das Ventil, OHNE
+#                      NoteValveDraw zu rufen - das Flag ueberlebte bis zum
+#                      naechsten regulaeren Ventilschluss und verschluckte
+#                      dessen Buchung. Geloescht wurde es bislang nur bei
+#                      barrelFull, und mit leerem IBC kommt kein volles Fass.
+#                      Belegt am Gewaechshaus-Lauf vom 18.09.2026: 21:00 Start
+#                      (20 min), 21:15 Fass leer nach 15 min -> 90 l gebucht,
+#                      21:21 Fass wieder auf Schwimmerhoehe, 21:21-21:26 weitere
+#                      4,95 min = 30 l - watered_today_l blieb bei 90. Drei Tage
+#                      in Folge dasselbe Muster, also 90 l, die in keiner
+#                      Statistik stehen.
+#                      Aufgefallen ist es an lastWaterFlow (v1.0.93): das stand
+#                      auf dem Zeitpunkt des Abbruchs statt auf dem Ende des
+#                      Laufs. Das Reading hat damit genau das getan, wofuer es
+#                      gedacht war - nur an einer anderen Stelle als erwartet.
+#                      drawBooked wird jetzt beim Oeffnen eines Ventils
+#                      geloescht: ein neuer Anlauf ist eine neue Buchung.
+#
 # 1.0.95 - 2026-09-13  Ein unterbrochener Lauf wird jetzt wirklich aufgegeben.
 #                      Zwei Bremsen sollten das tun, beide liefen ins Leere.
 #                      (1) barrelEmptyResumeMaxAge misst das Alter des Laufs,
@@ -1189,7 +1211,7 @@ use POSIX;
 # greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
 # gerade selbst geladen) oder die Liste ihr Format aendert.
 {
-    my $FALLBACK = '1.0.95';
+    my $FALLBACK = '1.0.96';
     my $cached;
     sub Gartenbewaesserung_Version {
         return $cached if(defined($cached));
@@ -3194,6 +3216,14 @@ sub Gartenbewaesserung_RunCircuit {
     $hash->{HELPER}{valveOpenLevel} = Gartenbewaesserung_BarrelLevelExact($hash);
     delete $hash->{HELPER}{drawMainsCounted};
     delete $hash->{HELPER}{drawInflow};
+    # Ein neuer Anlauf ist eine neue Buchung. drawBooked wird beim Leermelden
+    # gesetzt (NoteOpenValveDrawTime hat die offene Ventilzeit schon gebucht,
+    # NoteValveDraw darf sie nicht doppelt nehmen) - danach schliesst aber
+    # StopAll das Ventil, OHNE NoteValveDraw zu rufen. Das Flag ueberlebte damit
+    # bis zum naechsten regulaeren Ventilschluss und verschluckte dessen
+    # Buchung. Geloescht wurde es bislang nur bei barrelFull, und das kommt bei
+    # leerem IBC nie.
+    delete $hash->{HELPER}{drawBooked};
     readingsBulkUpdate($hash, "currentValve", $circuitNum);
     readingsBulkUpdate($hash, "currentValveName", Gartenbewaesserung_ValveName($hash, $circuitNum));
     readingsEndUpdate($hash, 1);
@@ -4041,6 +4071,14 @@ sub Gartenbewaesserung_OpenValve {
     $hash->{HELPER}{valveOpenLevel} = Gartenbewaesserung_BarrelLevelExact($hash);
     delete $hash->{HELPER}{drawMainsCounted};
     delete $hash->{HELPER}{drawInflow};
+    # Ein neuer Anlauf ist eine neue Buchung. drawBooked wird beim Leermelden
+    # gesetzt (NoteOpenValveDrawTime hat die offene Ventilzeit schon gebucht,
+    # NoteValveDraw darf sie nicht doppelt nehmen) - danach schliesst aber
+    # StopAll das Ventil, OHNE NoteValveDraw zu rufen. Das Flag ueberlebte damit
+    # bis zum naechsten regulaeren Ventilschluss und verschluckte dessen
+    # Buchung. Geloescht wurde es bislang nur bei barrelFull, und das kommt bei
+    # leerem IBC nie.
+    delete $hash->{HELPER}{drawBooked};
     readingsBulkUpdate($hash, "currentValve", $valveNum);
     readingsBulkUpdate($hash, "currentValveName", Gartenbewaesserung_ValveName($hash, $valveNum));
     readingsBulkUpdate($hash, "cycleProgress", "$index/$total");
@@ -5311,6 +5349,14 @@ sub Gartenbewaesserung_StartSingleValve {
     $hash->{HELPER}{valveOpenLevel} = Gartenbewaesserung_BarrelLevelExact($hash);
     delete $hash->{HELPER}{drawMainsCounted};
     delete $hash->{HELPER}{drawInflow};
+    # Ein neuer Anlauf ist eine neue Buchung. drawBooked wird beim Leermelden
+    # gesetzt (NoteOpenValveDrawTime hat die offene Ventilzeit schon gebucht,
+    # NoteValveDraw darf sie nicht doppelt nehmen) - danach schliesst aber
+    # StopAll das Ventil, OHNE NoteValveDraw zu rufen. Das Flag ueberlebte damit
+    # bis zum naechsten regulaeren Ventilschluss und verschluckte dessen
+    # Buchung. Geloescht wurde es bislang nur bei barrelFull, und das kommt bei
+    # leerem IBC nie.
+    delete $hash->{HELPER}{drawBooked};
     readingsBulkUpdate($hash, "currentValve", $valveNum);
     readingsBulkUpdate($hash, "currentValveName", Gartenbewaesserung_ValveName($hash, $valveNum));
     readingsEndUpdate($hash, 1);
