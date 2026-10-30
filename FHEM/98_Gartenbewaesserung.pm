@@ -13,6 +13,22 @@
 #
 ##############################################################################
 #
+# 1.0.97 - 2026-10-30  Neues Attribut harvest (Standard 1). harvest 0 haelt
+#                      nur das AUTOMATISCHE Sammeln an: alle vier Stellen, an
+#                      denen das Modul den IBC von sich aus fuellt (Fass voll
+#                      nach Regen im Notify, Regen + Fass voll und Regendauer in
+#                      CheckRain, Erntefenster ibcFillRainAmount), laufen durch
+#                      StartIBCFill mit $manual = 0 - dort steigt es aus.
+#                      Anlass: der obere IBC ist undicht (24.10.2026). Bisher
+#                      blieb dafuer nur disable 1 - das nimmt aber auch die
+#                      Sensor-Events (Notify steigt sofort aus): manuelles
+#                      Giessen lief dann ohne "Fass leer" bis zum
+#                      Pumpen-Waechter (24./25.10. je 20 min Gewaechshaus),
+#                      Umpumpen ohne "Fass voll" bis ibcToBarrelDuration.
+#                      Mit disable 0, manualMode 1, harvest 0 gibt es weder
+#                      Zeitplan noch Sammeln, Hand-Betrieb aber mit Schwimmern
+#                      und Buchhaltung.
+#
 # 1.0.96 - 2026-09-19  Nach einem Abbruch am leeren Fass wurde der ZWEITE
 #                      Teil des Laufs nicht gebucht. drawBooked wird beim
 #                      Leermelden gesetzt, damit NoteValveDraw die schon von
@@ -1211,7 +1227,7 @@ use POSIX;
 # greift, wenn die Datei nicht lesbar ist (sehr unwahrscheinlich - FHEM hat sie
 # gerade selbst geladen) oder die Liste ihr Format aendert.
 {
-    my $FALLBACK = '1.0.96';
+    my $FALLBACK = '1.0.97';
     my $cached;
     sub Gartenbewaesserung_Version {
         return $cached if(defined($cached));
@@ -1299,6 +1315,7 @@ sub Gartenbewaesserung_Initialize {
         "activeValves:textField " .
         "weekdaysOnly:0,1 " .
         "manualMode:0,1 " .
+        "harvest:1,0 " .
         "switchOnValue:textField switchOffValue:textField " .
         "rainSensorActiveValue:textField rainSensorInactiveValue:textField " .
         "barrelFullSensorActiveValue:textField barrelFullSensorInactiveValue:textField " .
@@ -5444,6 +5461,14 @@ sub Gartenbewaesserung_StartIBCFill {
     my ($hash, $manual, $fromFloat) = @_;
     my $name = $hash->{NAME};
 
+    # harvest 0: das Modul fuellt den IBC nicht mehr VON SICH AUS (Regen, volles
+    # Fass nach Regen, Erntefenster). Von Hand (set startIBCFill, mainsFillIbc,
+    # calibrate) geht es weiter. Alle vier Automatik-Stellen laufen hier durch.
+    if(!$manual && !AttrVal($name, "harvest", 1)) {
+        Log3 $name, 4, "$name: automatic IBC fill skipped (attr harvest 0)";
+        return;
+    }
+
     # Don't start if watering is active
     if($hash->{HELPER}{watering} || $hash->{HELPER}{circuitMode}) {
         Log3 $name, 3, "$name: Cannot start IBC fill during watering";
@@ -9188,6 +9213,20 @@ sub Gartenbewaesserung_UpdateNotifyDev {
             <i>watered_today_l</i>); bis v1.0.93 standen die mit still.<br>
             Unterschied zu <i>disable</i>: das schaltet das ganze Gerät ab,
             <b>samt Ernte</b>.
+        </li>
+        <li><a id="Gartenbewaesserung-attr-harvest"></a>
+            <b>harvest</b><br>
+            Typ: 1/0. Standardwert: 1. Ab 1.0.97.<br>
+            0 = das Modul füllt den IBC <b>nicht mehr von sich aus</b> &ndash; weder
+            bei Regen noch bei vollem Fass nach Regen noch im Erntefenster
+            (<i>ibcFillRainAmount</i>). Alles andere läuft weiter: Sensoren
+            (Fass voll/leer), Buchhaltung, manuelles Gießen
+            (<i>startCircuit</i>, <i>startValve</i>, <i>start</i>), Umpumpen
+            (<i>startIBCtoBarrel</i>) und eine IBC-Befüllung von Hand
+            (<i>startIBCFill</i>, <i>mainsFillIbc</i>, <i>calibrate</i>).<br>
+            Zusammen mit <i>manualMode 1</i> ergibt das „kein Zeitplan, kein
+            Sammeln, Hand-Betrieb mit Schwimmern" &ndash; anders als <i>disable</i>,
+            unter dem auch die Sensor-Events nicht mehr ausgewertet werden.
         </li>
         <li><a id="Gartenbewaesserung-attr-moistureSensorInvert"></a>
             <b>moistureSensorInvert</b><br>

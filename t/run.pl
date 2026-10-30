@@ -1719,6 +1719,44 @@ scenario("QQQ Nach einem Abbruch wird der zweite Teil des Laufs gebucht (v1.0.96
             "QQQ glatter Lauf: 5 min x 6 l/min = 30 l, einmal gebucht (ist: $glatt)");
 }
 
+scenario("RRR harvest 0: kein automatisches Sammeln, Hand-Betrieb bleibt (v1.0.97)");
+{
+    # Fremdwasser: ein volles Fass ist dann allein Grund genug zu ernten
+    # (HarvestDue) - der einfachste Weg, die Automatik auszuloesen.
+    my $h = build(attr => { harvest => 0 });
+    main::readingsSingleUpdate($h, "waterSource", "other", 0);
+    sens("barrelFull", "yes");
+    main::advance(60);
+    is(relay("POWER6"), "OFF", "RRR harvest 0: volles Fass fuellt den IBC NICHT");
+    Gartenbewaesserung_CheckRain($h);
+    main::advance(60);
+    is(relay("POWER6"), "OFF", "RRR harvest 0: auch CheckRain fuellt nicht");
+
+    # Von Hand geht es weiter.
+    my $r = Gartenbewaesserung_Set($h, "bw", "startIBCFill") // "";
+    main::advance(10);
+    is(relay("POWER6"), "ON", "RRR harvest 0: startIBCFill von Hand oeffnet das Ventil");
+    Gartenbewaesserung_Set($h, "bw", "stopIBCFill");
+    main::advance(10);
+
+    # Manuelles Giessen laeuft, und "Fass leer" wird ausgewertet.
+    sens("barrelFull", "no");
+    Gartenbewaesserung_SetBarrelLevel($h, 148, "test", 1);
+    Gartenbewaesserung_Set($h, "bw", "startCircuit", 3);
+    main::advance(30);
+    is(relay("POWER3"), "ON", "RRR harvest 0: startCircuit oeffnet Kreis 3");
+    sens("barrelEmpty", "yes");
+    main::advance(10);
+    is(relay("POWER8"), "OFF", "RRR harvest 0: Fass leer stoppt die Pumpe (Sensoren aktiv)");
+
+    # Gegenprobe: mit harvest 1 (Standard) fuellt ein volles Fass wie bisher.
+    my $h2 = build();
+    main::readingsSingleUpdate($h2, "waterSource", "other", 0);
+    sens("barrelFull", "yes");
+    main::advance(60);
+    is(relay("POWER6"), "ON", "RRR harvest 1: volles Fass fuellt den IBC wie bisher");
+}
+
 print "\n";
 printf("%d ok, %d fehlgeschlagen\n", $ok, $fail);
 exit($fail ? 1 : 0);
